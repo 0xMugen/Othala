@@ -579,4 +579,84 @@ mod tests {
             vec![vec!["OPENAI_API_KEY".to_string()]]
         );
     }
+
+    #[test]
+    fn probe_treats_any_of_env_group_as_satisfied_when_one_key_present() {
+        let mut runner = MockRunner::default();
+        runner.installed.insert("gemini".to_string(), true);
+        runner
+            .versions
+            .insert("gemini".to_string(), Ok("gemini 1".to_string()));
+        runner
+            .env_present
+            .insert("GEMINI_API_KEY".to_string(), false);
+        runner
+            .env_present
+            .insert("GOOGLE_API_KEY".to_string(), true);
+
+        let report = probe_models_with_runner(&SetupProbeConfig::default(), &runner);
+        let gemini = report
+            .models
+            .iter()
+            .find(|m| m.model == ModelKind::Gemini)
+            .expect("gemini probe missing");
+
+        assert!(gemini.installed);
+        assert!(gemini.version_ok);
+        assert_eq!(gemini.env_status.len(), 1);
+        assert!(gemini.env_status[0].satisfied);
+        assert!(gemini.healthy);
+    }
+
+    #[test]
+    fn summarize_setup_sorts_items_by_model_rank_regardless_of_report_order() {
+        let report = super::SetupProbeReport {
+            models: vec![
+                ModelProbeResult {
+                    model: ModelKind::Gemini,
+                    executable: "gemini".to_string(),
+                    installed: true,
+                    version_ok: true,
+                    version_output: Some("gemini 1".to_string()),
+                    env_status: vec![],
+                    healthy: true,
+                },
+                ModelProbeResult {
+                    model: ModelKind::Claude,
+                    executable: "claude".to_string(),
+                    installed: true,
+                    version_ok: true,
+                    version_output: Some("claude 1".to_string()),
+                    env_status: vec![],
+                    healthy: true,
+                },
+                ModelProbeResult {
+                    model: ModelKind::Codex,
+                    executable: "codex".to_string(),
+                    installed: true,
+                    version_ok: true,
+                    version_output: Some("codex 1".to_string()),
+                    env_status: vec![],
+                    healthy: true,
+                },
+            ],
+        };
+
+        let summary = summarize_setup(
+            &report,
+            &ValidatedSetupSelection {
+                enabled_models: vec![ModelKind::Gemini],
+            },
+        );
+
+        let model_order = summary
+            .items
+            .iter()
+            .map(|item| item.model)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model_order,
+            vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini]
+        );
+    }
 }

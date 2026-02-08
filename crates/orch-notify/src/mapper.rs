@@ -125,6 +125,32 @@ mod tests {
     }
 
     #[test]
+    fn maps_restack_conflict_to_warning_notification() {
+        let event = mk_event(EventKind::RestackConflict);
+        let message = notification_for_event(&event).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::RestackConflict);
+        assert_eq!(message.severity, NotificationSeverity::Warning);
+        assert!(message.body.contains("gt add -A"));
+        assert!(message.body.contains("gt continue"));
+        assert_eq!(message.task_id, event.task_id);
+        assert_eq!(message.repo_id, event.repo_id);
+    }
+
+    #[test]
+    fn ignores_review_requested_with_non_empty_models_and_successful_verify() {
+        let review_requested = mk_event(EventKind::ReviewRequested {
+            required_models: vec![orch_core::types::ModelKind::Claude],
+        });
+        assert!(notification_for_event(&review_requested).is_none());
+
+        let verify_ok = mk_event(EventKind::VerifyCompleted {
+            tier: VerifyTier::Quick,
+            success: true,
+        });
+        assert!(notification_for_event(&verify_ok).is_none());
+    }
+
+    #[test]
     fn ignores_non_notifying_events() {
         let event = mk_event(EventKind::TaskCreated);
         assert!(notification_for_event(&event).is_none());
