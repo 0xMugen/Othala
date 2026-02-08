@@ -47,7 +47,10 @@ pub struct RepoSnapshot {
     pub diff: DiffSnapshot,
 }
 
-pub fn capture_status_snapshot(repo: &RepoHandle, git: &GitCli) -> Result<StatusSnapshot, GitError> {
+pub fn capture_status_snapshot(
+    repo: &RepoHandle,
+    git: &GitCli,
+) -> Result<StatusSnapshot, GitError> {
     let branch = current_branch(repo, git)?;
     let output = git.run(&repo.root, ["status", "--porcelain=v1"])?;
     let changed_files = parse_porcelain_status(&output.stdout)?;

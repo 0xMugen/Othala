@@ -262,4 +262,79 @@ mod tests {
             "sandbox_updated"
         );
     }
+
+    #[test]
+    fn sandbox_target_serializes_with_snake_case_tag() {
+        let task_target = super::SandboxTarget::Task {
+            task_id: "T1".to_string(),
+        };
+        let task_value = serde_json::to_value(&task_target).expect("serialize task target");
+        assert_eq!(
+            task_value,
+            serde_json::json!({
+                "task": {
+                    "task_id": "T1"
+                }
+            })
+        );
+        let task_back: super::SandboxTarget =
+            serde_json::from_value(task_value).expect("deserialize task target");
+        assert_eq!(task_back, task_target);
+
+        let stack_target = super::SandboxTarget::Stack {
+            task_ids: vec!["T1".to_string(), "T2".to_string()],
+        };
+        let stack_value = serde_json::to_value(&stack_target).expect("serialize stack target");
+        assert_eq!(
+            stack_value,
+            serde_json::json!({
+                "stack": {
+                    "task_ids": ["T1", "T2"]
+                }
+            })
+        );
+        let stack_back: super::SandboxTarget =
+            serde_json::from_value(stack_value).expect("deserialize stack target");
+        assert_eq!(stack_back, stack_target);
+    }
+
+    #[test]
+    fn task_view_maps_pr_fields_when_present() {
+        let mut task = Task {
+            id: TaskId("T300".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task with PR".to_string(),
+            state: TaskState::Ready,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some("task/T300".to_string()),
+            worktree_path: PathBuf::from(".orch/wt/T300"),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        task.pr = Some(orch_core::types::PullRequestRef {
+            number: 123,
+            url: "https://github.com/org/repo/pull/123".to_string(),
+            draft: true,
+        });
+
+        let view = TaskView::from(&task);
+        assert_eq!(view.pr_number, Some(123));
+        assert_eq!(
+            view.pr_url,
+            Some("https://github.com/org/repo/pull/123".to_string())
+        );
+    }
 }

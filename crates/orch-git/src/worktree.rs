@@ -98,7 +98,9 @@ impl WorktreeManager {
     }
 
     pub fn list(&self, repo: &RepoHandle) -> Result<Vec<ListedWorktree>, GitError> {
-        let output = self.git.run(&repo.root, ["worktree", "list", "--porcelain"])?;
+        let output = self
+            .git
+            .run(&repo.root, ["worktree", "list", "--porcelain"])?;
         parse_worktree_list(&output.stdout)
     }
 }
@@ -144,4 +146,61 @@ fn parse_worktree_list(raw: &str) -> Result<Vec<ListedWorktree>, GitError> {
     }
 
     Ok(listed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::parse_worktree_list;
+
+    #[test]
+    fn parse_worktree_list_parses_multiple_entries_and_trims_refs_prefix() {
+        let raw = "\
+worktree /repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /repo/.orch/wt/T1
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/task/T1
+
+";
+
+        let parsed = parse_worktree_list(raw).expect("parse worktree list");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, PathBuf::from("/repo"));
+        assert_eq!(
+            parsed[0].head.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(parsed[0].branch.as_deref(), Some("main"));
+        assert_eq!(parsed[1].path, PathBuf::from("/repo/.orch/wt/T1"));
+        assert_eq!(parsed[1].branch.as_deref(), Some("task/T1"));
+    }
+
+    #[test]
+    fn parse_worktree_list_handles_entry_without_branch() {
+        let raw = "\
+worktree /repo/.orch/wt/T2
+HEAD 3333333333333333333333333333333333333333
+detached
+
+";
+
+        let parsed = parse_worktree_list(raw).expect("parse worktree list");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, PathBuf::from("/repo/.orch/wt/T2"));
+        assert_eq!(
+            parsed[0].head.as_deref(),
+            Some("3333333333333333333333333333333333333333")
+        );
+        assert_eq!(parsed[0].branch, None);
+    }
+
+    #[test]
+    fn parse_worktree_list_rejects_non_empty_unparseable_output() {
+        let err = parse_worktree_list("nonsense output").expect_err("expected parse error");
+        assert!(matches!(err, crate::error::GitError::Parse { .. }));
+    }
 }

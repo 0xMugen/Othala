@@ -276,4 +276,43 @@ mod tests {
         );
         assert_eq!(queue.groups[1].task_ids, vec!["T9".to_string()]);
     }
+
+    #[test]
+    fn build_merge_queue_dedupes_and_sorts_pr_urls_within_group() {
+        let tasks = vec![
+            mk_task(
+                "T1",
+                TaskState::AwaitingMerge,
+                &[],
+                Some("https://github.com/org/repo/pull/9"),
+            ),
+            mk_task(
+                "T2",
+                TaskState::AwaitingMerge,
+                &["T1"],
+                Some("https://github.com/org/repo/pull/2"),
+            ),
+            mk_task(
+                "T3",
+                TaskState::AwaitingMerge,
+                &["T2"],
+                Some("https://github.com/org/repo/pull/9"),
+            ),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert_eq!(queue.groups.len(), 1);
+        let group = &queue.groups[0];
+        assert_eq!(
+            group.recommended_merge_order,
+            vec!["T1".to_string(), "T2".to_string(), "T3".to_string()]
+        );
+        assert_eq!(
+            group.pr_urls,
+            vec![
+                "https://github.com/org/repo/pull/2".to_string(),
+                "https://github.com/org/repo/pull/9".to_string(),
+            ]
+        );
+    }
 }

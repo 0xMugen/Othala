@@ -130,4 +130,38 @@ mod tests {
         assert_eq!(payload["code"], "internal_error");
         assert_eq!(payload["message"], "unexpected");
     }
+
+    #[tokio::test]
+    async fn not_found_message_uses_resource_not_found_prefix() {
+        let response = WebError::NotFound {
+            resource: "sandbox:SBX-9".to_string(),
+        }
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(
+            payload["message"],
+            "resource not found: sandbox:SBX-9".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn io_error_from_conversion_maps_to_io_error_code() {
+        let io = std::io::Error::other("permission denied");
+        let web: WebError = io.into();
+        let response = web.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload["code"], "io_error");
+        let message = payload["message"].as_str().expect("message as str");
+        assert!(message.contains("permission denied"));
+    }
 }

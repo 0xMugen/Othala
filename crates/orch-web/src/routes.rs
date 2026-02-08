@@ -122,7 +122,10 @@ mod tests {
     use std::path::PathBuf;
     use tower::ServiceExt;
 
-    use crate::model::{MergeQueueResponse, SandboxSpawnRequest, SandboxTarget, TaskListResponse};
+    use crate::model::{
+        MergeQueueResponse, SandboxDetailResponse, SandboxRunView, SandboxSpawnRequest,
+        SandboxStatus, SandboxTarget, TaskDetailResponse, TaskListResponse,
+    };
     use crate::state::WebState;
 
     use super::router;
@@ -154,6 +157,25 @@ mod tests {
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn mk_sandbox(id: &str, status: SandboxStatus) -> SandboxRunView {
+        SandboxRunView {
+            sandbox_id: id.to_string(),
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            status,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            sandbox_path: Some(PathBuf::from(format!("/tmp/{id}"))),
+            checkout_ref: Some("HEAD".to_string()),
+            cleanup_worktree: true,
+            worktree_cleaned: false,
+            worktree_cleanup_error: None,
+            logs: Vec::new(),
+            last_error: None,
         }
     }
 
@@ -209,6 +231,35 @@ mod tests {
         assert_eq!(payload["code"], "not_found");
         let message = payload["message"].as_str().expect("message as str");
         assert!(message.contains("task:T404"));
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_task_detail_for_existing_task() {
+        let state = WebState::default();
+        state
+            .upsert_task(mk_task("T42", TaskState::Reviewing, &["T1"]))
+            .await;
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks/T42")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: TaskDetailResponse = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload.task.task_id, "T42");
+        assert_eq!(payload.task.state, TaskState::Reviewing);
+        assert_eq!(payload.task.depends_on, vec!["T1".to_string()]);
     }
 
     #[tokio::test]
@@ -269,6 +320,35 @@ mod tests {
         assert_eq!(payload["code"], "not_found");
         let message = payload["message"].as_str().expect("message as str");
         assert!(message.contains("sandbox:SBX-404"));
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_returns_detail_for_existing_id() {
+        let state = WebState::default();
+        state
+            .upsert_sandbox(mk_sandbox("SBX-1", SandboxStatus::Running))
+            .await;
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sandbox/SBX-1")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: SandboxDetailResponse =
+            serde_json::from_slice(&body).expect("sandbox detail json");
+        assert_eq!(payload.sandbox.sandbox_id, "SBX-1");
+        assert_eq!(payload.sandbox.status, SandboxStatus::Running);
     }
 
     #[tokio::test]
