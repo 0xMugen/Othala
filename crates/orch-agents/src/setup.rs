@@ -1,7 +1,7 @@
 use orch_core::types::ModelKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
@@ -120,6 +120,8 @@ impl SetupCommandRunner for ProcessSetupCommandRunner {
         Command::new("bash")
             .arg("-lc")
             .arg(format!("command -v -- {}", shell_quote(executable)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
