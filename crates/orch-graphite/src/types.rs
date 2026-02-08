@@ -296,4 +296,57 @@ refs/heads/parent
         assert_eq!(inferred[0].parent_task_id.0, "T9");
         assert_eq!(inferred[0].child_task_id.0, "T10");
     }
+
+    #[test]
+    fn parse_gt_log_short_ignores_blank_lines_and_marks_current_node() {
+        let raw = r#"
+
+* stack/root
+
+  stack/child
+
+"#;
+        let snapshot = parse_gt_log_short(raw);
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert!(snapshot.nodes[0].is_current);
+        assert_eq!(snapshot.nodes[0].branch.as_deref(), Some("stack/root"));
+        assert!(!snapshot.nodes[1].is_current);
+        assert_eq!(snapshot.nodes[1].branch.as_deref(), Some("stack/child"));
+    }
+
+    #[test]
+    fn infer_task_dependencies_dedupes_duplicate_edges() {
+        let raw = r#"
+stack/root
+stack/child
+stack/child
+"#;
+        let snapshot = parse_gt_log_short(raw);
+        let mapping = HashMap::from([
+            ("stack/root".to_string(), TaskId("T1".to_string())),
+            ("stack/child".to_string(), TaskId("T2".to_string())),
+        ]);
+
+        let inferred = infer_task_dependencies_from_stack(&snapshot, &mapping);
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].parent_task_id.0, "T1");
+        assert_eq!(inferred[0].child_task_id.0, "T2");
+    }
+
+    #[test]
+    fn infer_task_dependencies_skips_edges_missing_task_mapping() {
+        let raw = r#"
+stack/root
+stack/child-a
+stack/child-b
+"#;
+        let snapshot = parse_gt_log_short(raw);
+        let mapping = HashMap::from([
+            ("stack/root".to_string(), TaskId("T1".to_string())),
+            ("stack/child-b".to_string(), TaskId("T3".to_string())),
+        ]);
+
+        let inferred = infer_task_dependencies_from_stack(&snapshot, &mapping);
+        assert!(inferred.is_empty());
+    }
 }
