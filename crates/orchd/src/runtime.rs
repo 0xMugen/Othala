@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use orch_core::config::{OrgConfig, RepoConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::{TaskState, VerifyTier};
-use orch_core::types::{EventId, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, Task, TaskId};
 use orch_git::{discover_repo, GitCli, GitError, WorktreeManager, WorktreeSpec};
 use orch_graphite::{GraphiteClient, GraphiteError, RestackOutcome};
 use orch_verify::{commands_for_tier, resolve_verify_commands, VerifyOutcome, VerifyRunner};
@@ -72,6 +72,7 @@ impl RuntimeEngine {
         service: &OrchdService,
         org_config: &OrgConfig,
         repo_configs: &HashMap<String, RepoConfig>,
+        model_availability: &HashMap<ModelKind, bool>,
         at: DateTime<Utc>,
     ) -> Result<RuntimeTickSummary, RuntimeError> {
         let mut summary = RuntimeTickSummary::default();
@@ -122,7 +123,7 @@ impl RuntimeEngine {
             }
         }
 
-        self.promote_ready_tasks(service, org_config, repo_configs, at)?;
+        self.promote_ready_tasks(service, org_config, repo_configs, model_availability, at)?;
 
         Ok(summary)
     }
@@ -451,6 +452,7 @@ impl RuntimeEngine {
         service: &OrchdService,
         org_config: &OrgConfig,
         repo_configs: &HashMap<String, RepoConfig>,
+        model_availability: &HashMap<ModelKind, bool>,
         at: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
         let review_config = crate::review_gate::ReviewGateConfig {
@@ -465,7 +467,7 @@ impl RuntimeEngine {
             .copied()
             .map(|model| crate::review_gate::ReviewerAvailability {
                 model,
-                available: true,
+                available: model_availability.get(&model).copied().unwrap_or(false),
             })
             .collect::<Vec<_>>();
 

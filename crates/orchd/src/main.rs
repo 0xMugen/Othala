@@ -12,7 +12,10 @@ use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatu
 use orch_core::types::ModelKind;
 use orch_core::types::{EventId, Task, TaskSpec};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
-use orchd::{OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig, ServiceError};
+use orchd::{
+    ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
+    ServiceError,
+};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -197,8 +200,12 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
     }
 
     let enabled_models = org.models.enabled.clone();
-    let availability = Vec::new();
-    let first_tick = service.schedule_queued_tasks(&enabled_models, &availability, Utc::now())?;
+    let probe_config = SetupProbeConfig::default();
+    let (scheduler_availability, runtime_availability) =
+        current_model_availability(&enabled_models, &probe_config);
+
+    let first_tick =
+        service.schedule_queued_tasks(&enabled_models, &scheduler_availability, Utc::now())?;
     if !first_tick.scheduled.is_empty() || !first_tick.blocked.is_empty() {
         println!(
             "orchd scheduler tick scheduled={} blocked={}",
@@ -206,7 +213,13 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
             first_tick.blocked.len()
         );
     }
-    let runtime_tick = runtime.tick(&service, &org, &repo_config_by_id, Utc::now())?;
+    let runtime_tick = runtime.tick(
+        &service,
+        &org,
+        &repo_config_by_id,
+        &runtime_availability,
+        Utc::now(),
+    )?;
     if runtime_tick.touched() {
         println!(
             "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
@@ -229,7 +242,10 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
     println!("orchd running; press Ctrl+C to stop");
     loop {
         thread::sleep(Duration::from_secs(5));
-        let tick = service.schedule_queued_tasks(&enabled_models, &availability, Utc::now())?;
+        let (scheduler_availability, runtime_availability) =
+            current_model_availability(&enabled_models, &probe_config);
+        let tick =
+            service.schedule_queued_tasks(&enabled_models, &scheduler_availability, Utc::now())?;
         if !tick.scheduled.is_empty() || !tick.blocked.is_empty() {
             println!(
                 "orchd scheduler tick scheduled={} blocked={}",
@@ -238,7 +254,13 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
             );
         }
 
-        let runtime_tick = runtime.tick(&service, &org, &repo_config_by_id, Utc::now())?;
+        let runtime_tick = runtime.tick(
+            &service,
+            &org,
+            &repo_config_by_id,
+            &runtime_availability,
+            Utc::now(),
+        )?;
         if runtime_tick.touched() {
             println!(
                 "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
@@ -475,6 +497,33 @@ fn model_kind_tag(model: &ModelKind) -> &'static str {
         ModelKind::Codex => "codex",
         ModelKind::Gemini => "gemini",
     }
+}
+
+fn current_model_availability(
+    enabled_models: &[ModelKind],
+    probe_config: &SetupProbeConfig,
+) -> (Vec<ModelAvailability>, HashMap<ModelKind, bool>) {
+    let report = probe_models(probe_config);
+    let mut availability_map = report
+        .models
+        .iter()
+        .map(|probe| (probe.model, probe.healthy))
+        .collect::<HashMap<_, _>>();
+
+    for model in enabled_models {
+        availability_map.entry(*model).or_insert(false);
+    }
+
+    let scheduler_availability = enabled_models
+        .iter()
+        .copied()
+        .map(|model| ModelAvailability {
+            model,
+            available: availability_map.get(&model).copied().unwrap_or(false),
+        })
+        .collect::<Vec<_>>();
+
+    (scheduler_availability, availability_map)
 }
 
 fn ensure_dir(path: &Path) -> Result<(), MainError> {
