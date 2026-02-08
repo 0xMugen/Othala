@@ -218,8 +218,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        BlockReason, ModelAvailability, QueuedTask, RunningTask, SchedulePlan, Scheduler,
-        SchedulerConfig, SchedulingInput,
+        BlockReason, ModelAvailability, QueuedTask, RunningTask, Scheduler, SchedulerConfig,
+        SchedulingInput,
     };
 
     fn mk_scheduler(per_repo_limit: usize, per_model_limit: &[(ModelKind, usize)]) -> Scheduler {
@@ -423,7 +423,4 @@ mod tests {
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].reason, BlockReason::NoAvailableModel);
     }
-
-    #[allow(dead_code)]
-    fn _assert_plan_shape(_plan: &SchedulePlan) {}
 }
