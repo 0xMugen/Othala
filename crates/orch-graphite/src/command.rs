@@ -98,9 +98,10 @@ impl GraphiteCli {
 
 fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(), GraphiteError> {
     let ok = match allowed {
-        AllowedAutoCommand::Create => {
-            args.len() == 2 && arg_eq(args, 0, "create") && !arg_at(args, 1).trim().is_empty()
-        }
+        AllowedAutoCommand::Create => args.len() == 2 && arg_eq(args, 0, "create") && {
+            let branch = arg_at(args, 1);
+            !branch.trim().is_empty() && !branch.starts_with('-')
+        },
         AllowedAutoCommand::Restack => args.len() == 1 && arg_eq(args, 0, "restack"),
         AllowedAutoCommand::AddAllForConflict => {
             args.len() == 2 && arg_eq(args, 0, "add") && arg_eq(args, 1, "-A")
@@ -178,6 +179,10 @@ mod tests {
     fn validate_contract_rejects_disallowed_or_mismatched_invocations() {
         let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", ""]))
             .expect_err("empty create branch should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", "--stack"]))
+            .expect_err("create branch must not be flag-like");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
         let err = validate_contract(AllowedAutoCommand::Restack, &os(&["restack", "--stack"]))
