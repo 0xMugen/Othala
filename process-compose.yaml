@@ -1,2 +1,14 @@
 version: "0.5"
-processes: {}
+processes:
+  orchd:
+    command: "nix develop -c cargo run -p orchd -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --event-log-root .orch/events"
+  orch-web:
+    command: "nix develop -c cargo run -p orch-web -- --org-config config/org.toml"
+    depends_on:
+      orchd:
+        condition: process_started
+  orch-tui:
+    command: "nix develop -c cargo run -p orch-tui -- --tick-ms 250"
+    depends_on:
+      orchd:
+        condition: process_started
