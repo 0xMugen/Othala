@@ -122,6 +122,12 @@ pub struct StartVerifyEventIds {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveRestackConflictEventIds {
+    pub restack_state_changed: EventId,
+    pub restack_resolved: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartSubmitEventIds {
     pub submit_state_changed: EventId,
     pub submit_started: EventId,
@@ -131,6 +137,21 @@ pub struct StartSubmitEventIds {
 pub struct MarkNeedsHumanEventIds {
     pub needs_human_state_changed: EventId,
     pub needs_human_event: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseTaskEventIds {
+    pub pause_state_changed: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeTaskEventIds {
+    pub resume_state_changed: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentHeadUpdateEventIds {
+    pub parent_head_updated: EventId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,6 +675,52 @@ impl OrchdService {
         Ok(task)
     }
 
+    pub fn resolve_restack_conflict(
+        &self,
+        task_id: &TaskId,
+        event_ids: ResolveRestackConflictEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        let current_state = task.state;
+        if !matches!(
+            current_state,
+            TaskState::RestackConflict | TaskState::Restacking
+        ) {
+            return Err(ServiceError::StateMachine(
+                StateMachineError::InvalidTransition {
+                    from: current_state,
+                    to: TaskState::Restacking,
+                },
+            ));
+        }
+
+        if current_state == TaskState::RestackConflict {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Restacking,
+                event_ids.restack_state_changed,
+                at,
+            )?;
+        }
+
+        self.record_event(&Event {
+            id: event_ids.restack_resolved,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::RestackResolved,
+        })?;
+
+        Ok(task)
+    }
+
     pub fn start_verify(
         &self,
         task_id: &TaskId,
@@ -774,6 +841,56 @@ impl OrchdService {
         Ok(task)
     }
 
+    pub fn pause_task(
+        &self,
+        task_id: &TaskId,
+        event_ids: PauseTaskEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if task.state != TaskState::Paused {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Paused,
+                event_ids.pause_state_changed,
+                at,
+            )?;
+        }
+
+        Ok(task)
+    }
+
+    pub fn resume_task(
+        &self,
+        task_id: &TaskId,
+        event_ids: ResumeTaskEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if task.state != TaskState::Running {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Running,
+                event_ids.resume_state_changed,
+                at,
+            )?;
+        }
+
+        Ok(task)
+    }
+
     pub fn complete_submit(
         &self,
         task_id: &TaskId,
@@ -843,6 +960,33 @@ impl OrchdService {
             &graph,
             parent_task_id,
         ))
+    }
+
+    pub fn handle_parent_head_updated(
+        &self,
+        parent_task_id: &TaskId,
+        inferred: &[InferredDependency],
+        event_ids: ParentHeadUpdateEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<TaskId>, ServiceError> {
+        let parent_task =
+            self.store
+                .load_task(parent_task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: parent_task_id.0.clone(),
+                })?;
+
+        self.record_event(&Event {
+            id: event_ids.parent_head_updated,
+            task_id: Some(parent_task.id.clone()),
+            repo_id: Some(parent_task.repo_id.clone()),
+            at,
+            kind: EventKind::ParentHeadUpdated {
+                parent_task_id: parent_task_id.clone(),
+            },
+        })?;
+
+        self.restack_targets_for_parent_update(parent_task_id, inferred)
     }
 
     pub fn restack_targets_for_event(
@@ -1005,8 +1149,9 @@ mod tests {
     use super::{
         CompleteFullVerifyEventIds, CompleteQuickVerifyEventIds, CompleteRestackEventIds,
         CompleteReviewEventIds, CompleteSubmitEventIds, DraftPrEventIds, MarkNeedsHumanEventIds,
-        OrchdService, PromoteTaskEventIds, RequestReviewEventIds, StartRestackEventIds,
-        StartSubmitEventIds, StartVerifyEventIds,
+        OrchdService, ParentHeadUpdateEventIds, PauseTaskEventIds, PromoteTaskEventIds,
+        RequestReviewEventIds, ResolveRestackConflictEventIds, ResumeTaskEventIds,
+        StartRestackEventIds, StartSubmitEventIds, StartVerifyEventIds,
     };
 
     fn mk_service() -> OrchdService {
@@ -1895,6 +2040,142 @@ mod tests {
     }
 
     #[test]
+    fn pause_task_transitions_active_task_to_paused() {
+        let svc = mk_service();
+        let task = mk_task("TPAUSE1", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .pause_task(
+                &task.id,
+                PauseTaskEventIds {
+                    pause_state_changed: EventId("E-PAUSE1-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("pause task");
+
+        assert_eq!(updated.state, TaskState::Paused);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RUNNING" && to == "PAUSED"
+            )
+        }));
+    }
+
+    #[test]
+    fn pause_task_is_idempotent_when_already_paused() {
+        let svc = mk_service();
+        let task = mk_task("TPAUSE2", TaskState::Paused, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .pause_task(
+                &task.id,
+                PauseTaskEventIds {
+                    pause_state_changed: EventId("E-PAUSE2-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("pause task");
+
+        assert_eq!(updated.state, TaskState::Paused);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+    }
+
+    #[test]
+    fn resume_task_transitions_paused_task_to_running() {
+        let svc = mk_service();
+        let task = mk_task("TRESUME1", TaskState::Paused, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .resume_task(
+                &task.id,
+                ResumeTaskEventIds {
+                    resume_state_changed: EventId("E-RESUME1-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("resume task");
+
+        assert_eq!(updated.state, TaskState::Running);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "PAUSED" && to == "RUNNING"
+            )
+        }));
+    }
+
+    #[test]
+    fn resume_task_is_idempotent_when_already_running() {
+        let svc = mk_service();
+        let task = mk_task("TRESUME2", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .resume_task(
+                &task.id,
+                ResumeTaskEventIds {
+                    resume_state_changed: EventId("E-RESUME2-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("resume task");
+
+        assert_eq!(updated.state, TaskState::Running);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+    }
+
+    #[test]
+    fn resume_task_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TRESUME3", TaskState::Submitting, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .resume_task(
+                &task.id,
+                ResumeTaskEventIds {
+                    resume_state_changed: EventId("E-RESUME3-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("submitting -> running is invalid");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::StateMachine(
+                crate::state_machine::StateMachineError::InvalidTransition {
+                    from: TaskState::Submitting,
+                    to: TaskState::Running
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn start_restack_transitions_running_to_restacking_and_emits_started() {
         let svc = mk_service();
         let task = mk_task("TRSTART1", TaskState::Running, &[]);
@@ -1986,6 +2267,97 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::RestackStarted)));
+    }
+
+    #[test]
+    fn resolve_restack_conflict_transitions_to_restacking_and_emits_resolved() {
+        let svc = mk_service();
+        let task = mk_task("TRRES1", TaskState::RestackConflict, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .resolve_restack_conflict(
+                &task.id,
+                ResolveRestackConflictEventIds {
+                    restack_state_changed: EventId("E-RRES1-STATE".to_string()),
+                    restack_resolved: EventId("E-RRES1-RESOLVED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("resolve restack conflict");
+
+        assert_eq!(updated.state, TaskState::Restacking);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RESTACK_CONFLICT" && to == "RESTACKING"
+            )
+        }));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackResolved)));
+    }
+
+    #[test]
+    fn resolve_restack_conflict_is_idempotent_when_already_restacking() {
+        let svc = mk_service();
+        let task = mk_task("TRRES2", TaskState::Restacking, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .resolve_restack_conflict(
+                &task.id,
+                ResolveRestackConflictEventIds {
+                    restack_state_changed: EventId("E-RRES2-STATE".to_string()),
+                    restack_resolved: EventId("E-RRES2-RESOLVED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("resolve restack conflict");
+
+        assert_eq!(updated.state, TaskState::Restacking);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackResolved)));
+    }
+
+    #[test]
+    fn resolve_restack_conflict_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TRRES3", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .resolve_restack_conflict(
+                &task.id,
+                ResolveRestackConflictEventIds {
+                    restack_state_changed: EventId("E-RRES3-STATE".to_string()),
+                    restack_resolved: EventId("E-RRES3-RESOLVED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("running cannot resolve a restack conflict");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::StateMachine(
+                crate::state_machine::StateMachineError::InvalidTransition {
+                    from: TaskState::Running,
+                    to: TaskState::Restacking
+                }
+            )
+        ));
     }
 
     #[test]
@@ -2226,6 +2598,86 @@ mod tests {
 
         let ids = targets.into_iter().map(|x| x.0).collect::<Vec<_>>();
         assert_eq!(ids, vec!["T2".to_string(), "T3".to_string()]);
+    }
+
+    #[test]
+    fn handle_parent_head_updated_records_event_and_returns_descendant_targets() {
+        let svc = mk_service();
+        let t1 = mk_task("TPHU1", TaskState::Running, &[]);
+        let t2 = mk_task("TPHU2", TaskState::Running, &["TPHU1"]);
+        let t3 = mk_task("TPHU3", TaskState::Running, &[]);
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+        svc.create_task(&t2, &mk_created_event(&t2))
+            .expect("create t2");
+        svc.create_task(&t3, &mk_created_event(&t3))
+            .expect("create t3");
+
+        let targets = svc
+            .handle_parent_head_updated(
+                &TaskId("TPHU1".to_string()),
+                &[InferredDependency {
+                    parent_task_id: TaskId("TPHU2".to_string()),
+                    child_task_id: TaskId("TPHU3".to_string()),
+                }],
+                ParentHeadUpdateEventIds {
+                    parent_head_updated: EventId("E-PHU1".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("handle parent head update");
+
+        let ids = targets.into_iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["TPHU2".to_string(), "TPHU3".to_string()]);
+
+        let events = svc.task_events(&t1.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ParentHeadUpdated { parent_task_id }
+                    if parent_task_id.0 == "TPHU1"
+            )
+        }));
+    }
+
+    #[test]
+    fn handle_parent_head_updated_returns_empty_for_leaf_parent() {
+        let svc = mk_service();
+        let t1 = mk_task("TPHU4", TaskState::Running, &[]);
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+
+        let targets = svc
+            .handle_parent_head_updated(
+                &TaskId("TPHU4".to_string()),
+                &[],
+                ParentHeadUpdateEventIds {
+                    parent_head_updated: EventId("E-PHU2".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("handle parent head update");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn handle_parent_head_updated_requires_existing_parent_task() {
+        let svc = mk_service();
+        let err = svc
+            .handle_parent_head_updated(
+                &TaskId("MISSING".to_string()),
+                &[],
+                ParentHeadUpdateEventIds {
+                    parent_head_updated: EventId("E-PHU3".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("missing parent task should error");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::TaskNotFound { task_id } if task_id == "MISSING"
+        ));
     }
 
     #[test]

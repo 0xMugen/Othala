@@ -162,3 +162,118 @@ fn topo_order_component(
     }
     (order, false)
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
+    use orch_core::types::{PullRequestRef, RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+    use std::path::PathBuf;
+
+    use super::build_merge_queue;
+
+    fn mk_task(id: &str, state: TaskState, depends_on: &[&str], pr_url: Option<&str>) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: depends_on
+                .iter()
+                .map(|parent| TaskId((*parent).to_string()))
+                .collect(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{id}")),
+            worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
+            pr: pr_url.map(|url| PullRequestRef {
+                number: 1,
+                url: url.to_string(),
+                draft: false,
+            }),
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn build_merge_queue_filters_non_awaiting_and_keeps_stack_order() {
+        let tasks = vec![
+            mk_task(
+                "T1",
+                TaskState::AwaitingMerge,
+                &[],
+                Some("https://github.com/org/repo/pull/1"),
+            ),
+            mk_task(
+                "T2",
+                TaskState::AwaitingMerge,
+                &["T1"],
+                Some("https://github.com/org/repo/pull/2"),
+            ),
+            mk_task("T3", TaskState::Running, &["T2"], None),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert_eq!(queue.groups.len(), 1);
+        let group = &queue.groups[0];
+        assert_eq!(group.task_ids, vec!["T1".to_string(), "T2".to_string()]);
+        assert_eq!(
+            group.recommended_merge_order,
+            vec!["T1".to_string(), "T2".to_string()]
+        );
+        assert_eq!(
+            group.pr_urls,
+            vec![
+                "https://github.com/org/repo/pull/1".to_string(),
+                "https://github.com/org/repo/pull/2".to_string(),
+            ]
+        );
+        assert!(!group.contains_cycle);
+    }
+
+    #[test]
+    fn build_merge_queue_marks_cycle_and_uses_sorted_fallback_order() {
+        let tasks = vec![
+            mk_task("A", TaskState::AwaitingMerge, &["B"], None),
+            mk_task("B", TaskState::AwaitingMerge, &["A"], None),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert_eq!(queue.groups.len(), 1);
+        let group = &queue.groups[0];
+        assert!(group.contains_cycle);
+        assert_eq!(group.task_ids, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            group.recommended_merge_order,
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_merge_queue_splits_disconnected_components() {
+        let tasks = vec![
+            mk_task("T1", TaskState::AwaitingMerge, &[], None),
+            mk_task("T2", TaskState::AwaitingMerge, &["T1"], None),
+            mk_task("T9", TaskState::AwaitingMerge, &[], None),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert_eq!(queue.groups.len(), 2);
+        assert_eq!(
+            queue.groups[0].task_ids,
+            vec!["T1".to_string(), "T2".to_string()]
+        );
+        assert_eq!(queue.groups[1].task_ids, vec!["T9".to_string()]);
+    }
+}

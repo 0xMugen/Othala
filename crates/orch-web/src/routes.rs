@@ -23,10 +23,10 @@ pub fn router(state: WebState) -> Router {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/api/tasks", get(list_tasks))
-        .route("/api/tasks/:task_id", get(get_task))
+        .route("/api/tasks/{task_id}", get(get_task))
         .route("/api/merge-queue", get(merge_queue))
         .route("/api/sandbox", post(spawn_sandbox))
-        .route("/api/sandbox/:sandbox_id", get(get_sandbox))
+        .route("/api/sandbox/{sandbox_id}", get(get_sandbox))
         .route("/api/events", get(stream_events))
         .with_state(state)
 }
@@ -110,4 +110,263 @@ async fn stream_events(
             .interval(Duration::from_secs(10))
             .text("keepalive"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use chrono::Utc;
+    use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
+    use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+    use std::path::PathBuf;
+    use tower::ServiceExt;
+
+    use crate::model::{MergeQueueResponse, SandboxSpawnRequest, SandboxTarget, TaskListResponse};
+    use crate::state::WebState;
+
+    use super::router;
+
+    fn mk_task(id: &str, state: TaskState, depends_on: &[&str]) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: depends_on
+                .iter()
+                .map(|parent| TaskId((*parent).to_string()))
+                .collect(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{id}")),
+            worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tasks_returns_task_views() {
+        let state = WebState::default();
+        state
+            .upsert_task(mk_task("T1", TaskState::Running, &[]))
+            .await;
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: TaskListResponse = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload.tasks.len(), 1);
+        assert_eq!(payload.tasks[0].task_id, "T1");
+        assert_eq!(payload.tasks[0].state, TaskState::Running);
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_not_found_error_for_unknown_task() {
+        let state = WebState::default();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks/T404")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["code"], "not_found");
+        let message = payload["message"].as_str().expect("message as str");
+        assert!(message.contains("task:T404"));
+    }
+
+    #[tokio::test]
+    async fn merge_queue_includes_only_awaiting_merge_tasks() {
+        let state = WebState::default();
+        state
+            .upsert_task(mk_task("T1", TaskState::AwaitingMerge, &[]))
+            .await;
+        state
+            .upsert_task(mk_task("T2", TaskState::Running, &["T1"]))
+            .await;
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/merge-queue")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: MergeQueueResponse = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload.groups.len(), 1);
+        assert_eq!(payload.groups[0].task_ids, vec!["T1".to_string()]);
+        assert_eq!(
+            payload.groups[0].recommended_merge_order,
+            vec!["T1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_returns_not_found_for_unknown_id() {
+        let state = WebState::default();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sandbox/SBX-404")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["code"], "not_found");
+        let message = payload["message"].as_str().expect("message as str");
+        assert!(message.contains("sandbox:SBX-404"));
+    }
+
+    #[tokio::test]
+    async fn spawn_sandbox_rejects_empty_verify_commands() {
+        let state = WebState::default();
+        let app = router(state);
+
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: PathBuf::from("/tmp/repo"),
+            nix_dev_shell: "nix develop".to_string(),
+            verify_full_commands: Vec::new(),
+            checkout_ref: None,
+            cleanup_worktree: true,
+        };
+        let body = serde_json::to_vec(&request).expect("request json");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sandbox")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["code"], "bad_request");
+        let message = payload["message"].as_str().expect("message as str");
+        assert!(message.contains("verify_full_commands"));
+    }
+
+    #[tokio::test]
+    async fn spawn_sandbox_rejects_empty_nix_dev_shell() {
+        let state = WebState::default();
+        let app = router(state);
+
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: PathBuf::from("/tmp/repo"),
+            nix_dev_shell: "   ".to_string(),
+            verify_full_commands: vec!["echo ok".to_string()],
+            checkout_ref: None,
+            cleanup_worktree: true,
+        };
+        let body = serde_json::to_vec(&request).expect("request json");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sandbox")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["code"], "bad_request");
+        let message = payload["message"].as_str().expect("message as str");
+        assert!(message.contains("nix_dev_shell"));
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok_true() {
+        let state = WebState::default();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("health json");
+        assert_eq!(payload["ok"], true);
+    }
 }

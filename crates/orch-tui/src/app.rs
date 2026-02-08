@@ -8,9 +8,15 @@ use crate::event::TuiEvent;
 use crate::model::{AgentPane, AgentPaneStatus, DashboardState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedAction {
+    pub action: UiAction,
+    pub task_id: Option<TaskId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiApp {
     pub state: DashboardState,
-    pub action_queue: VecDeque<UiAction>,
+    pub action_queue: VecDeque<QueuedAction>,
     pub should_quit: bool,
 }
 
@@ -50,11 +56,16 @@ impl TuiApp {
     }
 
     pub fn push_action(&mut self, action: UiAction) {
-        self.state.status_line = format!("queued action={}", action_label(action));
-        self.action_queue.push_back(action);
+        let task_id = self.state.selected_task().map(|task| task.task_id.clone());
+        self.state.status_line = match &task_id {
+            Some(task_id) => format!("queued action={} task={}", action_label(action), task_id.0),
+            None => format!("queued action={}", action_label(action)),
+        };
+        self.action_queue
+            .push_back(QueuedAction { action, task_id });
     }
 
-    pub fn drain_actions(&mut self) -> Vec<UiAction> {
+    pub fn drain_actions(&mut self) -> Vec<QueuedAction> {
         self.action_queue.drain(..).collect()
     }
 
@@ -148,9 +159,12 @@ impl TuiApp {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use orch_core::state::TaskState;
+    use orch_core::types::RepoId;
     use orch_core::types::{ModelKind, TaskId};
 
-    use crate::{AgentPaneStatus, TuiApp, TuiEvent};
+    use crate::{AgentPaneStatus, TaskOverviewRow, TuiApp, TuiEvent, UiAction};
 
     #[test]
     fn apply_event_agent_output_creates_and_updates_pane() {
@@ -200,5 +214,55 @@ mod tests {
             status: AgentPaneStatus::Failed,
         });
         assert_eq!(app.state.status_line, "pane not found: missing");
+    }
+
+    #[test]
+    fn push_action_attaches_selected_task_id() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Running,
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::Running,
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+        ];
+        app.state.selected_task_idx = 1;
+
+        app.push_action(UiAction::RunVerifyQuick);
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
+        assert_eq!(drained[0].task_id, Some(TaskId("T2".to_string())));
+        assert_eq!(
+            app.state.status_line,
+            "queued action=run_verify_quick task=T2"
+        );
+    }
+
+    #[test]
+    fn push_action_uses_none_task_id_when_no_tasks_exist() {
+        let mut app = TuiApp::default();
+        app.push_action(UiAction::TriggerRestack);
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::TriggerRestack);
+        assert_eq!(drained[0].task_id, None);
+        assert_eq!(app.state.status_line, "queued action=trigger_restack");
     }
 }

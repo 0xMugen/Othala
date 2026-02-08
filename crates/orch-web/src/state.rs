@@ -110,3 +110,152 @@ impl WebState {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
+    use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+    use std::path::PathBuf;
+    use tokio::sync::broadcast::Receiver;
+    use tokio::time::{timeout, Duration};
+
+    use crate::model::{SandboxRunView, SandboxStatus, SandboxTarget, WebEvent};
+
+    use super::WebState;
+
+    fn mk_task(id: &str, state: TaskState) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{id}")),
+            worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn mk_sandbox(id: &str, status: SandboxStatus) -> SandboxRunView {
+        SandboxRunView {
+            sandbox_id: id.to_string(),
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            status,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            sandbox_path: Some(PathBuf::from(format!("/tmp/{id}"))),
+            checkout_ref: Some("HEAD".to_string()),
+            cleanup_worktree: true,
+            worktree_cleaned: false,
+            worktree_cleanup_error: None,
+            logs: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    async fn recv_event(rx: &mut Receiver<WebEvent>) -> WebEvent {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("event received")
+    }
+
+    #[tokio::test]
+    async fn replace_tasks_emits_count_event_and_persists_tasks() {
+        let state = WebState::default();
+        let mut rx = state.subscribe();
+
+        state
+            .replace_tasks(vec![
+                mk_task("T1", TaskState::AwaitingMerge),
+                mk_task("T2", TaskState::Running),
+            ])
+            .await;
+
+        let event = recv_event(&mut rx).await;
+        assert!(matches!(
+            event.kind,
+            crate::model::WebEventKind::TasksReplaced { count } if count == 2
+        ));
+        assert_eq!(state.list_tasks().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_task_emits_event_and_allows_lookup() {
+        let state = WebState::default();
+        let mut rx = state.subscribe();
+
+        state.upsert_task(mk_task("T9", TaskState::Reviewing)).await;
+
+        let event = recv_event(&mut rx).await;
+        assert!(matches!(
+            event.kind,
+            crate::model::WebEventKind::TaskUpserted { task_id, state: task_state }
+                if task_id == "T9" && task_state == TaskState::Reviewing
+        ));
+        let loaded = state.task("T9").await.expect("task exists");
+        assert_eq!(loaded.state, TaskState::Reviewing);
+    }
+
+    #[tokio::test]
+    async fn upsert_and_update_sandbox_emit_events_and_mutate_state() {
+        let state = WebState::default();
+        let mut rx = state.subscribe();
+
+        state
+            .upsert_sandbox(mk_sandbox("SBX-1", SandboxStatus::Queued))
+            .await;
+        let queued_event = recv_event(&mut rx).await;
+        assert!(matches!(
+            queued_event.kind,
+            crate::model::WebEventKind::SandboxUpdated { sandbox_id, status }
+                if sandbox_id == "SBX-1" && status == SandboxStatus::Queued
+        ));
+
+        let before = state
+            .sandbox("SBX-1")
+            .await
+            .expect("sandbox exists")
+            .updated_at;
+        let updated = state
+            .update_sandbox("SBX-1", |run| {
+                run.status = SandboxStatus::Running;
+            })
+            .await
+            .expect("sandbox updated");
+        assert_eq!(updated.status, SandboxStatus::Running);
+        assert!(updated.updated_at >= before);
+
+        let running_event = recv_event(&mut rx).await;
+        assert!(matches!(
+            running_event.kind,
+            crate::model::WebEventKind::SandboxUpdated { sandbox_id, status }
+                if sandbox_id == "SBX-1" && status == SandboxStatus::Running
+        ));
+    }
+
+    #[test]
+    fn next_sandbox_id_increments_monotonically() {
+        let state = WebState::default();
+        assert_eq!(state.next_sandbox_id(), "SBX-1");
+        assert_eq!(state.next_sandbox_id(), "SBX-2");
+        assert_eq!(state.next_sandbox_id(), "SBX-3");
+    }
+}
