@@ -794,6 +794,7 @@ dependencies = [
  "chrono",
  "orch-core",
  "orch-verify",
+ "orchd",
  "serde",
  "serde_json",
  "thiserror",

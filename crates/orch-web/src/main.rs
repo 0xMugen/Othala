@@ -2,14 +2,19 @@ use orch_core::config::{load_org_config, ConfigError};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_web::{run_web_server, WebError, WebState};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const DEFAULT_ORG_CONFIG: &str = "config/org.toml";
+const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
+const DEFAULT_SYNC_INTERVAL_MS: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     org_config_path: PathBuf,
     bind_override: Option<String>,
+    sqlite_path: PathBuf,
+    sync_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,8 +66,39 @@ async fn run() -> Result<(), MainError> {
     validate_org_config(&org.validate())?;
     let bind = resolve_bind(args.bind_override, &org.ui.web_bind)?;
 
+    let state = WebState::default();
+    if let Err(err) = sync_tasks_from_sqlite(&args.sqlite_path, &state).await {
+        eprintln!("orch-web startup sync warning: {err}");
+    }
+
+    let sqlite_path = args.sqlite_path.clone();
+    let interval = Duration::from_millis(args.sync_interval_ms);
+    let state_for_sync = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = sync_tasks_from_sqlite(&sqlite_path, &state_for_sync).await {
+                eprintln!("orch-web task sync warning: {err}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+
     println!("orch-web binding to {bind}");
-    run_web_server(&bind, WebState::default()).await?;
+    run_web_server(&bind, state).await?;
+    Ok(())
+}
+
+async fn sync_tasks_from_sqlite(sqlite_path: &Path, state: &WebState) -> Result<(), String> {
+    let sqlite_path = sqlite_path.to_path_buf();
+    let tasks = tokio::task::spawn_blocking(move || {
+        let store = orchd::SqliteStore::open(&sqlite_path).map_err(|err| err.to_string())?;
+        store.migrate().map_err(|err| err.to_string())?;
+        store.list_tasks().map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+
+    state.replace_tasks(tasks).await;
     Ok(())
 }
 
@@ -101,6 +137,8 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
     let mut parsed = CliArgs {
         org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
         bind_override: None,
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        sync_interval_ms: DEFAULT_SYNC_INTERVAL_MS,
     };
 
     let mut idx = 0usize;
@@ -122,6 +160,30 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
                     .ok_or_else(|| MainError::Args("missing value for --bind".to_string()))?;
                 parsed.bind_override = Some(value.clone());
             }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                parsed.sqlite_path = PathBuf::from(value);
+            }
+            "--sync-interval-ms" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sync-interval-ms".to_string())
+                })?;
+                let parsed_interval = value.parse::<u64>().map_err(|_| {
+                    MainError::Args(format!(
+                        "invalid --sync-interval-ms value: {value} (expected u64 > 0)"
+                    ))
+                })?;
+                if parsed_interval == 0 {
+                    return Err(MainError::Args(
+                        "invalid --sync-interval-ms value: 0 (must be > 0)".to_string(),
+                    ));
+                }
+                parsed.sync_interval_ms = parsed_interval;
+            }
             other => {
                 return Err(MainError::Args(format!(
                     "unknown argument: {other}\n\n{}",
@@ -137,10 +199,12 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--org-config <path>] [--bind <ip:port>]\n\
+        "Usage: {program} [--org-config <path>] [--bind <ip:port>] [--sqlite-path <path>] [--sync-interval-ms <u64>]\n\
 Defaults:\n\
   --org-config {DEFAULT_ORG_CONFIG}\n\
-  --bind from config.org.ui.web_bind"
+  --bind from config.org.ui.web_bind\n\
+  --sqlite-path {DEFAULT_SQLITE_PATH}\n\
+  --sync-interval-ms {DEFAULT_SYNC_INTERVAL_MS}"
     )
 }
 
@@ -157,6 +221,8 @@ mod tests {
             CliCommand::Run(CliArgs {
                 org_config_path: PathBuf::from("config/org.toml"),
                 bind_override: None,
+                sqlite_path: PathBuf::from(".orch/state.sqlite"),
+                sync_interval_ms: 1000,
             })
         );
     }
@@ -169,6 +235,10 @@ mod tests {
                 "/tmp/org.toml".to_string(),
                 "--bind".to_string(),
                 "0.0.0.0:9842".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+                "--sync-interval-ms".to_string(),
+                "2000".to_string(),
             ],
             "orch-web",
         )
@@ -178,6 +248,8 @@ mod tests {
             CliCommand::Run(CliArgs {
                 org_config_path: PathBuf::from("/tmp/org.toml"),
                 bind_override: Some("0.0.0.0:9842".to_string()),
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                sync_interval_ms: 2000,
             })
         );
     }
@@ -197,13 +269,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_args_requires_values_for_org_config_and_bind() {
+    fn parse_cli_args_requires_values_for_all_value_flags() {
         let err = parse_cli_args(vec!["--org-config".to_string()], "orch-web")
             .expect_err("missing org config");
         assert_eq!(err.to_string(), "missing value for --org-config");
 
         let err = parse_cli_args(vec!["--bind".to_string()], "orch-web").expect_err("missing bind");
         assert_eq!(err.to_string(), "missing value for --bind");
+
+        let err = parse_cli_args(vec!["--sqlite-path".to_string()], "orch-web")
+            .expect_err("missing sqlite path");
+        assert_eq!(err.to_string(), "missing value for --sqlite-path");
+
+        let err = parse_cli_args(vec!["--sync-interval-ms".to_string()], "orch-web")
+            .expect_err("missing sync interval");
+        assert_eq!(err.to_string(), "missing value for --sync-interval-ms");
+    }
+
+    #[test]
+    fn parse_cli_args_validates_sync_interval_is_positive_u64() {
+        let err = parse_cli_args(
+            vec!["--sync-interval-ms".to_string(), "abc".to_string()],
+            "orch-web",
+        )
+        .expect_err("invalid numeric value");
+        assert_eq!(
+            err.to_string(),
+            "invalid --sync-interval-ms value: abc (expected u64 > 0)"
+        );
+
+        let err = parse_cli_args(
+            vec!["--sync-interval-ms".to_string(), "0".to_string()],
+            "orch-web",
+        )
+        .expect_err("zero interval");
+        assert_eq!(
+            err.to_string(),
+            "invalid --sync-interval-ms value: 0 (must be > 0)"
+        );
     }
 
     #[test]
