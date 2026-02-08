@@ -121,6 +121,12 @@ A validated local flow (with controlled test config) is:
 4. `review-approve` records required approvals
 5. daemon tick promotes task -> `READY` (or `SUBMITTING` when auto-submit enabled)
 
+You can run this exact controlled path with:
+
+```bash
+scripts/e2e-ready.sh
+```
+
 ## Project Layout
 
 ```text
