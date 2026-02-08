@@ -1119,7 +1119,7 @@ impl OrchdService {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use orch_core::events::{
         EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
     };
@@ -1379,6 +1379,106 @@ mod tests {
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].task_id, TaskId("TSCH2".to_string()));
         assert_eq!(plan.blocked[0].reason, BlockReason::RepoLimitReached);
+    }
+
+    #[test]
+    fn task_returns_none_when_task_is_missing() {
+        let svc = mk_service();
+        let task = svc
+            .task(&TaskId("MISSING-TASK".to_string()))
+            .expect("query task");
+        assert_eq!(task, None);
+    }
+
+    #[test]
+    fn list_tasks_and_list_tasks_by_state_use_store_ordering_and_filtering() {
+        let svc = mk_service();
+        let base = Utc::now();
+
+        let mut t1 = mk_task("TLIST1", TaskState::Running, &[]);
+        t1.created_at = base;
+        t1.updated_at = base + Duration::seconds(1);
+        let mut t2 = mk_task("TLIST2", TaskState::Reviewing, &[]);
+        t2.created_at = base;
+        t2.updated_at = base + Duration::seconds(2);
+        let mut t3 = mk_task("TLIST3", TaskState::Running, &[]);
+        t3.created_at = base;
+        t3.updated_at = base + Duration::seconds(3);
+
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+        svc.create_task(&t2, &mk_created_event(&t2))
+            .expect("create t2");
+        svc.create_task(&t3, &mk_created_event(&t3))
+            .expect("create t3");
+
+        let listed = svc.list_tasks().expect("list tasks");
+        let listed_ids = listed.into_iter().map(|task| task.id.0).collect::<Vec<_>>();
+        assert_eq!(
+            listed_ids,
+            vec![
+                "TLIST3".to_string(),
+                "TLIST2".to_string(),
+                "TLIST1".to_string()
+            ]
+        );
+
+        let running = svc
+            .list_tasks_by_state(TaskState::Running)
+            .expect("list running tasks");
+        let running_ids = running
+            .into_iter()
+            .map(|task| task.id.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            running_ids,
+            vec!["TLIST3".to_string(), "TLIST1".to_string()]
+        );
+    }
+
+    #[test]
+    fn global_events_returns_events_in_store_order() {
+        let svc = mk_service();
+        let base = Utc::now();
+
+        let mut t1 = mk_task("TEVENT1", TaskState::Running, &[]);
+        t1.created_at = base;
+        t1.updated_at = base;
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create task");
+
+        let event_2 = orch_core::events::Event {
+            id: EventId("E-GLOBAL-2".to_string()),
+            task_id: Some(t1.id.clone()),
+            repo_id: Some(t1.repo_id.clone()),
+            at: base + Duration::seconds(5),
+            kind: EventKind::RestackStarted,
+        };
+        let event_1 = orch_core::events::Event {
+            id: EventId("E-GLOBAL-1".to_string()),
+            task_id: Some(t1.id.clone()),
+            repo_id: Some(t1.repo_id.clone()),
+            at: base + Duration::seconds(5),
+            kind: EventKind::VerifyRequested {
+                tier: orch_core::state::VerifyTier::Quick,
+            },
+        };
+        svc.record_event(&event_2).expect("record event 2");
+        svc.record_event(&event_1).expect("record event 1");
+
+        let events = svc.global_events().expect("list global events");
+        let ids = events
+            .into_iter()
+            .map(|event| event.id.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                format!("E-CREATE-{}", t1.id.0),
+                "E-GLOBAL-1".to_string(),
+                "E-GLOBAL-2".to_string()
+            ]
+        );
     }
 
     #[test]
