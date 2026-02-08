@@ -369,4 +369,45 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("health json");
         assert_eq!(payload["ok"], true);
     }
+
+    #[tokio::test]
+    async fn index_endpoint_returns_running_text() {
+        let state = WebState::default();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert_eq!(text, "orch-web running");
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        let state = WebState::default();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
