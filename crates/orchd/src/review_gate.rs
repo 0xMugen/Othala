@@ -414,6 +414,26 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_missing_availability_entries_are_treated_as_unavailable() {
+        let cfg = ReviewGateConfig {
+            enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+            policy: ReviewPolicy::Adaptive,
+            min_approvals: 2,
+        };
+        let requirement = compute_review_requirement(
+            &cfg,
+            &[ReviewerAvailability {
+                model: ModelKind::Claude,
+                available: true,
+            }],
+        );
+
+        assert_eq!(requirement.capacity_state, ReviewCapacityState::NeedsHuman);
+        assert_eq!(requirement.required_models, vec![ModelKind::Claude]);
+        assert_eq!(requirement.approvals_required, 0);
+    }
+
+    #[test]
     fn evaluate_review_gate_uses_latest_verdict_per_reviewer() {
         let cfg = ReviewGateConfig {
             enabled_models: vec![ModelKind::Claude],
