@@ -362,6 +362,27 @@ mod tests {
     }
 
     #[test]
+    fn ready_gate_blocks_on_capacity_even_when_reviews_are_approved() {
+        let mut review = approved_review();
+        review.requirement.capacity_state = ReviewCapacityState::WaitingForReviewCapacity;
+        review.approved = true;
+
+        let input = ReadyGateInput {
+            verify_status: VerifyStatus::Passed {
+                tier: orch_core::state::VerifyTier::Quick,
+            },
+            review_evaluation: review,
+            graphite_hygiene_ok: true,
+        };
+        let decision = evaluate_ready_gate(&input);
+        assert!(!decision.ready);
+        assert_eq!(
+            decision.reasons,
+            vec![ReadyFailureReason::WaitingForReviewCapacity]
+        );
+    }
+
+    #[test]
     fn ready_gate_dedupes_reason_when_capacity_needs_human_and_review_not_approved() {
         let input = ReadyGateInput {
             verify_status: VerifyStatus::NotRun,

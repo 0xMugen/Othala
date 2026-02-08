@@ -146,4 +146,16 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn discover_repo_propagates_non_command_failed_git_errors() {
+        let dir = unique_temp_dir("missing-git");
+        fs::create_dir_all(&dir).expect("create plain dir");
+
+        let git = GitCli::new("/definitely/missing/git-binary");
+        let err = discover_repo(&dir, &git).expect_err("missing git binary should propagate io");
+        assert!(matches!(err, GitError::Io { .. }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

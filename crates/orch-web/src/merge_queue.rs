@@ -334,4 +334,15 @@ mod tests {
         );
         assert!(!group.contains_cycle);
     }
+
+    #[test]
+    fn build_merge_queue_returns_no_groups_when_nothing_is_awaiting_merge() {
+        let tasks = vec![
+            mk_task("T1", TaskState::Running, &[], None),
+            mk_task("T2", TaskState::Reviewing, &["T1"], None),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert!(queue.groups.is_empty());
+    }
 }
