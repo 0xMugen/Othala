@@ -76,4 +76,22 @@ mod tests {
         let signal = detect_common_signal("progress: compiling crates");
         assert!(signal.is_none());
     }
+
+    #[test]
+    fn prioritizes_need_human_over_other_markers_in_same_line() {
+        let signal = detect_common_signal(
+            "status: [needs_human] and ready for review but fatal: waiting for human",
+        )
+        .expect("need human signal");
+        assert_eq!(signal.kind, AgentSignalKind::NeedHuman);
+    }
+
+    #[test]
+    fn signal_message_is_trimmed_but_source_line_is_preserved() {
+        let raw = "   TRACEBACK: something failed   ";
+        let signal = detect_common_signal(raw).expect("error hint signal");
+        assert_eq!(signal.kind, AgentSignalKind::ErrorHint);
+        assert_eq!(signal.message, "TRACEBACK: something failed");
+        assert_eq!(signal.source_line, raw);
+    }
 }
