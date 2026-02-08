@@ -537,4 +537,50 @@ web_bind = "127.0.0.1:9842"
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].reason, BlockReason::NoAvailableModel);
     }
+
+    #[test]
+    fn plan_falls_back_when_preferred_model_is_not_in_eligible_set() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Codex, 10), (ModelKind::Claude, 10)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Codex),
+                &[ModelKind::Claude],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex, ModelKind::Claude],
+            availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Claude);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_treats_missing_per_model_limit_as_unbounded() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Codex, 1)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Gemini),
+                &[ModelKind::Gemini],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Gemini],
+            availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Gemini);
+        assert!(plan.blocked.is_empty());
+    }
 }
