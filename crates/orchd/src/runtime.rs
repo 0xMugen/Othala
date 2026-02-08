@@ -21,6 +21,7 @@ static EVENT_NONCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeTickSummary {
     pub initialized: usize,
+    pub verify_started: usize,
     pub restacked: usize,
     pub restack_conflicts: usize,
     pub verify_passed: usize,
@@ -33,6 +34,7 @@ pub struct RuntimeTickSummary {
 impl RuntimeTickSummary {
     pub fn touched(&self) -> bool {
         self.initialized > 0
+            || self.verify_started > 0
             || self.restacked > 0
             || self.restack_conflicts > 0
             || self.verify_passed > 0
@@ -93,6 +95,13 @@ impl RuntimeEngine {
                 RestackTickOutcome::Restacked => summary.restacked += 1,
                 RestackTickOutcome::Conflict => summary.restack_conflicts += 1,
                 RestackTickOutcome::Failed => summary.errors += 1,
+            }
+        }
+
+        let running = service.list_tasks_by_state(TaskState::Running)?;
+        for task in running {
+            if self.maybe_start_quick_verify(service, &task, at)? {
+                summary.verify_started += 1;
             }
         }
 
@@ -252,6 +261,11 @@ impl RuntimeEngine {
             )?;
         }
 
+        let _ = service
+            .store
+            .finish_open_runs_for_task(&task.id, at, "initialized", Some(0))
+            .map_err(ServiceError::from)?;
+
         Ok(true)
     }
 
@@ -402,6 +416,36 @@ impl RuntimeEngine {
         }
 
         Ok(success)
+    }
+
+    fn maybe_start_quick_verify(
+        &self,
+        service: &OrchdService,
+        task: &Task,
+        at: DateTime<Utc>,
+    ) -> Result<bool, RuntimeError> {
+        let should_start = matches!(
+            task.verify_status,
+            orch_core::state::VerifyStatus::NotRun
+                | orch_core::state::VerifyStatus::Failed { .. }
+                | orch_core::state::VerifyStatus::Passed {
+                    tier: VerifyTier::Full
+                }
+        );
+        if !should_start {
+            return Ok(false);
+        }
+
+        let _ = service.start_verify(
+            &task.id,
+            VerifyTier::Quick,
+            crate::service::StartVerifyEventIds {
+                verify_state_changed: event_id(&task.id, "VERIFY-QUICK-START-S", at),
+                verify_requested: event_id(&task.id, "VERIFY-QUICK-START-E", at),
+            },
+            at,
+        )?;
+        Ok(true)
     }
 
     fn submit_task(

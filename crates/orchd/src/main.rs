@@ -7,10 +7,12 @@ use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
     ConfigError, RepoConfig, SetupApplyError,
 };
-use orch_core::events::{Event, EventKind};
+use orch_core::events::{
+    Event, EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
+};
 use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
 use orch_core::types::ModelKind;
-use orch_core::types::{EventId, Task, TaskSpec};
+use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -61,11 +63,22 @@ struct ListTasksCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewApproveCliArgs {
+    org_config_path: PathBuf,
+    sqlite_path: PathBuf,
+    event_log_root: PathBuf,
+    task_id: TaskId,
+    reviewer: ModelKind,
+    verdict: ReviewVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run(RunCliArgs),
     Setup(SetupCliArgs),
     CreateTask(CreateTaskCliArgs),
     ListTasks(ListTasksCliArgs),
+    ReviewApprove(ReviewApproveCliArgs),
     Help(String),
 }
 
@@ -149,6 +162,7 @@ fn run() -> Result<(), MainError> {
         CliCommand::Setup(args) => run_setup(args),
         CliCommand::CreateTask(args) => run_create_task(args),
         CliCommand::ListTasks(args) => run_list_tasks(args),
+        CliCommand::ReviewApprove(args) => run_review_approve(args),
     }
 }
 
@@ -222,8 +236,9 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
     )?;
     if runtime_tick.touched() {
         println!(
-            "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
+            "orchd runtime tick initialized={} verify_started={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
             runtime_tick.initialized,
+            runtime_tick.verify_started,
             runtime_tick.restacked,
             runtime_tick.restack_conflicts,
             runtime_tick.verify_passed,
@@ -263,8 +278,9 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
         )?;
         if runtime_tick.touched() {
             println!(
-                "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
+                "orchd runtime tick initialized={} verify_started={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
                 runtime_tick.initialized,
+                runtime_tick.verify_started,
                 runtime_tick.restacked,
                 runtime_tick.restack_conflicts,
                 runtime_tick.verify_passed,
@@ -458,6 +474,83 @@ fn run_list_tasks(args: ListTasksCliArgs) -> Result<(), MainError> {
     Ok(())
 }
 
+fn run_review_approve(args: ReviewApproveCliArgs) -> Result<(), MainError> {
+    ensure_parent_dir(&args.sqlite_path)?;
+    ensure_dir(&args.event_log_root)?;
+
+    let org = load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+    validate_org_config(&org.validate())?;
+
+    let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
+    let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
+
+    let probe_config = SetupProbeConfig::default();
+    let (_, availability_map) = current_model_availability(&org.models.enabled, &probe_config);
+    let review_config = orchd::ReviewGateConfig {
+        enabled_models: org.models.enabled.clone(),
+        policy: org.models.policy,
+        min_approvals: org.models.min_approvals,
+    };
+    let availability = org
+        .models
+        .enabled
+        .iter()
+        .copied()
+        .map(|model| orchd::ReviewerAvailability {
+            model,
+            available: availability_map.get(&model).copied().unwrap_or(false),
+        })
+        .collect::<Vec<_>>();
+
+    let output = ReviewOutput {
+        verdict: args.verdict,
+        issues: Vec::new(),
+        risk_flags: Vec::new(),
+        graphite_hygiene: GraphiteHygieneReport {
+            ok: true,
+            notes: "manual approval".to_string(),
+        },
+        test_assessment: TestAssessment {
+            ok: true,
+            notes: "manual approval".to_string(),
+        },
+    };
+
+    let now = Utc::now();
+    let event_nonce = now.timestamp_nanos_opt().unwrap_or_default();
+    let outcome = service.complete_review(
+        &args.task_id,
+        args.reviewer,
+        output,
+        &review_config,
+        &availability,
+        orchd::CompleteReviewEventIds {
+            review_completed: EventId(format!("E-REVIEW-DONE-{}-{event_nonce}", args.task_id.0)),
+            needs_human_state_changed: EventId(format!(
+                "E-REVIEW-NH-S-{}-{event_nonce}",
+                args.task_id.0
+            )),
+            needs_human_event: EventId(format!("E-REVIEW-NH-E-{}-{event_nonce}", args.task_id.0)),
+        },
+        now,
+    )?;
+
+    println!(
+        "review recorded task={} reviewer={} verdict={:?} approvals={}/{} approved={}",
+        outcome.task.id.0,
+        model_kind_tag(&args.reviewer),
+        args.verdict,
+        outcome.computation.evaluation.approvals_received,
+        outcome.computation.requirement.approvals_required,
+        outcome.computation.evaluation.approved
+    );
+
+    Ok(())
+}
+
 fn print_setup_summary(summary: &SetupSummary, per_model_concurrency: usize, path: &Path) {
     println!(
         "setup saved org config to {} (per-model concurrency={})",
@@ -507,7 +600,9 @@ fn current_model_availability(
     let mut availability_map = report
         .models
         .iter()
-        .map(|probe| (probe.model, probe.healthy))
+        // Runtime scheduling only needs executable reachability.
+        // Full env health remains visible in setup checks.
+        .map(|probe| (probe.model, probe.installed && probe.version_ok))
         .collect::<HashMap<_, _>>();
 
     for model in enabled_models {
@@ -631,6 +726,7 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
         "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
         "create-task" => parse_create_task_cli_args(args[1..].to_vec(), program),
         "list-tasks" => parse_list_tasks_cli_args(args[1..].to_vec(), program),
+        "review-approve" => parse_review_approve_cli_args(args[1..].to_vec(), program),
         "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
         _ => parse_run_cli_args(args, program),
     }
@@ -863,6 +959,90 @@ fn parse_list_tasks_cli_args(args: Vec<String>, program: &str) -> Result<CliComm
     Ok(CliCommand::ListTasks(parsed))
 }
 
+fn parse_review_approve_cli_args(
+    args: Vec<String>,
+    program: &str,
+) -> Result<CliCommand, MainError> {
+    let mut parsed = ReviewApproveCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
+        task_id: TaskId(String::new()),
+        reviewer: ModelKind::Codex,
+        verdict: ReviewVerdict::Approve,
+    };
+    let mut reviewer_provided = false;
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(review_approve_usage(program))),
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                parsed.sqlite_path = PathBuf::from(value);
+            }
+            "--event-log-root" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --event-log-root".to_string())
+                })?;
+                parsed.event_log_root = PathBuf::from(value);
+            }
+            "--task-id" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --task-id".to_string()))?;
+                parsed.task_id = TaskId(value.to_string());
+            }
+            "--reviewer" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --reviewer".to_string()))?;
+                parsed.reviewer = parse_model_kind(value)?;
+                reviewer_provided = true;
+            }
+            "--verdict" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --verdict".to_string()))?;
+                parsed.verdict = parse_review_verdict(value)?;
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown review-approve argument: {other}\n\n{}",
+                    review_approve_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    if parsed.task_id.0.trim().is_empty() {
+        return Err(MainError::Args(
+            "missing required --task-id <id> for review-approve".to_string(),
+        ));
+    }
+    if !reviewer_provided {
+        return Err(MainError::Args("missing value for --reviewer".to_string()));
+    }
+
+    Ok(CliCommand::ReviewApprove(parsed))
+}
+
 fn parse_enabled_models(raw: &str) -> Result<Vec<ModelKind>, MainError> {
     let mut models = Vec::new();
     for token in raw.split(',') {
@@ -893,6 +1073,17 @@ fn parse_model_kind(value: &str) -> Result<ModelKind, MainError> {
     }
 }
 
+fn parse_review_verdict(value: &str) -> Result<ReviewVerdict, MainError> {
+    match value.to_ascii_lowercase().as_str() {
+        "approve" => Ok(ReviewVerdict::Approve),
+        "request_changes" => Ok(ReviewVerdict::RequestChanges),
+        "block" => Ok(ReviewVerdict::Block),
+        other => Err(MainError::Args(format!(
+            "unknown verdict '{other}' (expected approve|request_changes|block)"
+        ))),
+    }
+}
+
 fn default_run_args() -> RunCliArgs {
     RunCliArgs {
         org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
@@ -905,7 +1096,7 @@ fn default_run_args() -> RunCliArgs {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 \nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
     )
 }
@@ -931,14 +1122,21 @@ fn list_tasks_usage(program: &str) -> String {
     )
 }
 
+fn review_approve_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         create_task_usage, list_tasks_usage, load_repo_configs, parse_cli_args,
         parse_enabled_models, setup_usage, usage, CliCommand, CreateTaskCliArgs, ListTasksCliArgs,
-        RunCliArgs, SetupCliArgs,
+        ReviewApproveCliArgs, RunCliArgs, SetupCliArgs,
     };
-    use orch_core::types::ModelKind;
+    use orch_core::events::ReviewVerdict;
+    use orch_core::types::{ModelKind, TaskId};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1159,6 +1357,67 @@ mod tests {
                 event_log_root: PathBuf::from("/tmp/events"),
             })
         );
+    }
+
+    #[test]
+    fn parse_cli_args_review_approve_parses_required_and_optional_fields() {
+        let parsed = parse_cli_args(
+            vec![
+                "review-approve".to_string(),
+                "--task-id".to_string(),
+                "T9".to_string(),
+                "--reviewer".to_string(),
+                "gemini".to_string(),
+                "--verdict".to_string(),
+                "request_changes".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+                "--event-log-root".to_string(),
+                "/tmp/events".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("parse review-approve");
+
+        assert_eq!(
+            parsed,
+            CliCommand::ReviewApprove(ReviewApproveCliArgs {
+                org_config_path: PathBuf::from("config/org.toml"),
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                event_log_root: PathBuf::from("/tmp/events"),
+                task_id: TaskId("T9".to_string()),
+                reviewer: ModelKind::Gemini,
+                verdict: ReviewVerdict::RequestChanges,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_review_approve_requires_task_id_and_reviewer() {
+        let err = parse_cli_args(
+            vec![
+                "review-approve".to_string(),
+                "--reviewer".to_string(),
+                "codex".to_string(),
+            ],
+            "orchd",
+        )
+        .expect_err("missing task id should fail");
+        assert_eq!(
+            err.to_string(),
+            "missing required --task-id <id> for review-approve"
+        );
+
+        let err = parse_cli_args(
+            vec![
+                "review-approve".to_string(),
+                "--task-id".to_string(),
+                "T1".to_string(),
+            ],
+            "orchd",
+        )
+        .expect_err("missing reviewer should fail");
+        assert_eq!(err.to_string(), "missing value for --reviewer");
     }
 
     #[test]

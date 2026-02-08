@@ -281,6 +281,24 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         Ok(())
     }
 
+    pub fn finish_open_runs_for_task(
+        &self,
+        task_id: &TaskId,
+        finished_at: DateTime<Utc>,
+        stop_reason: &str,
+        exit_code: Option<i32>,
+    ) -> Result<usize, PersistenceError> {
+        let updated = self.conn.execute(
+            r#"
+UPDATE runs
+SET finished_at = ?1, stop_reason = ?2, exit_code = ?3
+WHERE task_id = ?4 AND finished_at IS NULL
+"#,
+            params![finished_at.to_rfc3339(), stop_reason, exit_code, task_id.0],
+        )?;
+        Ok(updated)
+    }
+
     pub fn list_open_runs(&self) -> Result<Vec<TaskRunRecord>, PersistenceError> {
         let mut stmt = self.conn.prepare(
             "SELECT payload_json FROM runs WHERE finished_at IS NULL ORDER BY started_at ASC, run_id ASC",
@@ -642,5 +660,64 @@ mod tests {
             run_ids,
             vec!["R-OPEN-EARLY".to_string(), "R-OPEN-LATE".to_string()]
         );
+    }
+
+    #[test]
+    fn finish_open_runs_for_task_marks_only_unfinished_rows_for_task() {
+        let store = mk_store();
+        let base = Utc::now();
+        let open_target = TaskRunRecord {
+            run_id: "R-TARGET-OPEN".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Codex,
+            started_at: base,
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+        let closed_target = TaskRunRecord {
+            run_id: "R-TARGET-CLOSED".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Codex,
+            started_at: base + Duration::seconds(1),
+            finished_at: Some(base + Duration::seconds(2)),
+            stop_reason: Some("done".to_string()),
+            exit_code: Some(0),
+        };
+        let other_open = TaskRunRecord {
+            run_id: "R-OTHER-OPEN".to_string(),
+            task_id: TaskId("T2".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            started_at: base + Duration::seconds(3),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+
+        store.insert_run(&open_target).expect("insert target open");
+        store
+            .insert_run(&closed_target)
+            .expect("insert target closed");
+        store.insert_run(&other_open).expect("insert other open");
+
+        let count = store
+            .finish_open_runs_for_task(
+                &TaskId("T1".to_string()),
+                base + Duration::seconds(9),
+                "initialized",
+                Some(0),
+            )
+            .expect("finish open runs for task");
+        assert_eq!(count, 1);
+
+        let open_runs = store.list_open_runs().expect("list open runs");
+        let open_ids = open_runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(open_ids, vec!["R-OTHER-OPEN".to_string()]);
     }
 }
