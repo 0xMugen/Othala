@@ -193,3 +193,112 @@ fn summarize(value: &str, max_len: usize) -> String {
     s.push_str("...");
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::{
+        ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
+    };
+    use orch_core::types::{ModelKind, RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+
+    use super::{AgentPane, DashboardState, TaskOverviewRow};
+
+    fn mk_task(id: &str) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            state: TaskState::Running,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{id}")),
+            worktree_path: format!(".orch/wt/{id}").into(),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: vec![ModelKind::Claude],
+                approvals_received: 0,
+                approvals_required: 1,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn task_overview_row_formats_failed_verify_and_review_capacity() {
+        let mut task = mk_task("T1");
+        task.verify_status = VerifyStatus::Failed {
+            tier: VerifyTier::Quick,
+            summary: "line one\nline two with a fairly long explanation".to_string(),
+        };
+        task.review_status.approvals_received = 1;
+        task.review_status.approvals_required = 2;
+        task.review_status.unanimous = true;
+        task.review_status.capacity_state = ReviewCapacityState::WaitingForReviewCapacity;
+
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.verify_summary, "failed:quick:line one line two wit...");
+        assert_eq!(row.review_summary, "1/2 unanimous=true cap=waiting");
+    }
+
+    #[test]
+    fn task_overview_row_uses_dash_when_branch_missing() {
+        let mut task = mk_task("T2");
+        task.branch_name = None;
+
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.branch, "-");
+    }
+
+    #[test]
+    fn dashboard_selection_wraps_for_tasks_and_panes() {
+        let mut state = DashboardState::default();
+        state.tasks = vec![
+            TaskOverviewRow::from_task(&mk_task("T1")),
+            TaskOverviewRow::from_task(&mk_task("T2")),
+        ];
+        state.panes = vec![
+            AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex),
+            AgentPane::new("A2", TaskId("T2".to_string()), ModelKind::Claude),
+        ];
+
+        state.move_task_selection_previous();
+        assert_eq!(state.selected_task_idx, 1);
+        state.move_task_selection_next();
+        assert_eq!(state.selected_task_idx, 0);
+
+        state.move_pane_selection_previous();
+        assert_eq!(state.selected_pane_idx, 1);
+        state.move_pane_selection_next();
+        assert_eq!(state.selected_pane_idx, 0);
+    }
+
+    #[test]
+    fn agent_pane_append_line_caps_history_and_tail() {
+        let mut pane = AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex);
+        for i in 0..405 {
+            pane.append_line(format!("line-{i}"));
+        }
+
+        assert_eq!(pane.lines.len(), 400);
+        assert_eq!(pane.lines.front().cloned(), Some("line-5".to_string()));
+        assert_eq!(pane.lines.back().cloned(), Some("line-404".to_string()));
+
+        let tail = pane.tail(3);
+        assert_eq!(
+            tail,
+            vec![
+                "line-402".to_string(),
+                "line-403".to_string(),
+                "line-404".to_string()
+            ]
+        );
+    }
+}
