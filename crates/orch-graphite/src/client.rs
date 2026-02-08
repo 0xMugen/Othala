@@ -251,4 +251,51 @@ mod tests {
             other => panic!("expected io error, got {other:?}"),
         }
     }
+
+    #[test]
+    fn submit_single_mode_does_not_include_stack_flag() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .submit(SubmitMode::Single)
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("submit"));
+                assert!(!command.contains("--stack"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_resolution_commands_use_expected_gt_subcommands() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+
+        let err = client
+            .begin_conflict_resolution()
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("add"));
+                assert!(command.contains("-A"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+
+        let err = client
+            .continue_conflict_resolution()
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("continue"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+    }
 }
