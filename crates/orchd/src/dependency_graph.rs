@@ -239,6 +239,71 @@ mod tests {
     }
 
     #[test]
+    fn ignores_self_and_unknown_dependencies() {
+        let graph = build_effective_dependency_graph(
+            &[mk_task("T1", &["T1", "T9"]), mk_task("T2", &[])],
+            &[
+                InferredDependency {
+                    parent_task_id: TaskId("T9".to_string()),
+                    child_task_id: TaskId("T2".to_string()),
+                },
+                InferredDependency {
+                    parent_task_id: TaskId("T2".to_string()),
+                    child_task_id: TaskId("T2".to_string()),
+                },
+            ],
+        );
+
+        let t1_parents = graph
+            .parents_by_child
+            .get(&TaskId("T1".to_string()))
+            .cloned()
+            .unwrap_or_default();
+        assert!(t1_parents.is_empty());
+
+        let t2_parents = graph
+            .parents_by_child
+            .get(&TaskId("T2".to_string()))
+            .cloned()
+            .unwrap_or_default();
+        assert!(t2_parents.is_empty());
+    }
+
+    #[test]
+    fn restack_targets_deduplicate_diamond_descendants() {
+        let graph = build_effective_dependency_graph(
+            &[
+                mk_task("T1", &[]),
+                mk_task("T2", &["T1"]),
+                mk_task("T3", &["T1"]),
+                mk_task("T4", &["T2", "T3"]),
+            ],
+            &[],
+        );
+
+        let targets = restack_descendants_for_parent_head_update(&graph, &TaskId("T1".to_string()));
+        let as_ids = targets.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            as_ids,
+            vec!["T2".to_string(), "T3".to_string(), "T4".to_string()]
+        );
+    }
+
+    #[test]
+    fn restack_targets_empty_for_leaf_or_unknown_parent() {
+        let graph =
+            build_effective_dependency_graph(&[mk_task("T1", &[]), mk_task("T2", &["T1"])], &[]);
+
+        let leaf_targets =
+            restack_descendants_for_parent_head_update(&graph, &TaskId("T2".to_string()));
+        assert!(leaf_targets.is_empty());
+
+        let unknown_targets =
+            restack_descendants_for_parent_head_update(&graph, &TaskId("T9".to_string()));
+        assert!(unknown_targets.is_empty());
+    }
+
+    #[test]
     fn non_parent_head_events_do_not_trigger_restack() {
         let event = EventKind::RestackStarted;
         assert!(parent_head_update_trigger(&event).is_none());
