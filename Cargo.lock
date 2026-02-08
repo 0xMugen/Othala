@@ -770,6 +770,7 @@ dependencies = [
  "orch-core",
  "ratatui",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
