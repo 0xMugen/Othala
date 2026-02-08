@@ -210,3 +210,220 @@ fn candidate_models_for_task(
 
     candidates
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use orch_core::types::{ModelKind, RepoId, TaskId};
+    use std::collections::HashMap;
+
+    use super::{
+        BlockReason, ModelAvailability, QueuedTask, RunningTask, SchedulePlan, Scheduler,
+        SchedulerConfig, SchedulingInput,
+    };
+
+    fn mk_scheduler(per_repo_limit: usize, per_model_limit: &[(ModelKind, usize)]) -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            per_repo_limit,
+            per_model_limit: per_model_limit.iter().copied().collect::<HashMap<_, _>>(),
+        })
+    }
+
+    fn mk_queued(
+        id: &str,
+        repo: &str,
+        priority: i32,
+        enqueued_at: chrono::DateTime<Utc>,
+        preferred_model: Option<ModelKind>,
+        eligible_models: &[ModelKind],
+    ) -> QueuedTask {
+        QueuedTask {
+            task_id: TaskId(id.to_string()),
+            repo_id: RepoId(repo.to_string()),
+            preferred_model,
+            eligible_models: eligible_models.to_vec(),
+            priority,
+            enqueued_at,
+        }
+    }
+
+    fn mk_running(id: &str, repo: &str, model: ModelKind) -> RunningTask {
+        RunningTask {
+            task_id: TaskId(id.to_string()),
+            repo_id: RepoId(repo.to_string()),
+            model,
+        }
+    }
+
+    fn empty_plan_input(queued: Vec<QueuedTask>) -> SchedulingInput {
+        SchedulingInput {
+            queued,
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex, ModelKind::Claude, ModelKind::Gemini],
+            availability: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plan_orders_by_priority_then_age_then_task_id() {
+        let scheduler = mk_scheduler(
+            10,
+            &[
+                (ModelKind::Codex, 10),
+                (ModelKind::Claude, 10),
+                (ModelKind::Gemini, 10),
+            ],
+        );
+        let base = Utc::now();
+        let queued = vec![
+            mk_queued("T3", "repo", 5, base, Some(ModelKind::Codex), &[]),
+            mk_queued(
+                "T2",
+                "repo",
+                10,
+                base + Duration::seconds(5),
+                Some(ModelKind::Codex),
+                &[],
+            ),
+            mk_queued(
+                "T1",
+                "repo",
+                10,
+                base - Duration::seconds(5),
+                Some(ModelKind::Codex),
+                &[],
+            ),
+        ];
+
+        let plan = scheduler.plan(empty_plan_input(queued));
+        let assigned = plan
+            .assignments
+            .iter()
+            .map(|assignment| assignment.task_id.0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assigned,
+            vec!["T1".to_string(), "T2".to_string(), "T3".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_blocks_when_repo_limit_reached() {
+        let scheduler = mk_scheduler(
+            1,
+            &[
+                (ModelKind::Codex, 10),
+                (ModelKind::Claude, 10),
+                (ModelKind::Gemini, 10),
+            ],
+        );
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Codex),
+                &[],
+            )],
+            running: vec![mk_running("TR", "repo-a", ModelKind::Codex)],
+            enabled_models: vec![ModelKind::Codex],
+            availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].task_id, TaskId("TQ".to_string()));
+        assert_eq!(plan.blocked[0].reason, BlockReason::RepoLimitReached);
+    }
+
+    #[test]
+    fn plan_blocks_when_model_limit_reached() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Codex, 1)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Codex),
+                &[],
+            )],
+            running: vec![mk_running("TR", "repo-b", ModelKind::Codex)],
+            enabled_models: vec![ModelKind::Codex],
+            availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, BlockReason::ModelLimitReached);
+    }
+
+    #[test]
+    fn plan_uses_preferred_model_when_available_and_eligible() {
+        let scheduler = mk_scheduler(
+            10,
+            &[
+                (ModelKind::Codex, 10),
+                (ModelKind::Claude, 10),
+                (ModelKind::Gemini, 10),
+            ],
+        );
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Gemini),
+                &[ModelKind::Gemini, ModelKind::Claude],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude, ModelKind::Gemini],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Gemini,
+                available: true,
+            }],
+        };
+
+        let plan = scheduler.plan(input);
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Gemini);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_blocks_with_no_available_model_when_eligibility_excludes_enabled_models() {
+        let scheduler = mk_scheduler(
+            10,
+            &[
+                (ModelKind::Codex, 10),
+                (ModelKind::Claude, 10),
+                (ModelKind::Gemini, 10),
+            ],
+        );
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                None,
+                &[ModelKind::Gemini],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+            availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, BlockReason::NoAvailableModel);
+    }
+
+    #[allow(dead_code)]
+    fn _assert_plan_shape(_plan: &SchedulePlan) {}
+}
