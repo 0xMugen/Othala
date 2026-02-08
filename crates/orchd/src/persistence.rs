@@ -281,6 +281,19 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         Ok(())
     }
 
+    pub fn list_open_runs(&self) -> Result<Vec<TaskRunRecord>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json FROM runs WHERE finished_at IS NULL ORDER BY started_at ASC, run_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            let payload = row?;
+            runs.push(serde_json::from_str::<TaskRunRecord>(&payload)?);
+        }
+        Ok(runs)
+    }
+
     pub fn insert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), PersistenceError> {
         let payload = serde_json::to_string(artifact)?;
         self.conn.execute(
@@ -577,5 +590,57 @@ mod tests {
             .expect("count artifact");
         assert_eq!(run_count, 1);
         assert_eq!(artifact_count, 1);
+    }
+
+    #[test]
+    fn list_open_runs_returns_only_unfinished_runs_ordered_by_started_at() {
+        let store = mk_store();
+        let base = Utc::now();
+        let open_earlier = TaskRunRecord {
+            run_id: "R-OPEN-EARLY".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Codex,
+            started_at: base,
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+        let closed = TaskRunRecord {
+            run_id: "R-CLOSED".to_string(),
+            task_id: TaskId("T2".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            started_at: base + Duration::seconds(1),
+            finished_at: Some(base + Duration::seconds(2)),
+            stop_reason: Some("completed".to_string()),
+            exit_code: Some(0),
+        };
+        let open_later = TaskRunRecord {
+            run_id: "R-OPEN-LATE".to_string(),
+            task_id: TaskId("T3".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Gemini,
+            started_at: base + Duration::seconds(3),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+
+        store.insert_run(&open_later).expect("insert open later");
+        store.insert_run(&closed).expect("insert closed");
+        store
+            .insert_run(&open_earlier)
+            .expect("insert open earlier");
+
+        let open_runs = store.list_open_runs().expect("list open runs");
+        let run_ids = open_runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_ids,
+            vec!["R-OPEN-EARLY".to_string(), "R-OPEN-LATE".to_string()]
+        );
     }
 }

@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::{TaskState, VerifyStatus, VerifyTier};
-use orch_core::types::{EventId, PullRequestRef, SubmitMode, Task, TaskApproval, TaskId};
+use orch_core::types::{
+    EventId, ModelKind, PullRequestRef, SubmitMode, Task, TaskApproval, TaskId,
+};
 use orch_notify::{notification_for_event, NotificationDispatcher};
 use std::path::PathBuf;
 
@@ -19,8 +21,12 @@ use crate::review_gate::{
     compute_review_requirement, evaluate_review_gate, ReviewEvaluation, ReviewGateConfig,
     ReviewRequirement, ReviewerAvailability,
 };
-use crate::scheduler::{SchedulePlan, Scheduler, SchedulingInput};
+use crate::scheduler::{
+    BlockedTask, ModelAvailability, QueuedTask, RunningTask, SchedulePlan, ScheduledAssignment,
+    Scheduler, SchedulingInput,
+};
 use crate::state_machine::{task_state_tag, transition_task, StateMachineError};
+use crate::types::TaskRunRecord;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -160,6 +166,12 @@ pub struct CompleteSubmitEventIds {
     pub success_state_changed: EventId,
     pub failure_state_changed: EventId,
     pub failure_error_event: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulingTickOutcome {
+    pub scheduled: Vec<ScheduledAssignment>,
+    pub blocked: Vec<BlockedTask>,
 }
 
 pub struct OrchdService {
@@ -1084,6 +1096,92 @@ impl OrchdService {
         self.scheduler.plan(input)
     }
 
+    pub fn schedule_queued_tasks(
+        &self,
+        enabled_models: &[ModelKind],
+        availability: &[ModelAvailability],
+        at: DateTime<Utc>,
+    ) -> Result<SchedulingTickOutcome, ServiceError> {
+        let queued_tasks = self.store.list_tasks_by_state(TaskState::Queued)?;
+        if queued_tasks.is_empty() {
+            return Ok(SchedulingTickOutcome {
+                scheduled: Vec::new(),
+                blocked: Vec::new(),
+            });
+        }
+
+        let running = self
+            .store
+            .list_open_runs()?
+            .into_iter()
+            .map(|run| RunningTask {
+                task_id: run.task_id,
+                repo_id: run.repo_id,
+                model: run.model,
+            })
+            .collect::<Vec<_>>();
+
+        let queued = queued_tasks
+            .iter()
+            .map(|task| QueuedTask {
+                task_id: task.id.clone(),
+                repo_id: task.repo_id.clone(),
+                preferred_model: task.preferred_model,
+                eligible_models: Vec::new(),
+                priority: 0,
+                enqueued_at: task.created_at,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = self.scheduler.plan(SchedulingInput {
+            queued,
+            running,
+            enabled_models: enabled_models.to_vec(),
+            availability: availability.to_vec(),
+        });
+
+        let tick_nonce = at.timestamp_nanos_opt().unwrap_or_default();
+        for assignment in &plan.assignments {
+            let mut task = self.store.load_task(&assignment.task_id)?.ok_or_else(|| {
+                ServiceError::TaskNotFound {
+                    task_id: assignment.task_id.0.clone(),
+                }
+            })?;
+            if task.state != TaskState::Queued {
+                continue;
+            }
+
+            let task_id_value = task.id.0.clone();
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Initializing,
+                EventId(format!("E-SCHED-INIT-{task_id_value}-{tick_nonce}")),
+                at,
+            )?;
+
+            let run = TaskRunRecord {
+                run_id: format!(
+                    "RUN-{}-{}-{tick_nonce}",
+                    task_id_value,
+                    model_kind_slug(assignment.model)
+                ),
+                task_id: task.id.clone(),
+                repo_id: task.repo_id.clone(),
+                model: assignment.model,
+                started_at: at,
+                finished_at: None,
+                stop_reason: None,
+                exit_code: None,
+            };
+            self.store.insert_run(&run)?;
+        }
+
+        Ok(SchedulingTickOutcome {
+            scheduled: plan.assignments,
+            blocked: plan.blocked,
+        })
+    }
+
     fn apply_transition_with_state_event(
         &self,
         task: &mut Task,
@@ -1114,6 +1212,14 @@ impl OrchdService {
             return;
         };
         let _ = dispatcher.dispatch(&message);
+    }
+}
+
+fn model_kind_slug(model: ModelKind) -> &'static str {
+    match model {
+        ModelKind::Claude => "claude",
+        ModelKind::Codex => "codex",
+        ModelKind::Gemini => "gemini",
     }
 }
 
@@ -1379,6 +1485,79 @@ mod tests {
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].task_id, TaskId("TSCH2".to_string()));
         assert_eq!(plan.blocked[0].reason, BlockReason::RepoLimitReached);
+    }
+
+    #[test]
+    fn schedule_queued_tasks_transitions_to_initializing_and_records_run() {
+        let svc = mk_service();
+        let task = mk_task("TSCHED", TaskState::Queued, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create queued task");
+
+        let now = Utc::now();
+        let outcome = svc
+            .schedule_queued_tasks(
+                &[ModelKind::Codex],
+                &[ModelAvailability {
+                    model: ModelKind::Codex,
+                    available: true,
+                }],
+                now,
+            )
+            .expect("schedule queued tasks");
+
+        assert_eq!(outcome.scheduled.len(), 1);
+        assert!(outcome.blocked.is_empty());
+        assert_eq!(outcome.scheduled[0].task_id, task.id);
+        assert_eq!(outcome.scheduled[0].model, ModelKind::Codex);
+
+        let updated = svc
+            .task(&TaskId("TSCHED".to_string()))
+            .expect("load updated task")
+            .expect("task exists");
+        assert_eq!(updated.state, TaskState::Initializing);
+
+        let runs = svc.store.list_open_runs().expect("list open runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].task_id, TaskId("TSCHED".to_string()));
+        assert_eq!(runs[0].model, ModelKind::Codex);
+        assert_eq!(runs[0].finished_at, None);
+    }
+
+    #[test]
+    fn schedule_queued_tasks_reports_blocked_without_state_change() {
+        let svc = mk_service();
+        let mut task = mk_task("TBLOCK", TaskState::Queued, &[]);
+        task.preferred_model = Some(ModelKind::Gemini);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create queued task");
+
+        let outcome = svc
+            .schedule_queued_tasks(
+                &[ModelKind::Gemini],
+                &[ModelAvailability {
+                    model: ModelKind::Gemini,
+                    available: false,
+                }],
+                Utc::now(),
+            )
+            .expect("schedule queued tasks");
+
+        assert!(outcome.scheduled.is_empty());
+        assert_eq!(outcome.blocked.len(), 1);
+        assert_eq!(outcome.blocked[0].task_id, TaskId("TBLOCK".to_string()));
+        assert_eq!(outcome.blocked[0].reason, BlockReason::NoAvailableModel);
+
+        let updated = svc
+            .task(&TaskId("TBLOCK".to_string()))
+            .expect("load updated task")
+            .expect("task exists");
+        assert_eq!(updated.state, TaskState::Queued);
+        assert!(svc
+            .store
+            .list_open_runs()
+            .expect("list open runs")
+            .is_empty());
     }
 
     #[test]

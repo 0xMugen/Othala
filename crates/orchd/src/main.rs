@@ -188,14 +188,33 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
         );
     }
 
+    let enabled_models = org.models.enabled.clone();
+    let availability = Vec::new();
+    let first_tick = service.schedule_queued_tasks(&enabled_models, &availability, Utc::now())?;
+    if !first_tick.scheduled.is_empty() || !first_tick.blocked.is_empty() {
+        println!(
+            "orchd scheduler tick scheduled={} blocked={}",
+            first_tick.scheduled.len(),
+            first_tick.blocked.len()
+        );
+    }
+
     if args.once {
-        println!("orchd exiting after bootstrap (--once)");
+        println!("orchd exiting after bootstrap + single scheduler tick (--once)");
         return Ok(());
     }
 
     println!("orchd running; press Ctrl+C to stop");
     loop {
-        thread::sleep(Duration::from_secs(60));
+        thread::sleep(Duration::from_secs(5));
+        let tick = service.schedule_queued_tasks(&enabled_models, &availability, Utc::now())?;
+        if !tick.scheduled.is_empty() || !tick.blocked.is_empty() {
+            println!(
+                "orchd scheduler tick scheduled={} blocked={}",
+                tick.scheduled.len(),
+                tick.blocked.len()
+            );
+        }
     }
 }
 
