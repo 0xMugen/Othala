@@ -90,7 +90,9 @@ fn render_command(binary: &Path, args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::GitCli;
@@ -161,5 +163,47 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> PathBuf {
+        let root = unique_temp_dir("command-repo");
+        fs::create_dir_all(&root).expect("create temp repo");
+        run_git(&root, &["init"]);
+        root
+    }
+
+    #[test]
+    fn run_uses_cwd_for_repo_sensitive_commands() {
+        let git = GitCli::default();
+        let repo_root = init_repo();
+        let plain_dir = unique_temp_dir("command-plain");
+        fs::create_dir_all(&plain_dir).expect("create plain dir");
+
+        let inside_repo = git
+            .run(&repo_root, ["rev-parse", "--is-inside-work-tree"])
+            .expect("rev-parse should succeed in repo");
+        assert_eq!(inside_repo.stdout.trim(), "true");
+
+        let outside_repo = git
+            .run(&plain_dir, ["rev-parse", "--is-inside-work-tree"])
+            .expect_err("rev-parse should fail outside repo");
+        assert!(matches!(outside_repo, GitError::CommandFailed { .. }));
+
+        let _ = fs::remove_dir_all(repo_root);
+        let _ = fs::remove_dir_all(plain_dir);
     }
 }
