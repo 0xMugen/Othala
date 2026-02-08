@@ -122,6 +122,23 @@ mod tests {
     }
 
     #[test]
+    fn prefers_lowercase_justfile_when_present() {
+        let dir = tmp_dir("just-lower");
+        fs::write(dir.join("justfile"), "fmt:\n\t@echo fmt\n").expect("write lowercase justfile");
+        fs::write(dir.join("package.json"), "{ \"name\": \"x\" }\n").expect("write package.json");
+
+        let cmds = discover_verify_commands(&dir, VerifyTier::Quick);
+        assert_eq!(
+            cmds,
+            vec![
+                "just fmt".to_string(),
+                "just lint".to_string(),
+                "just test".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn uses_rust_conventions_for_cargo_repo() {
         let dir = tmp_dir("rust");
         fs::write(

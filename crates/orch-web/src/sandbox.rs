@@ -321,7 +321,7 @@ mod tests {
     use std::path::Path;
 
     use crate::error::WebError;
-    use crate::model::{SandboxSpawnRequest, SandboxTarget};
+    use crate::model::{SandboxSpawnRequest, SandboxStatus, SandboxTarget};
     use crate::state::WebState;
 
     use super::{
@@ -433,6 +433,35 @@ mod tests {
             err,
             WebError::BadRequest { message } if message.contains("nix_dev_shell")
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_sandbox_run_enqueues_sandbox_and_preserves_request_metadata() {
+        let state = WebState::default();
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Stack {
+                task_ids: vec!["T1".to_string(), "T2".to_string()],
+            },
+            repo_path: "/tmp/othala-non-git-repo".into(),
+            nix_dev_shell: "nix develop".to_string(),
+            verify_full_commands: vec!["echo ok".to_string()],
+            checkout_ref: Some("feature/branch".to_string()),
+            cleanup_worktree: false,
+        };
+
+        let response = spawn_sandbox_run(state.clone(), request.clone())
+            .await
+            .expect("spawn sandbox");
+        assert_eq!(response.status, SandboxStatus::Queued);
+
+        let stored = state
+            .sandbox(&response.sandbox_id)
+            .await
+            .expect("sandbox should be stored");
+        assert_eq!(stored.sandbox_id, response.sandbox_id);
+        assert_eq!(stored.target, request.target);
+        assert!(!stored.cleanup_worktree);
+        assert_eq!(stored.checkout_ref, request.checkout_ref);
     }
 
     #[test]
