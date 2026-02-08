@@ -1,4 +1,12 @@
-use orch_core::config::{load_org_config, load_repo_config, ConfigError, RepoConfig};
+use orch_agents::{
+    probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupError,
+    SetupProbeConfig, SetupSummary,
+};
+use orch_core::config::{
+    apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
+    ConfigError, RepoConfig, SetupApplyError,
+};
+use orch_core::types::ModelKind;
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orchd::{OrchdService, Scheduler, SchedulerConfig, ServiceError};
 use std::env;
@@ -13,12 +21,26 @@ const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_ROOT: &str = ".orch/events";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CliArgs {
+struct RunCliArgs {
     org_config_path: PathBuf,
     repos_config_dir: PathBuf,
     sqlite_path: PathBuf,
     event_log_root: PathBuf,
     once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupCliArgs {
+    org_config_path: PathBuf,
+    enabled_models: Option<Vec<ModelKind>>,
+    per_model_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliCommand {
+    Run(RunCliArgs),
+    Setup(SetupCliArgs),
+    Help(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,16 +59,28 @@ enum MainError {
         #[source]
         source: ConfigError,
     },
+    #[error("failed to save org config at {path}: {source}")]
+    SaveConfig {
+        path: PathBuf,
+        #[source]
+        source: ConfigError,
+    },
     #[error("failed to read repo config directory {path}: {source}")]
     ReadRepoConfigDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Setup(#[from] SetupError),
+    #[error(transparent)]
+    SetupApply(#[from] SetupApplyError),
     #[error("{0}")]
     InvalidConfig(String),
     #[error(transparent)]
     Service(#[from] ServiceError),
+    #[error(transparent)]
+    Web(#[from] std::io::Error),
 }
 
 fn main() {
@@ -59,8 +93,19 @@ fn main() {
 fn run() -> Result<(), MainError> {
     let mut argv = env::args();
     let program = argv.next().unwrap_or_else(|| "orchd".to_string());
-    let args = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
+    let command = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
 
+    match command {
+        CliCommand::Help(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        CliCommand::Run(args) => run_daemon(args),
+        CliCommand::Setup(args) => run_setup(args),
+    }
+}
+
+fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
     ensure_parent_dir(&args.sqlite_path)?;
     ensure_dir(&args.event_log_root)?;
 
@@ -69,6 +114,7 @@ fn run() -> Result<(), MainError> {
         source,
     })?;
     validate_org_config(&org.validate())?;
+
     let repo_configs = load_repo_configs(&args.repos_config_dir)?;
     validate_repo_configs(&repo_configs)?;
 
@@ -109,6 +155,104 @@ fn run() -> Result<(), MainError> {
     println!("orchd running; press Ctrl+C to stop");
     loop {
         thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn run_setup(args: SetupCliArgs) -> Result<(), MainError> {
+    let mut org =
+        load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
+            path: args.org_config_path.clone(),
+            source,
+        })?;
+    validate_org_config(&org.validate())?;
+
+    let probe_config = SetupProbeConfig::default();
+    let report = probe_models(&probe_config);
+
+    let selected_models = if let Some(enabled) = args.enabled_models.clone() {
+        enabled
+    } else {
+        report
+            .models
+            .iter()
+            .filter(|probe| probe.healthy)
+            .map(|probe| probe.model)
+            .collect::<Vec<_>>()
+    };
+
+    if selected_models.is_empty() {
+        return Err(MainError::Args(
+            "no healthy models detected; pass --enable with explicit models".to_string(),
+        ));
+    }
+
+    let validated = validate_setup_selection(
+        &report,
+        &ModelSetupSelection {
+            enabled_models: selected_models,
+        },
+    )?;
+
+    let per_model_concurrency = args
+        .per_model_concurrency
+        .unwrap_or_else(|| org.concurrency.codex.max(1));
+
+    apply_setup_selection_to_org_config(
+        &mut org,
+        &validated.enabled_models,
+        per_model_concurrency,
+    )?;
+    validate_org_config(&org.validate())?;
+
+    save_org_config(&args.org_config_path, &org).map_err(|source| MainError::SaveConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+
+    let summary = summarize_setup(&report, &validated);
+    print_setup_summary(&summary, per_model_concurrency, &args.org_config_path);
+
+    Ok(())
+}
+
+fn print_setup_summary(summary: &SetupSummary, per_model_concurrency: usize, path: &Path) {
+    println!(
+        "setup saved org config to {} (per-model concurrency={})",
+        path.display(),
+        per_model_concurrency
+    );
+    println!(
+        "selected models: {}",
+        summary
+            .selected_models
+            .iter()
+            .map(model_kind_tag)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    for item in &summary.items {
+        let healthy = if item.healthy { "healthy" } else { "unhealthy" };
+        let detected = if item.detected {
+            "detected"
+        } else {
+            "not_detected"
+        };
+        println!(
+            "- {}: {} {} selected={}",
+            model_kind_tag(&item.model),
+            detected,
+            healthy,
+            item.selected
+        );
+    }
+}
+
+fn model_kind_tag(model: &ModelKind) -> &'static str {
+    match model {
+        ModelKind::Claude => "claude",
+        ModelKind::Codex => "codex",
+        ModelKind::Gemini => "gemini",
     }
 }
 
@@ -208,22 +352,26 @@ fn validate_repo_configs(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), M
     )))
 }
 
-fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {
-    let mut parsed = CliArgs {
-        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
-        repos_config_dir: PathBuf::from(DEFAULT_REPOS_CONFIG_DIR),
-        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
-        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
-        once: false,
-    };
+fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    if args.is_empty() {
+        return Ok(CliCommand::Run(default_run_args()));
+    }
+
+    match args[0].as_str() {
+        "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
+        "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
+        _ => parse_run_cli_args(args, program),
+    }
+}
+
+fn parse_run_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = default_run_args();
 
     let mut idx = 0usize;
     while idx < args.len() {
         let arg = &args[idx];
         match arg.as_str() {
-            "--help" | "-h" => {
-                return Err(MainError::Args(usage(program)));
-            }
+            "--help" | "-h" => return Ok(CliCommand::Help(usage(program))),
             "--org-config" => {
                 idx += 1;
                 let value = args
@@ -265,23 +413,132 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
         idx += 1;
     }
 
-    Ok(parsed)
+    Ok(CliCommand::Run(parsed))
+}
+
+fn parse_setup_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = SetupCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        enabled_models: None,
+        per_model_concurrency: None,
+    };
+    let mut enabled_models = Vec::new();
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(setup_usage(program))),
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--enable" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --enable".to_string()))?;
+                enabled_models.extend(parse_enabled_models(value)?);
+            }
+            "--per-model-concurrency" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --per-model-concurrency".to_string())
+                })?;
+                let parsed_value = value.parse::<usize>().map_err(|_| {
+                    MainError::Args(format!(
+                        "invalid --per-model-concurrency value: {value} (expected usize > 0)"
+                    ))
+                })?;
+                if parsed_value == 0 {
+                    return Err(MainError::Args(
+                        "invalid --per-model-concurrency value: 0 (must be > 0)".to_string(),
+                    ));
+                }
+                parsed.per_model_concurrency = Some(parsed_value);
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown setup argument: {other}\n\n{}",
+                    setup_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    if !enabled_models.is_empty() {
+        parsed.enabled_models = Some(enabled_models);
+    }
+
+    Ok(CliCommand::Setup(parsed))
+}
+
+fn parse_enabled_models(raw: &str) -> Result<Vec<ModelKind>, MainError> {
+    let mut models = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        models.push(parse_model_kind(token)?);
+    }
+
+    if models.is_empty() {
+        return Err(MainError::Args(
+            "--enable requires at least one model (claude,codex,gemini)".to_string(),
+        ));
+    }
+
+    Ok(models)
+}
+
+fn parse_model_kind(value: &str) -> Result<ModelKind, MainError> {
+    match value.to_ascii_lowercase().as_str() {
+        "claude" => Ok(ModelKind::Claude),
+        "codex" => Ok(ModelKind::Codex),
+        "gemini" => Ok(ModelKind::Gemini),
+        other => Err(MainError::Args(format!(
+            "unknown model '{other}' (expected claude|codex|gemini)"
+        ))),
+    }
+}
+
+fn default_run_args() -> RunCliArgs {
+    RunCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        repos_config_dir: PathBuf::from(DEFAULT_REPOS_CONFIG_DIR),
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
+        once: false,
+    }
 }
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n\
-Defaults:\n\
-  --org-config config/org.toml\n\
-  --repos-config-dir config/repos\n\
-  --sqlite-path .orch/state.sqlite\n\
-  --event-log-root .orch/events"
+        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n\
+\nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
+    )
+}
+
+fn setup_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n\
+\nExamples:\n  {program} setup\n  {program} setup --enable claude,codex --per-model-concurrency 5\n\
+\nNotes:\n  --enable accepts comma-separated values from claude|codex|gemini\n  if --enable is omitted, all healthy detected models are selected"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_repo_configs, parse_cli_args, usage, CliArgs};
+    use super::{
+        load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage, usage, CliCommand,
+        RunCliArgs, SetupCliArgs,
+    };
+    use orch_core::types::ModelKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -290,13 +547,13 @@ mod tests {
         let parsed = parse_cli_args(Vec::new(), "orchd").expect("parse");
         assert_eq!(
             parsed,
-            CliArgs {
+            CliCommand::Run(RunCliArgs {
                 org_config_path: PathBuf::from("config/org.toml"),
                 repos_config_dir: PathBuf::from("config/repos"),
                 sqlite_path: PathBuf::from(".orch/state.sqlite"),
                 event_log_root: PathBuf::from(".orch/events"),
                 once: false,
-            }
+            })
         );
     }
 
@@ -320,13 +577,13 @@ mod tests {
 
         assert_eq!(
             parsed,
-            CliArgs {
+            CliCommand::Run(RunCliArgs {
                 org_config_path: PathBuf::from("/tmp/org.toml"),
                 repos_config_dir: PathBuf::from("/tmp/repos"),
                 sqlite_path: PathBuf::from("/tmp/state.sqlite"),
                 event_log_root: PathBuf::from("/tmp/events"),
                 once: true,
-            }
+            })
         );
     }
 
@@ -336,7 +593,7 @@ mod tests {
             .expect_err("unknown arg should fail");
         let rendered = err.to_string();
         assert!(rendered.contains("unknown argument: --bad-flag"));
-        assert!(rendered.contains("Usage: orchd"));
+        assert!(rendered.contains("Usage:"));
     }
 
     #[test]
@@ -360,9 +617,63 @@ mod tests {
 
     #[test]
     fn parse_cli_args_help_returns_usage_message() {
-        let err = parse_cli_args(vec!["--help".to_string()], "orchd")
-            .expect_err("help should produce usage output");
-        assert_eq!(err.to_string(), usage("orchd"));
+        let parsed = parse_cli_args(vec!["--help".to_string()], "orchd")
+            .expect("help should return command");
+        assert_eq!(parsed, CliCommand::Help(usage("orchd")));
+    }
+
+    #[test]
+    fn parse_cli_args_setup_defaults() {
+        let parsed = parse_cli_args(vec!["setup".to_string()], "orchd").expect("parse setup");
+        assert_eq!(
+            parsed,
+            CliCommand::Setup(SetupCliArgs {
+                org_config_path: PathBuf::from("config/org.toml"),
+                enabled_models: None,
+                per_model_concurrency: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_setup_with_explicit_models_and_concurrency() {
+        let parsed = parse_cli_args(
+            vec![
+                "setup".to_string(),
+                "--org-config".to_string(),
+                "/tmp/org.toml".to_string(),
+                "--enable".to_string(),
+                "claude,codex".to_string(),
+                "--enable".to_string(),
+                "gemini".to_string(),
+                "--per-model-concurrency".to_string(),
+                "7".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("parse setup");
+
+        assert_eq!(
+            parsed,
+            CliCommand::Setup(SetupCliArgs {
+                org_config_path: PathBuf::from("/tmp/org.toml"),
+                enabled_models: Some(vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini]),
+                per_model_concurrency: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_setup_help_returns_setup_usage() {
+        let parsed = parse_cli_args(vec!["setup".to_string(), "--help".to_string()], "orchd")
+            .expect("setup help");
+        assert_eq!(parsed, CliCommand::Help(setup_usage("orchd")));
+    }
+
+    #[test]
+    fn parse_enabled_models_rejects_unknown_model() {
+        let err = parse_enabled_models("claude,unknown").expect_err("unknown model should fail");
+        assert!(err.to_string().contains("unknown model 'unknown'"));
     }
 
     #[test]
