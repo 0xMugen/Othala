@@ -196,6 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_porcelain_status_preserves_rename_arrow_payload() {
+        let raw = "R  src/old_name.rs -> src/new_name.rs\n";
+        let parsed = parse_porcelain_status(raw).expect("parse porcelain");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].state, FileState::Renamed);
+        assert_eq!(
+            parsed[0].path,
+            PathBuf::from("src/old_name.rs -> src/new_name.rs")
+        );
+        assert_eq!(parsed[0].status_code, "R ");
+    }
+
+    #[test]
     fn file_state_from_code_returns_unknown_for_unhandled_codes() {
         assert_eq!(file_state_from_code("!!"), FileState::Unknown);
         assert_eq!(file_state_from_code("  "), FileState::Unknown);

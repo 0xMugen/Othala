@@ -94,4 +94,12 @@ mod tests {
         assert_eq!(signal.message, "TRACEBACK: something failed");
         assert_eq!(signal.source_line, raw);
     }
+
+    #[test]
+    fn prioritizes_patch_ready_over_rate_limit_markers() {
+        let signal =
+            detect_common_signal("status: [patch_ready] but got rate limit warning afterwards")
+                .expect("signal");
+        assert_eq!(signal.kind, AgentSignalKind::PatchReady);
+    }
 }
