@@ -349,4 +349,21 @@ stack/child-b
         let inferred = infer_task_dependencies_from_stack(&snapshot, &mapping);
         assert!(inferred.is_empty());
     }
+
+    #[test]
+    fn parse_gt_log_short_handles_graphite_markers_and_trailing_punctuation() {
+        let raw = r#"
+o refs/heads/root/main:
+|\
+| o feature/api,
+| o feature/web;
+"#;
+
+        let snapshot = parse_gt_log_short(raw);
+        assert_eq!(snapshot.nodes.len(), 4);
+        assert_eq!(snapshot.nodes[0].branch.as_deref(), Some("root/main"));
+        assert_eq!(snapshot.nodes[1].branch, None);
+        assert_eq!(snapshot.nodes[2].branch.as_deref(), Some("feature/api"));
+        assert_eq!(snapshot.nodes[3].branch.as_deref(), Some("feature/web"));
+    }
 }
