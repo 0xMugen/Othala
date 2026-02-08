@@ -717,6 +717,7 @@ dependencies = [
  "orch-core",
  "portable-pty",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
