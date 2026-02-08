@@ -162,10 +162,15 @@ fn classify_restack_result(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use orch_core::types::SubmitMode;
+
+    use crate::command::GraphiteCli;
     use crate::command::GraphiteOutput;
     use crate::error::GraphiteError;
 
-    use super::{classify_restack_result, RestackOutcome};
+    use super::{classify_restack_result, GraphiteClient, RestackOutcome};
 
     #[test]
     fn classifies_successful_restack() {
@@ -203,5 +208,47 @@ mod tests {
         }))
         .expect_err("must be error");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn preserves_non_conflict_command_failed_errors() {
+        let err = classify_restack_result(Err(GraphiteError::CommandFailed {
+            command: "gt restack".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "authentication failed".to_string(),
+        }))
+        .expect_err("non-conflict command failure should be preserved");
+        assert!(matches!(err, GraphiteError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn create_branch_rejects_blank_name_before_cli_invocation() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .create_branch("   ")
+            .expect_err("blank branch must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn submit_stack_mode_passes_stack_flag_to_cli_command() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .submit(SubmitMode::Stack)
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("submit"));
+                assert!(command.contains("--stack"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
     }
 }
