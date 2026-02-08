@@ -29,7 +29,10 @@ pub fn build_effective_dependency_graph(
     inferred: &[InferredDependency],
 ) -> DependencyGraph {
     let mut graph = DependencyGraph::empty();
-    let task_ids = tasks.iter().map(|task| task.id.clone()).collect::<HashSet<_>>();
+    let task_ids = tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
 
     for task in tasks {
         graph.parents_by_child.entry(task.id.clone()).or_default();
@@ -152,7 +155,10 @@ mod tests {
             role: TaskRole::General,
             task_type: TaskType::Feature,
             preferred_model: None,
-            depends_on: depends_on.iter().map(|x| TaskId((*x).to_string())).collect(),
+            depends_on: depends_on
+                .iter()
+                .map(|x| TaskId((*x).to_string()))
+                .collect(),
             submit_mode: SubmitMode::Single,
             branch_name: Some(format!("task/{id}")),
             worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
@@ -219,8 +225,7 @@ mod tests {
             &[],
         );
 
-        let targets =
-            restack_descendants_for_parent_head_update(&graph, &TaskId("T1".to_string()));
+        let targets = restack_descendants_for_parent_head_update(&graph, &TaskId("T1".to_string()));
         let as_ids = targets.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
         assert_eq!(
             as_ids,

@@ -133,7 +133,11 @@ pub fn evaluate_review_gate(
         };
     }
 
-    let required_set = requirement.required_models.iter().copied().collect::<Vec<_>>();
+    let required_set = requirement
+        .required_models
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
     let mut latest_by_model = HashMap::<ModelKind, ReviewVerdict>::new();
     for approval in approvals {
         if required_set.contains(&approval.reviewer) {

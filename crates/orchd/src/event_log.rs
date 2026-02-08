@@ -84,7 +84,8 @@ impl JsonlEventLog {
 }
 
 fn append_json_line(path: &Path, event: &Event) -> Result<(), EventLogError> {
-    let line = serde_json::to_string(event).map_err(|source| EventLogError::Serialize { source })?;
+    let line =
+        serde_json::to_string(event).map_err(|source| EventLogError::Serialize { source })?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)

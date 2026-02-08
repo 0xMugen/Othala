@@ -166,7 +166,9 @@ ON CONFLICT(task_id) DO UPDATE SET
         let mut stmt = self.conn.prepare(
             "SELECT payload_json FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
         )?;
-        let rows = stmt.query_map(params![task_state_tag(state)], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![task_state_tag(state)], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut tasks = Vec::new();
         for row in rows {
             let payload = row?;
@@ -208,9 +210,9 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     }
 
     pub fn list_events_global(&self) -> Result<Vec<Event>, PersistenceError> {
-        let mut stmt =
-            self.conn
-                .prepare("SELECT payload_json FROM events ORDER BY at ASC, event_id ASC")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT payload_json FROM events ORDER BY at ASC, event_id ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut events = Vec::new();
         for row in rows {

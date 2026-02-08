@@ -70,7 +70,8 @@ async fn execute_sandbox(state: WebState, sandbox_id: String, request: SandboxSp
         })
         .await;
 
-    let add_result = create_sandbox_worktree(&request.repo_path, &sandbox_path, &checkout_ref).await;
+    let add_result =
+        create_sandbox_worktree(&request.repo_path, &sandbox_path, &checkout_ref).await;
     let add_log = to_command_log("git worktree add", &add_result.command_line, &add_result);
     let _ = state
         .update_sandbox(&sandbox_id, |run| {
@@ -207,7 +208,11 @@ async fn run_one_command(repo_path: &Path, command_line: &str) -> CommandResult 
     }
 }
 
-async fn create_sandbox_worktree(repo_path: &Path, sandbox_path: &Path, checkout_ref: &str) -> CommandResult {
+async fn create_sandbox_worktree(
+    repo_path: &Path,
+    sandbox_path: &Path,
+    checkout_ref: &str,
+) -> CommandResult {
     let parent = sandbox_path.parent().map(Path::to_path_buf);
     if let Some(parent_dir) = parent {
         if let Err(err) = fs::create_dir_all(parent_dir) {
@@ -262,7 +267,11 @@ async fn run_git_command(repo_path: &Path, args: Vec<String>) -> CommandResult {
     }
 }
 
-fn to_command_log(command: &str, effective_command: &str, result: &CommandResult) -> SandboxCommandLog {
+fn to_command_log(
+    command: &str,
+    effective_command: &str,
+    result: &CommandResult,
+) -> SandboxCommandLog {
     SandboxCommandLog {
         command: command.to_string(),
         effective_command: effective_command.to_string(),
@@ -313,7 +322,9 @@ mod tests {
 
     use crate::model::{SandboxSpawnRequest, SandboxTarget};
 
-    use super::{requested_checkout_ref, sandbox_worktree_path, worktree_add_args, worktree_remove_args};
+    use super::{
+        requested_checkout_ref, sandbox_worktree_path, worktree_add_args, worktree_remove_args,
+    };
 
     #[test]
     fn defaults_checkout_ref_to_head() {

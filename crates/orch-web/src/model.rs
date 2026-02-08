@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use orch_core::state::TaskState;
+use orch_core::state::{ReviewStatus, TaskState, VerifyStatus};
 use orch_core::types::Task;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -10,6 +10,8 @@ pub struct TaskView {
     pub repo_id: String,
     pub title: String,
     pub state: TaskState,
+    pub verify_status: VerifyStatus,
+    pub review_status: ReviewStatus,
     pub branch: Option<String>,
     pub worktree_path: PathBuf,
     pub pr_number: Option<u64>,
@@ -25,6 +27,8 @@ impl From<&Task> for TaskView {
             repo_id: task.repo_id.0.clone(),
             title: task.title.clone(),
             state: task.state,
+            verify_status: task.verify_status.clone(),
+            review_status: task.review_status.clone(),
             branch: task.branch_name.clone(),
             worktree_path: task.worktree_path.clone(),
             pr_number: task.pr.as_ref().map(|x| x.number),
@@ -130,9 +134,17 @@ pub struct SandboxDetailResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebEventKind {
-    TasksReplaced { count: usize },
-    TaskUpserted { task_id: String, state: TaskState },
-    SandboxUpdated { sandbox_id: String, status: SandboxStatus },
+    TasksReplaced {
+        count: usize,
+    },
+    TaskUpserted {
+        task_id: String,
+        state: TaskState,
+    },
+    SandboxUpdated {
+        sandbox_id: String,
+        status: SandboxStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,4 +163,54 @@ pub fn web_event_name(kind: &WebEventKind) -> &'static str {
 
 fn default_cleanup_worktree() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::{
+        ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
+    };
+    use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+    use std::path::PathBuf;
+
+    use super::TaskView;
+
+    #[test]
+    fn task_view_carries_verify_and_review_details() {
+        let task = Task {
+            id: TaskId("T200".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Example task".to_string(),
+            state: TaskState::Reviewing,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: vec![TaskId("T100".to_string())],
+            submit_mode: SubmitMode::Single,
+            branch_name: Some("task/T200".to_string()),
+            worktree_path: PathBuf::from(".orch/wt/T200"),
+            pr: None,
+            verify_status: VerifyStatus::Passed {
+                tier: VerifyTier::Quick,
+            },
+            review_status: ReviewStatus {
+                required_models: vec![
+                    orch_core::types::ModelKind::Claude,
+                    orch_core::types::ModelKind::Codex,
+                ],
+                approvals_received: 1,
+                approvals_required: 2,
+                unanimous: true,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let view = TaskView::from(&task);
+        assert_eq!(view.verify_status, task.verify_status);
+        assert_eq!(view.review_status, task.review_status);
+        assert_eq!(view.depends_on, vec!["T100".to_string()]);
+    }
 }

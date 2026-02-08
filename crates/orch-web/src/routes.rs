@@ -12,8 +12,8 @@ use tokio_stream::StreamExt;
 use crate::error::WebError;
 use crate::merge_queue::build_merge_queue;
 use crate::model::{
-    web_event_name, SandboxDetailResponse, SandboxSpawnRequest, TaskDetailResponse, TaskListResponse,
-    TaskView,
+    web_event_name, SandboxDetailResponse, SandboxSpawnRequest, TaskDetailResponse,
+    TaskListResponse, TaskView,
 };
 use crate::sandbox::spawn_sandbox_run;
 use crate::state::WebState;
@@ -60,7 +60,9 @@ async fn get_task(
     }))
 }
 
-async fn merge_queue(State(state): State<WebState>) -> Result<Json<crate::model::MergeQueueResponse>, WebError> {
+async fn merge_queue(
+    State(state): State<WebState>,
+) -> Result<Json<crate::model::MergeQueueResponse>, WebError> {
     let tasks = state.list_tasks().await;
     Ok(Json(build_merge_queue(&tasks)))
 }

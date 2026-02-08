@@ -104,6 +104,9 @@ impl WebState {
     }
 
     fn emit(&self, kind: WebEventKind) {
-        let _ = self.events_tx.send(WebEvent { at: Utc::now(), kind });
+        let _ = self.events_tx.send(WebEvent {
+            at: Utc::now(),
+            kind,
+        });
     }
 }

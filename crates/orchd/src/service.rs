@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, Task, TaskApproval, TaskId};
+use orch_notify::{notification_for_event, NotificationDispatcher};
 use std::path::PathBuf;
 
 use crate::dependency_graph::{
@@ -54,19 +55,29 @@ pub struct TaskReviewComputation {
     pub evaluation: ReviewEvaluation,
 }
 
-#[derive(Debug)]
 pub struct OrchdService {
     pub store: SqliteStore,
     pub event_log: JsonlEventLog,
     pub scheduler: Scheduler,
+    pub notifier: Option<NotificationDispatcher>,
 }
 
 impl OrchdService {
     pub fn new(store: SqliteStore, event_log: JsonlEventLog, scheduler: Scheduler) -> Self {
+        Self::new_with_notifier(store, event_log, scheduler, None)
+    }
+
+    pub fn new_with_notifier(
+        store: SqliteStore,
+        event_log: JsonlEventLog,
+        scheduler: Scheduler,
+        notifier: Option<NotificationDispatcher>,
+    ) -> Self {
         Self {
             store,
             event_log,
             scheduler,
+            notifier,
         }
     }
 
@@ -109,6 +120,7 @@ impl OrchdService {
     pub fn record_event(&self, event: &Event) -> Result<(), ServiceError> {
         self.store.append_event(event)?;
         self.event_log.append_both(event)?;
+        self.dispatch_notification_for_event(event);
         Ok(())
     }
 
@@ -159,12 +171,12 @@ impl OrchdService {
         availability: &[ReviewerAvailability],
         at: DateTime<Utc>,
     ) -> Result<(Task, TaskReviewComputation), ServiceError> {
-        let mut task = self
-            .store
-            .load_task(task_id)?
-            .ok_or_else(|| ServiceError::TaskNotFound {
-                task_id: task_id.0.clone(),
-            })?;
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
 
         let computation = self.compute_task_review_from_config(task_id, config, availability)?;
         task.review_status.required_models = computation.requirement.required_models.clone();
@@ -185,12 +197,12 @@ impl OrchdService {
         event_id: EventId,
         at: DateTime<Utc>,
     ) -> Result<Task, ServiceError> {
-        let mut task = self
-            .store
-            .load_task(task_id)?
-            .ok_or_else(|| ServiceError::TaskNotFound {
-                task_id: task_id.0.clone(),
-            })?;
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
         let transition = transition_task(&mut task, to, at)?;
         self.store.upsert_task(&task)?;
 
@@ -240,12 +252,12 @@ impl OrchdService {
         event_ids: PromoteTaskEventIds,
         at: DateTime<Utc>,
     ) -> Result<PromoteTaskOutcome, ServiceError> {
-        let mut task = self
-            .store
-            .load_task(task_id)?
-            .ok_or_else(|| ServiceError::TaskNotFound {
-                task_id: task_id.0.clone(),
-            })?;
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
 
         let ready_gate = evaluate_ready_gate(&ready_input);
         let auto_submit = decide_auto_submit(&task, submit_policy, &ready_gate);
@@ -289,7 +301,9 @@ impl OrchdService {
                 repo_id: Some(task.repo_id.clone()),
                 at,
                 kind: EventKind::SubmitStarted {
-                    mode: auto_submit.mode.expect("mode must exist when should_submit"),
+                    mode: auto_submit
+                        .mode
+                        .expect("mode must exist when should_submit"),
                 },
             })?;
         }
@@ -326,18 +340,35 @@ impl OrchdService {
         })?;
         Ok(())
     }
+
+    fn dispatch_notification_for_event(&self, event: &Event) {
+        let Some(dispatcher) = &self.notifier else {
+            return;
+        };
+        let Some(message) = notification_for_event(event) else {
+            return;
+        };
+        let _ = dispatcher.dispatch(&message);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use orch_core::events::{EventKind, ReviewVerdict};
-    use orch_core::state::{ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus};
+    use orch_core::state::{
+        ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus,
+    };
     use orch_core::types::{
         EventId, ModelKind, RepoId, SubmitMode, Task, TaskApproval, TaskId, TaskRole, TaskType,
     };
+    use orch_notify::{
+        NotificationDispatcher, NotificationMessage, NotificationSink, NotificationSinkKind,
+        NotificationTopic, NotifyError,
+    };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use crate::dependency_graph::InferredDependency;
     use crate::event_log::JsonlEventLog;
@@ -350,6 +381,10 @@ mod tests {
     use super::{OrchdService, PromoteTaskEventIds};
 
     fn mk_service() -> OrchdService {
+        mk_service_with_notifier(None)
+    }
+
+    fn mk_service_with_notifier(notifier: Option<NotificationDispatcher>) -> OrchdService {
         let store = crate::persistence::SqliteStore::open_in_memory().expect("in-memory db");
         let dir = std::env::temp_dir().join(format!(
             "othala-orchd-test-{}",
@@ -357,7 +392,7 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
 
-        let svc = OrchdService::new(
+        let svc = OrchdService::new_with_notifier(
             store,
             JsonlEventLog::new(dir),
             Scheduler::new(SchedulerConfig {
@@ -370,6 +405,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             }),
+            notifier,
         );
         svc.bootstrap().expect("bootstrap");
         svc
@@ -384,7 +420,10 @@ mod tests {
             role: TaskRole::General,
             task_type: TaskType::Feature,
             preferred_model: None,
-            depends_on: depends_on.iter().map(|x| TaskId((*x).to_string())).collect(),
+            depends_on: depends_on
+                .iter()
+                .map(|x| TaskId((*x).to_string()))
+                .collect(),
             submit_mode: SubmitMode::Single,
             branch_name: Some(format!("task/{id}")),
             worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
@@ -436,15 +475,70 @@ mod tests {
         }
     }
 
+    struct CaptureSink {
+        captured: Arc<Mutex<Vec<NotificationMessage>>>,
+    }
+
+    impl NotificationSink for CaptureSink {
+        fn kind(&self) -> NotificationSinkKind {
+            NotificationSinkKind::Stdout
+        }
+
+        fn send(&self, message: &NotificationMessage) -> Result<(), NotifyError> {
+            self.captured
+                .lock()
+                .expect("capture lock")
+                .push(message.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn record_event_dispatches_notifications_for_mapped_events_only() {
+        let captured = Arc::new(Mutex::new(Vec::<NotificationMessage>::new()));
+        let dispatcher = NotificationDispatcher::new(vec![Box::new(CaptureSink {
+            captured: captured.clone(),
+        })]);
+        let svc = mk_service_with_notifier(Some(dispatcher));
+
+        let task = mk_task("TN", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "TaskCreated should not emit notification"
+        );
+
+        let verify_failed_event = orch_core::events::Event {
+            id: EventId("E-VERIFY-FAILED".to_string()),
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at: Utc::now(),
+            kind: EventKind::VerifyCompleted {
+                tier: orch_core::state::VerifyTier::Quick,
+                success: false,
+            },
+        };
+        svc.record_event(&verify_failed_event)
+            .expect("record verify failed");
+
+        let messages = captured.lock().expect("capture lock");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].topic, NotificationTopic::VerifyFailed);
+    }
+
     #[test]
     fn restack_targets_for_parent_update_uses_union_graph() {
         let svc = mk_service();
         let t1 = mk_task("T1", TaskState::Running, &[]);
         let t2 = mk_task("T2", TaskState::Running, &["T1"]);
         let t3 = mk_task("T3", TaskState::Running, &[]);
-        svc.create_task(&t1, &mk_created_event(&t1)).expect("create t1");
-        svc.create_task(&t2, &mk_created_event(&t2)).expect("create t2");
-        svc.create_task(&t3, &mk_created_event(&t3)).expect("create t3");
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+        svc.create_task(&t2, &mk_created_event(&t2))
+            .expect("create t2");
+        svc.create_task(&t3, &mk_created_event(&t3))
+            .expect("create t3");
 
         let targets = svc
             .restack_targets_for_parent_update(
@@ -500,7 +594,9 @@ mod tests {
         assert_eq!(stored.state, TaskState::Submitting);
 
         let events = svc.task_events(&task.id).expect("events");
-        assert!(events.iter().any(|e| matches!(e.kind, EventKind::ReadyReached)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ReadyReached)));
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::SubmitStarted { .. })));
@@ -659,7 +755,10 @@ mod tests {
             updated.review_status.capacity_state,
             ReviewCapacityState::NeedsHuman
         );
-        assert_eq!(updated.review_status.required_models, vec![ModelKind::Claude]);
+        assert_eq!(
+            updated.review_status.required_models,
+            vec![ModelKind::Claude]
+        );
         assert_eq!(updated.review_status.approvals_required, 0);
         assert_eq!(updated.review_status.approvals_received, 0);
         assert!(computation.evaluation.needs_human);

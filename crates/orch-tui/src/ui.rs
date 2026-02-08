@@ -69,7 +69,11 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     ));
 
     for (idx, task) in app.state.tasks.iter().enumerate() {
-        let prefix = if idx == app.state.selected_task_idx { ">" } else { " " };
+        let prefix = if idx == app.state.selected_task_idx {
+            ">"
+        } else {
+            " "
+        };
         lines.push(Line::from(format_task_row(prefix, task)));
     }
 
@@ -96,7 +100,10 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(tabs, panes[0]);
 
     let lines = if let Some(pane) = app.state.selected_pane() {
-        pane.tail(20).into_iter().map(Line::from).collect::<Vec<_>>()
+        pane.tail(20)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>()
     } else {
         vec![Line::from("no running agent panes")]
     };
@@ -130,7 +137,10 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 "Focused PTY {} ({:?}, task={})",
                 pane.instance_id, pane.model, pane.task_id.0
             ),
-            pane.tail(200).into_iter().map(Line::from).collect::<Vec<_>>(),
+            pane.tail(200)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
         )
     } else {
         (

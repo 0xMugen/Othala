@@ -121,7 +121,8 @@ impl Scheduler {
                 continue;
             }
 
-            let candidates = candidate_models_for_task(&queued, &input.enabled_models, &available_models);
+            let candidates =
+                candidate_models_for_task(&queued, &input.enabled_models, &available_models);
             if candidates.is_empty() {
                 blocked.push(BlockedTask {
                     task_id: queued.task_id,
