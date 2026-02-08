@@ -1144,7 +1144,10 @@ mod tests {
     use crate::review_gate::{
         ReviewEvaluation, ReviewGateConfig, ReviewRequirement, ReviewerAvailability,
     };
-    use crate::scheduler::{Scheduler, SchedulerConfig};
+    use crate::scheduler::{
+        BlockReason, ModelAvailability, QueuedTask, RunningTask, Scheduler, SchedulerConfig,
+        SchedulingInput,
+    };
 
     use super::{
         CompleteFullVerifyEventIds, CompleteQuickVerifyEventIds, CompleteRestackEventIds,
@@ -1315,6 +1318,67 @@ mod tests {
         let messages = captured.lock().expect("capture lock");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].topic, NotificationTopic::VerifyFailed);
+    }
+
+    #[test]
+    fn schedule_assigns_queued_task_to_available_eligible_model() {
+        let svc = mk_service();
+        let plan = svc.schedule(SchedulingInput {
+            queued: vec![QueuedTask {
+                task_id: TaskId("TSCH1".to_string()),
+                repo_id: RepoId("repo-a".to_string()),
+                preferred_model: Some(ModelKind::Codex),
+                eligible_models: vec![ModelKind::Codex],
+                priority: 10,
+                enqueued_at: Utc::now(),
+            }],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Codex,
+                available: true,
+            }],
+        });
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].task_id, TaskId("TSCH1".to_string()));
+        assert_eq!(plan.assignments[0].repo_id, RepoId("repo-a".to_string()));
+        assert_eq!(plan.assignments[0].model, ModelKind::Codex);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn schedule_blocks_when_repo_limit_already_full() {
+        let svc = mk_service();
+        let running = (0..10)
+            .map(|i| RunningTask {
+                task_id: TaskId(format!("TRUN{i}")),
+                repo_id: RepoId("repo-full".to_string()),
+                model: ModelKind::Codex,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = svc.schedule(SchedulingInput {
+            queued: vec![QueuedTask {
+                task_id: TaskId("TSCH2".to_string()),
+                repo_id: RepoId("repo-full".to_string()),
+                preferred_model: Some(ModelKind::Codex),
+                eligible_models: vec![ModelKind::Codex],
+                priority: 1,
+                enqueued_at: Utc::now(),
+            }],
+            running,
+            enabled_models: vec![ModelKind::Codex],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Codex,
+                available: true,
+            }],
+        });
+
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].task_id, TaskId("TSCH2".to_string()));
+        assert_eq!(plan.blocked[0].reason, BlockReason::RepoLimitReached);
     }
 
     #[test]
