@@ -1,4 +1,4 @@
-use orch_core::config::{load_org_config, ConfigError};
+use orch_core::config::{load_org_config, load_repo_config, ConfigError, RepoConfig};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orchd::{OrchdService, Scheduler, SchedulerConfig, ServiceError};
 use std::env;
@@ -8,12 +8,14 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_ORG_CONFIG: &str = "config/org.toml";
+const DEFAULT_REPOS_CONFIG_DIR: &str = "config/repos";
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_ROOT: &str = ".orch/events";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     org_config_path: PathBuf,
+    repos_config_dir: PathBuf,
     sqlite_path: PathBuf,
     event_log_root: PathBuf,
     once: bool,
@@ -34,6 +36,12 @@ enum MainError {
         path: PathBuf,
         #[source]
         source: ConfigError,
+    },
+    #[error("failed to read repo config directory {path}: {source}")]
+    ReadRepoConfigDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("{0}")]
     InvalidConfig(String),
@@ -61,6 +69,8 @@ fn run() -> Result<(), MainError> {
         source,
     })?;
     validate_org_config(&org.validate())?;
+    let repo_configs = load_repo_configs(&args.repos_config_dir)?;
+    validate_repo_configs(&repo_configs)?;
 
     let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
@@ -72,6 +82,24 @@ fn run() -> Result<(), MainError> {
         args.event_log_root.display(),
         task_count
     );
+    if repo_configs.is_empty() {
+        println!(
+            "orchd loaded 0 repo configs from {}",
+            args.repos_config_dir.display()
+        );
+    } else {
+        let repo_ids = repo_configs
+            .iter()
+            .map(|(_, cfg)| cfg.repo_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "orchd loaded {} repo configs from {} [{}]",
+            repo_configs.len(),
+            args.repos_config_dir.display(),
+            repo_ids
+        );
+    }
 
     if args.once {
         println!("orchd exiting after bootstrap (--once)");
@@ -120,9 +148,70 @@ fn validate_org_config(issues: &[ValidationIssue]) -> Result<(), MainError> {
     )))
 }
 
+fn load_repo_configs(repo_dir: &Path) -> Result<Vec<(PathBuf, RepoConfig)>, MainError> {
+    if !repo_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(repo_dir).map_err(|source| MainError::ReadRepoConfigDir {
+        path: repo_dir.to_path_buf(),
+        source,
+    })?;
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| MainError::ReadRepoConfigDir {
+            path: repo_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) == Some("toml") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    let mut repo_configs = Vec::new();
+    for path in paths {
+        let cfg = load_repo_config(&path).map_err(|source| MainError::LoadConfig {
+            path: path.clone(),
+            source,
+        })?;
+        repo_configs.push((path, cfg));
+    }
+    Ok(repo_configs)
+}
+
+fn validate_repo_configs(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), MainError> {
+    let mut errors = Vec::new();
+
+    for (path, cfg) in repo_configs {
+        for issue in cfg.validate() {
+            if issue.level == ValidationLevel::Error {
+                errors.push(format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    issue.code,
+                    issue.message
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    Err(MainError::InvalidConfig(format!(
+        "repo config validation failed ({})",
+        errors.join("; ")
+    )))
+}
+
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {
     let mut parsed = CliArgs {
         org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        repos_config_dir: PathBuf::from(DEFAULT_REPOS_CONFIG_DIR),
         sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
         event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
         once: false,
@@ -141,6 +230,13 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
                     .get(idx)
                     .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
                 parsed.org_config_path = PathBuf::from(value);
+            }
+            "--repos-config-dir" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --repos-config-dir".to_string())
+                })?;
+                parsed.repos_config_dir = PathBuf::from(value);
             }
             "--sqlite-path" => {
                 idx += 1;
@@ -174,9 +270,10 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n\
+        "Usage: {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n\
 Defaults:\n\
   --org-config config/org.toml\n\
+  --repos-config-dir config/repos\n\
   --sqlite-path .orch/state.sqlite\n\
   --event-log-root .orch/events"
     )
@@ -184,7 +281,8 @@ Defaults:\n\
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cli_args, usage, CliArgs};
+    use super::{load_repo_configs, parse_cli_args, usage, CliArgs};
+    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -194,6 +292,7 @@ mod tests {
             parsed,
             CliArgs {
                 org_config_path: PathBuf::from("config/org.toml"),
+                repos_config_dir: PathBuf::from("config/repos"),
                 sqlite_path: PathBuf::from(".orch/state.sqlite"),
                 event_log_root: PathBuf::from(".orch/events"),
                 once: false,
@@ -207,6 +306,8 @@ mod tests {
             vec![
                 "--org-config".to_string(),
                 "/tmp/org.toml".to_string(),
+                "--repos-config-dir".to_string(),
+                "/tmp/repos".to_string(),
                 "--sqlite-path".to_string(),
                 "/tmp/state.sqlite".to_string(),
                 "--event-log-root".to_string(),
@@ -221,6 +322,7 @@ mod tests {
             parsed,
             CliArgs {
                 org_config_path: PathBuf::from("/tmp/org.toml"),
+                repos_config_dir: PathBuf::from("/tmp/repos"),
                 sqlite_path: PathBuf::from("/tmp/state.sqlite"),
                 event_log_root: PathBuf::from("/tmp/events"),
                 once: true,
@@ -250,6 +352,10 @@ mod tests {
         let err = parse_cli_args(vec!["--event-log-root".to_string()], "orchd")
             .expect_err("missing event log root should fail");
         assert_eq!(err.to_string(), "missing value for --event-log-root");
+
+        let err = parse_cli_args(vec!["--repos-config-dir".to_string()], "orchd")
+            .expect_err("missing repos config dir should fail");
+        assert_eq!(err.to_string(), "missing value for --repos-config-dir");
     }
 
     #[test]
@@ -257,5 +363,76 @@ mod tests {
         let err = parse_cli_args(vec!["--help".to_string()], "orchd")
             .expect_err("help should produce usage output");
         assert_eq!(err.to_string(), usage("orchd"));
+    }
+
+    #[test]
+    fn load_repo_configs_reads_only_toml_files_sorted_by_path() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-orchd-load-repos-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create temp repo dir");
+        fs::write(
+            root.join("b.toml"),
+            r#"
+repo_id = "b"
+repo_path = "/tmp/b"
+base_branch = "main"
+
+[nix]
+dev_shell = "nix develop"
+
+[verify.quick]
+commands = ["nix develop -c just test"]
+
+[verify.full]
+commands = ["nix develop -c just test-all"]
+
+[graphite]
+draft_on_start = true
+submit_mode = "single"
+"#,
+        )
+        .expect("write b.toml");
+        fs::write(
+            root.join("a.toml"),
+            r#"
+repo_id = "a"
+repo_path = "/tmp/a"
+base_branch = "main"
+
+[nix]
+dev_shell = "nix develop"
+
+[verify.quick]
+commands = ["nix develop -c just test"]
+
+[verify.full]
+commands = ["nix develop -c just test-all"]
+
+[graphite]
+draft_on_start = true
+submit_mode = "single"
+"#,
+        )
+        .expect("write a.toml");
+        fs::write(root.join("notes.txt"), "ignore me").expect("write non-toml");
+
+        let loaded = load_repo_configs(&root).expect("load repo configs");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].1.repo_id, "a");
+        assert_eq!(loaded[1].1.repo_id, "b");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_repo_configs_returns_empty_when_directory_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-orchd-missing-repos-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let loaded = load_repo_configs(&root).expect("missing dir should be treated as empty");
+        assert!(loaded.is_empty());
     }
 }
