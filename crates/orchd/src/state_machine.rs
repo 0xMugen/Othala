@@ -233,6 +233,29 @@ mod tests {
     }
 
     #[test]
+    fn transition_allows_noop_self_transition_and_updates_timestamp() {
+        let mut task = mk_task(TaskState::Running);
+        let at = Utc::now();
+        let transition =
+            transition_task(&mut task, TaskState::Running, at).expect("self transition");
+        assert_eq!(transition.from, TaskState::Running);
+        assert_eq!(transition.to, TaskState::Running);
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.updated_at, at);
+    }
+
+    #[test]
+    fn merged_is_terminal_except_self_transition() {
+        assert!(is_transition_allowed(TaskState::Merged, TaskState::Merged));
+        assert!(!is_transition_allowed(TaskState::Merged, TaskState::Paused));
+        assert!(!is_transition_allowed(TaskState::Merged, TaskState::Failed));
+        assert!(!is_transition_allowed(
+            TaskState::Merged,
+            TaskState::Running
+        ));
+    }
+
+    #[test]
     fn task_state_tag_covers_restack_conflict_and_paused() {
         assert_eq!(
             super::task_state_tag(TaskState::RestackConflict),
