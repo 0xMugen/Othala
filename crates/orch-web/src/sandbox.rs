@@ -320,10 +320,13 @@ fn worktree_remove_args(sandbox_path: &Path) -> Vec<String> {
 mod tests {
     use std::path::Path;
 
+    use crate::error::WebError;
     use crate::model::{SandboxSpawnRequest, SandboxTarget};
+    use crate::state::WebState;
 
     use super::{
-        requested_checkout_ref, sandbox_worktree_path, worktree_add_args, worktree_remove_args,
+        requested_checkout_ref, sandbox_worktree_path, spawn_sandbox_run, worktree_add_args,
+        worktree_remove_args,
     };
 
     #[test]
@@ -354,6 +357,82 @@ mod tests {
             cleanup_worktree: true,
         };
         assert_eq!(requested_checkout_ref(&request), "feature/branch");
+    }
+
+    #[test]
+    fn requested_checkout_ref_trims_value() {
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: "/tmp/repo".into(),
+            nix_dev_shell: "nix develop".to_string(),
+            verify_full_commands: vec!["echo ok".to_string()],
+            checkout_ref: Some("  feature/trim-me  ".to_string()),
+            cleanup_worktree: true,
+        };
+        assert_eq!(requested_checkout_ref(&request), "feature/trim-me");
+    }
+
+    #[test]
+    fn requested_checkout_ref_uses_head_for_blank_input() {
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: "/tmp/repo".into(),
+            nix_dev_shell: "nix develop".to_string(),
+            verify_full_commands: vec!["echo ok".to_string()],
+            checkout_ref: Some("   ".to_string()),
+            cleanup_worktree: true,
+        };
+        assert_eq!(requested_checkout_ref(&request), "HEAD");
+    }
+
+    #[tokio::test]
+    async fn spawn_sandbox_run_rejects_empty_verify_commands() {
+        let state = WebState::default();
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: "/tmp/repo".into(),
+            nix_dev_shell: "nix develop".to_string(),
+            verify_full_commands: Vec::new(),
+            checkout_ref: None,
+            cleanup_worktree: true,
+        };
+
+        let err = spawn_sandbox_run(state, request)
+            .await
+            .expect_err("empty verify commands should be rejected");
+        assert!(matches!(
+            err,
+            WebError::BadRequest { message } if message.contains("verify_full_commands")
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_sandbox_run_rejects_empty_nix_dev_shell() {
+        let state = WebState::default();
+        let request = SandboxSpawnRequest {
+            target: SandboxTarget::Task {
+                task_id: "T1".to_string(),
+            },
+            repo_path: "/tmp/repo".into(),
+            nix_dev_shell: "   ".to_string(),
+            verify_full_commands: vec!["echo ok".to_string()],
+            checkout_ref: None,
+            cleanup_worktree: true,
+        };
+
+        let err = spawn_sandbox_run(state, request)
+            .await
+            .expect_err("blank nix_dev_shell should be rejected");
+        assert!(matches!(
+            err,
+            WebError::BadRequest { message } if message.contains("nix_dev_shell")
+        ));
     }
 
     #[test]

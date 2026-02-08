@@ -50,3 +50,84 @@ impl IntoResponse for WebError {
         (status, Json(body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
+    use serde_json::Value;
+
+    use super::WebError;
+
+    #[tokio::test]
+    async fn not_found_maps_to_404_and_not_found_code() {
+        let response = WebError::NotFound {
+            resource: "task:T404".to_string(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload["code"], "not_found");
+        let message = payload["message"].as_str().expect("message as string");
+        assert!(message.contains("task:T404"));
+    }
+
+    #[tokio::test]
+    async fn bad_request_maps_to_400_and_bad_request_code() {
+        let response = WebError::BadRequest {
+            message: "invalid payload".to_string(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload["code"], "bad_request");
+        assert_eq!(payload["message"], "invalid payload");
+    }
+
+    #[tokio::test]
+    async fn io_error_maps_to_500_and_io_error_code() {
+        let response = WebError::Io {
+            source: std::io::Error::other("disk offline"),
+        }
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload["code"], "io_error");
+        let message = payload["message"].as_str().expect("message as string");
+        assert!(message.contains("disk offline"));
+    }
+
+    #[tokio::test]
+    async fn internal_error_maps_to_500_and_internal_error_code() {
+        let response = WebError::Internal {
+            message: "unexpected".to_string(),
+        }
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(payload["code"], "internal_error");
+        assert_eq!(payload["message"], "unexpected");
+    }
+}
