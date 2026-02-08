@@ -205,10 +205,150 @@ fn classify_failure(stdout: &str, stderr: &str) -> VerifyFailureClass {
     {
         return VerifyFailureClass::Environment;
     }
-    if combined.contains("error:") || combined.contains("linker") || combined.contains("compile")
-    {
+    if combined.contains("error:") || combined.contains("linker") || combined.contains("compile") {
         return VerifyFailureClass::Build;
     }
 
     VerifyFailureClass::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use orch_core::config::{
+        NixConfig, RepoConfig, RepoGraphiteConfig, VerifyCommands, VerifyConfig,
+    };
+    use orch_core::state::VerifyTier;
+    use orch_core::types::SubmitMode;
+
+    use crate::error::VerifyError;
+    use crate::runner::{
+        classify_failure, command_has_prefix, commands_for_tier, prepare_verify_command,
+    };
+    use crate::types::VerifyFailureClass;
+
+    fn mk_repo_config() -> RepoConfig {
+        RepoConfig {
+            repo_id: "example".to_string(),
+            repo_path: PathBuf::from("/tmp/example"),
+            base_branch: "main".to_string(),
+            nix: NixConfig {
+                dev_shell: "nix develop".to_string(),
+            },
+            verify: VerifyConfig {
+                quick: VerifyCommands {
+                    commands: vec![
+                        "nix develop -c just fmt".to_string(),
+                        "nix develop -c just lint".to_string(),
+                    ],
+                },
+                full: VerifyCommands {
+                    commands: vec!["nix develop -c just test-all".to_string()],
+                },
+            },
+            graphite: RepoGraphiteConfig {
+                draft_on_start: true,
+                submit_mode: Some(SubmitMode::Single),
+            },
+        }
+    }
+
+    #[test]
+    fn commands_for_tier_selects_quick_and_full_lists() {
+        let cfg = mk_repo_config();
+        let quick = commands_for_tier(&cfg, VerifyTier::Quick);
+        let full = commands_for_tier(&cfg, VerifyTier::Full);
+
+        assert_eq!(
+            quick,
+            vec![
+                "nix develop -c just fmt".to_string(),
+                "nix develop -c just lint".to_string()
+            ]
+        );
+        assert_eq!(full, vec!["nix develop -c just test-all".to_string()]);
+    }
+
+    #[test]
+    fn prepare_verify_command_wraps_non_nix_command() {
+        let prepared = prepare_verify_command("nix develop", "cargo test --workspace");
+        assert_eq!(prepared.original, "cargo test --workspace");
+        assert!(prepared.wrapped_with_dev_shell);
+        assert_eq!(
+            prepared.effective,
+            "nix develop -c 'cargo test --workspace'".to_string()
+        );
+    }
+
+    #[test]
+    fn prepare_verify_command_preserves_already_wrapped_commands() {
+        let prepared = prepare_verify_command("nix develop", "nix develop -c just test");
+        assert!(!prepared.wrapped_with_dev_shell);
+        assert_eq!(prepared.effective, "nix develop -c just test");
+    }
+
+    #[test]
+    fn command_has_prefix_requires_whitespace_or_exact_match() {
+        assert!(command_has_prefix("nix develop", "nix develop"));
+        assert!(command_has_prefix(
+            "nix develop -c cargo test",
+            "nix develop"
+        ));
+        assert!(!command_has_prefix("nix development", "nix develop"));
+        assert!(!command_has_prefix("cargo test", "nix develop"));
+    }
+
+    #[test]
+    fn classify_failure_detects_priority_classes() {
+        assert_eq!(
+            classify_failure("assertion failed: x", ""),
+            VerifyFailureClass::Tests
+        );
+        assert_eq!(
+            classify_failure("", "clippy: warning denied"),
+            VerifyFailureClass::Lint
+        );
+        assert_eq!(
+            classify_failure("rustfmt check failed", ""),
+            VerifyFailureClass::Format
+        );
+        assert_eq!(
+            classify_failure("", "failed to fetch dependency from network"),
+            VerifyFailureClass::Environment
+        );
+        assert_eq!(
+            classify_failure("", "error: linker failed"),
+            VerifyFailureClass::Build
+        );
+        assert_eq!(
+            classify_failure("some custom failure", "unknown details"),
+            VerifyFailureClass::Unknown
+        );
+    }
+
+    #[test]
+    fn run_tier_validates_empty_commands_and_blank_dev_shell() {
+        let runner = crate::runner::VerifyRunner::default();
+
+        let err = runner
+            .run_tier(
+                PathBuf::from(".").as_path(),
+                "nix develop",
+                VerifyTier::Quick,
+                &[],
+            )
+            .expect_err("empty commands should be invalid");
+        assert!(matches!(err, VerifyError::InvalidConfig { .. }));
+
+        let err = runner
+            .run_tier(
+                PathBuf::from(".").as_path(),
+                "   ",
+                VerifyTier::Quick,
+                &["echo ok".to_string()],
+            )
+            .expect_err("blank dev shell should be invalid");
+        assert!(matches!(err, VerifyError::InvalidConfig { .. }));
+    }
 }

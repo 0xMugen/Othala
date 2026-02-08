@@ -104,7 +104,11 @@ mod tests {
     fn prefers_justfile_when_present() {
         let dir = tmp_dir("just");
         fs::write(dir.join("Justfile"), "fmt:\n\t@echo fmt\n").expect("write justfile");
-        fs::write(dir.join("Cargo.toml"), "[package]\nname='x'\nversion='0.1.0'\n").expect("write cargo");
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .expect("write cargo");
 
         let cmds = discover_verify_commands(&dir, VerifyTier::Quick);
         assert_eq!(
@@ -120,8 +124,11 @@ mod tests {
     #[test]
     fn uses_rust_conventions_for_cargo_repo() {
         let dir = tmp_dir("rust");
-        fs::write(dir.join("Cargo.toml"), "[package]\nname='x'\nversion='0.1.0'\n")
-            .expect("write cargo");
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .expect("write cargo");
 
         let quick = discover_verify_commands(&dir, VerifyTier::Quick);
         let full = discover_verify_commands(&dir, VerifyTier::Full);
@@ -136,8 +143,11 @@ mod tests {
     #[test]
     fn configured_commands_override_discovery() {
         let dir = tmp_dir("override");
-        fs::write(dir.join("Cargo.toml"), "[package]\nname='x'\nversion='0.1.0'\n")
-            .expect("write cargo");
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .expect("write cargo");
 
         let configured = vec!["nix develop -c just custom-check".to_string()];
         let resolved = resolve_verify_commands(&dir, VerifyTier::Quick, &configured);
