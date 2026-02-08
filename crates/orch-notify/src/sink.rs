@@ -189,4 +189,37 @@ mod tests {
         assert_eq!(results[1].0, NotificationSinkKind::Telegram);
         assert!(results[1].1.is_err());
     }
+
+    #[test]
+    fn from_policy_with_no_sinks_dispatches_to_none() {
+        let dispatcher = NotificationDispatcher::from_policy(&NotificationPolicy {
+            enabled_sinks: Vec::new(),
+        });
+        let results = dispatcher.dispatch(&mk_message());
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn telegram_sink_returns_disabled_error_when_not_enabled() {
+        let sink = super::TelegramSink::default();
+        let err = sink
+            .send(&mk_message())
+            .expect_err("telegram default is disabled");
+        assert!(matches!(
+            err,
+            NotifyError::SinkDisabled { sink } if sink == "telegram"
+        ));
+    }
+
+    #[test]
+    fn telegram_sink_returns_not_implemented_when_enabled() {
+        let sink = super::TelegramSink {
+            enabled: true,
+            ..super::TelegramSink::default()
+        };
+        let err = sink
+            .send(&mk_message())
+            .expect_err("transport is not implemented");
+        assert!(matches!(err, NotifyError::SinkFailed { .. }));
+    }
 }
