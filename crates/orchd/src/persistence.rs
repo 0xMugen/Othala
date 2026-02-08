@@ -476,6 +476,38 @@ mod tests {
     }
 
     #[test]
+    fn list_events_global_orders_by_timestamp_then_event_id() {
+        let store = mk_store();
+        let base = Utc::now();
+        let e2 = mk_event("E2", "T1", base);
+        let e1 = mk_event("E1", "T2", base);
+        let e3 = mk_event("E3", "T1", base + Duration::seconds(1));
+
+        store.append_event(&e2).expect("append e2");
+        store.append_event(&e1).expect("append e1");
+        store.append_event(&e3).expect("append e3");
+
+        let events = store.list_events_global().expect("list global events");
+        let ids = events
+            .into_iter()
+            .map(|event| event.id.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["E1".to_string(), "E2".to_string(), "E3".to_string()]
+        );
+    }
+
+    #[test]
+    fn latest_event_at_for_task_returns_none_when_task_has_no_events() {
+        let store = mk_store();
+        let latest = store
+            .latest_event_at_for_task(&TaskId("NO-EVENTS".to_string()))
+            .expect("latest event query");
+        assert_eq!(latest, None);
+    }
+
+    #[test]
     fn upsert_approval_replaces_existing_reviewer_verdict() {
         let store = mk_store();
         let task_id = TaskId("T1".to_string());
