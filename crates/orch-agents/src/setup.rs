@@ -414,6 +414,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_selection_rejects_unknown_selected_model() {
+        let report = super::SetupProbeReport {
+            models: vec![ModelProbeResult {
+                model: ModelKind::Codex,
+                executable: "codex".to_string(),
+                installed: true,
+                version_ok: true,
+                version_output: Some("codex 1".to_string()),
+                env_status: vec![],
+                healthy: true,
+            }],
+        };
+
+        let selection = ModelSetupSelection {
+            enabled_models: vec![ModelKind::Gemini],
+        };
+        let err = validate_setup_selection(&report, &selection).expect_err("expected error");
+        assert!(matches!(
+            err,
+            SetupError::SelectedModelUnknown {
+                model: ModelKind::Gemini
+            }
+        ));
+    }
+
+    #[test]
     fn validate_selection_dedupes_models_in_order() {
         let report = super::SetupProbeReport {
             models: vec![
@@ -446,6 +472,60 @@ mod tests {
             validated.enabled_models,
             vec![ModelKind::Codex, ModelKind::Claude]
         );
+    }
+
+    #[test]
+    fn probe_falls_back_to_default_executables_when_override_missing() {
+        let mut config = SetupProbeConfig::default();
+        config.executable_by_model.clear();
+
+        let mut runner = MockRunner::default();
+        runner.installed.insert("claude".to_string(), true);
+        runner.installed.insert("codex".to_string(), true);
+        runner.installed.insert("gemini".to_string(), true);
+        runner
+            .versions
+            .insert("claude".to_string(), Ok("claude 1".to_string()));
+        runner
+            .versions
+            .insert("codex".to_string(), Ok("codex 1".to_string()));
+        runner
+            .versions
+            .insert("gemini".to_string(), Ok("gemini 1".to_string()));
+        runner
+            .env_present
+            .insert("ANTHROPIC_API_KEY".to_string(), true);
+        runner
+            .env_present
+            .insert("OPENAI_API_KEY".to_string(), true);
+        runner
+            .env_present
+            .insert("GEMINI_API_KEY".to_string(), true);
+
+        let report = probe_models_with_runner(&config, &runner);
+
+        let claude = report
+            .models
+            .iter()
+            .find(|m| m.model == ModelKind::Claude)
+            .expect("claude probe");
+        let codex = report
+            .models
+            .iter()
+            .find(|m| m.model == ModelKind::Codex)
+            .expect("codex probe");
+        let gemini = report
+            .models
+            .iter()
+            .find(|m| m.model == ModelKind::Gemini)
+            .expect("gemini probe");
+
+        assert_eq!(claude.executable, "claude");
+        assert_eq!(codex.executable, "codex");
+        assert_eq!(gemini.executable, "gemini");
+        assert!(claude.healthy);
+        assert!(codex.healthy);
+        assert!(gemini.healthy);
     }
 
     #[test]
