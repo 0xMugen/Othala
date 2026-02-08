@@ -180,4 +180,64 @@ mod tests {
         assert_eq!(task.state, TaskState::VerifyingFull);
         assert_eq!(task.updated_at, at);
     }
+
+    #[test]
+    fn allows_pause_from_active_states_and_resume_from_failed() {
+        assert!(is_transition_allowed(TaskState::Running, TaskState::Paused));
+        assert!(is_transition_allowed(
+            TaskState::Reviewing,
+            TaskState::Paused
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::Paused
+        ));
+        assert!(is_transition_allowed(TaskState::Failed, TaskState::Paused));
+    }
+
+    #[test]
+    fn disallows_invalid_shortcuts_between_lifecycle_states() {
+        assert!(!is_transition_allowed(
+            TaskState::Queued,
+            TaskState::Running
+        ));
+        assert!(!is_transition_allowed(TaskState::Ready, TaskState::Running));
+        assert!(!is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::Ready
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Merged,
+            TaskState::Running
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Paused,
+            TaskState::Reviewing
+        ));
+    }
+
+    #[test]
+    fn transition_rejects_invalid_target_state() {
+        let mut task = mk_task(TaskState::Queued);
+        let at = Utc::now();
+        let err = transition_task(&mut task, TaskState::Running, at)
+            .expect_err("queued -> running should be invalid");
+        assert!(matches!(
+            err,
+            super::StateMachineError::InvalidTransition {
+                from: TaskState::Queued,
+                to: TaskState::Running
+            }
+        ));
+        assert_eq!(task.state, TaskState::Queued);
+    }
+
+    #[test]
+    fn task_state_tag_covers_restack_conflict_and_paused() {
+        assert_eq!(
+            super::task_state_tag(TaskState::RestackConflict),
+            "RESTACK_CONFLICT"
+        );
+        assert_eq!(super::task_state_tag(TaskState::Paused), "PAUSED");
+    }
 }
