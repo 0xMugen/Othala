@@ -241,3 +241,107 @@ fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{escaped}'")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use orch_core::types::{ModelKind, RepoId, TaskId};
+
+    use crate::adapter::ClaudeAdapter;
+    use crate::error::AgentError;
+    use crate::types::{AgentCommand, AgentSignalKind, EpochRequest, EpochStopReason};
+
+    use super::{render_shell_invocation, shell_quote, signal_to_stop_reason, EpochRunner};
+
+    fn mk_request() -> EpochRequest {
+        EpochRequest {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            repo_path: PathBuf::from("/tmp/repo"),
+            prompt: "do work".to_string(),
+            timeout_secs: 30,
+            extra_args: vec!["--json".to_string()],
+            env: vec![("FOO".to_string(), "BAR".to_string())],
+        }
+    }
+
+    #[test]
+    fn signal_to_stop_reason_maps_supported_signals() {
+        assert_eq!(
+            signal_to_stop_reason(AgentSignalKind::NeedHuman),
+            Some(EpochStopReason::NeedHuman)
+        );
+        assert_eq!(
+            signal_to_stop_reason(AgentSignalKind::PatchReady),
+            Some(EpochStopReason::PatchReady)
+        );
+        assert_eq!(
+            signal_to_stop_reason(AgentSignalKind::RateLimited),
+            Some(EpochStopReason::RateLimited)
+        );
+        assert_eq!(signal_to_stop_reason(AgentSignalKind::ErrorHint), None);
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("O'Reilly"), "'O'\"'\"'Reilly'");
+    }
+
+    #[test]
+    fn render_shell_invocation_renders_cd_env_and_command() {
+        let repo_path = PathBuf::from("/tmp/repo path");
+        let command = AgentCommand {
+            executable: "codex".to_string(),
+            args: vec!["--flag".to_string(), "it's".to_string()],
+            env: vec![
+                ("FOO".to_string(), "BAR".to_string()),
+                ("".to_string(), "SKIP".to_string()),
+                ("A_B".to_string(), "x y".to_string()),
+            ],
+        };
+
+        let rendered = render_shell_invocation(&repo_path, &command);
+        assert!(rendered.starts_with("cd '/tmp/repo path' && "));
+        assert!(rendered.contains("FOO='BAR' "));
+        assert!(rendered.contains("A_B='x y' "));
+        assert!(!rendered.contains("SKIP"));
+        assert!(rendered.contains("'codex' '--flag' 'it'\"'\"'s'"));
+    }
+
+    #[test]
+    fn run_epoch_rejects_zero_timeout_before_spawning() {
+        let mut request = mk_request();
+        request.timeout_secs = 0;
+
+        let runner = EpochRunner::default();
+        let adapter = ClaudeAdapter::default();
+        let err = runner
+            .run_epoch(&request, &adapter)
+            .expect_err("zero timeout must fail");
+
+        assert!(matches!(
+            err,
+            AgentError::InvalidRequest { message } if message.contains("timeout_secs")
+        ));
+    }
+
+    #[test]
+    fn run_epoch_rejects_empty_prompt_before_spawning() {
+        let mut request = mk_request();
+        request.prompt = "   ".to_string();
+
+        let runner = EpochRunner::default();
+        let adapter = ClaudeAdapter::default();
+        let err = runner
+            .run_epoch(&request, &adapter)
+            .expect_err("empty prompt must fail");
+
+        assert!(matches!(
+            err,
+            AgentError::InvalidRequest { message } if message.contains("prompt")
+        ));
+    }
+}

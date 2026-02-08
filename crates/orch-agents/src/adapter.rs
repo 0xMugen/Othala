@@ -106,3 +106,92 @@ pub fn default_adapter_for(model: ModelKind) -> Result<Box<dyn AgentAdapter>, Ag
         ModelKind::Gemini => Ok(Box::new(GeminiAdapter::default())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use orch_core::types::{ModelKind, RepoId, TaskId};
+
+    use crate::types::EpochRequest;
+
+    use super::{default_adapter_for, AgentAdapter, ClaudeAdapter, CodexAdapter, GeminiAdapter};
+
+    fn mk_request(model: ModelKind) -> EpochRequest {
+        EpochRequest {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model,
+            repo_path: PathBuf::from("/tmp/repo"),
+            prompt: "implement feature".to_string(),
+            timeout_secs: 30,
+            extra_args: vec!["--flag".to_string(), "--json".to_string()],
+            env: vec![("FOO".to_string(), "BAR".to_string())],
+        }
+    }
+
+    #[test]
+    fn claude_adapter_builds_command_with_prompt_appended() {
+        let adapter = ClaudeAdapter::default();
+        let request = mk_request(ModelKind::Claude);
+        let command = adapter.build_command(&request);
+
+        assert_eq!(command.executable, "claude");
+        assert_eq!(
+            command.args,
+            vec![
+                "--flag".to_string(),
+                "--json".to_string(),
+                "implement feature".to_string()
+            ]
+        );
+        assert_eq!(command.env, vec![("FOO".to_string(), "BAR".to_string())]);
+    }
+
+    #[test]
+    fn codex_adapter_builds_command_with_prompt_appended() {
+        let adapter = CodexAdapter::default();
+        let request = mk_request(ModelKind::Codex);
+        let command = adapter.build_command(&request);
+
+        assert_eq!(command.executable, "codex");
+        assert_eq!(
+            command.args,
+            vec![
+                "--flag".to_string(),
+                "--json".to_string(),
+                "implement feature".to_string()
+            ]
+        );
+        assert_eq!(command.env, vec![("FOO".to_string(), "BAR".to_string())]);
+    }
+
+    #[test]
+    fn gemini_adapter_builds_command_with_prompt_appended() {
+        let adapter = GeminiAdapter::default();
+        let request = mk_request(ModelKind::Gemini);
+        let command = adapter.build_command(&request);
+
+        assert_eq!(command.executable, "gemini");
+        assert_eq!(
+            command.args,
+            vec![
+                "--flag".to_string(),
+                "--json".to_string(),
+                "implement feature".to_string()
+            ]
+        );
+        assert_eq!(command.env, vec![("FOO".to_string(), "BAR".to_string())]);
+    }
+
+    #[test]
+    fn default_adapter_for_returns_adapter_matching_requested_model() {
+        let claude = default_adapter_for(ModelKind::Claude).expect("claude adapter");
+        let codex = default_adapter_for(ModelKind::Codex).expect("codex adapter");
+        let gemini = default_adapter_for(ModelKind::Gemini).expect("gemini adapter");
+
+        assert_eq!(claude.model(), ModelKind::Claude);
+        assert_eq!(codex.model(), ModelKind::Codex);
+        assert_eq!(gemini.model(), ModelKind::Gemini);
+    }
+}
