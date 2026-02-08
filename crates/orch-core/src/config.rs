@@ -207,11 +207,12 @@ fn dedupe_models(models: &[ModelKind]) -> Vec<ModelKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_setup_selection_to_org_config, load_org_config, parse_org_config, save_org_config,
-        OrgConfig, SetupApplyError,
+        apply_setup_selection_to_org_config, load_org_config, load_repo_config, parse_org_config,
+        parse_repo_config, save_org_config, ConfigError, OrgConfig, SetupApplyError,
     };
     use crate::types::ModelKind;
     use std::fs;
+    use std::path::PathBuf;
 
     fn sample_org() -> OrgConfig {
         parse_org_config(
@@ -237,6 +238,40 @@ web_bind = "127.0.0.1:9842"
 "#,
         )
         .expect("parse org config")
+    }
+
+    fn sample_repo() -> &'static str {
+        r#"
+repo_id = "example"
+repo_path = "/home/user/src/example"
+base_branch = "main"
+
+[nix]
+dev_shell = "nix develop"
+
+[verify.quick]
+commands = [
+  "nix develop -c just fmt",
+  "nix develop -c just lint",
+  "nix develop -c just test"
+]
+
+[verify.full]
+commands = [
+  "nix develop -c just test-all"
+]
+
+[graphite]
+draft_on_start = true
+submit_mode = "single"
+"#
+    }
+
+    fn unique_temp_path(file_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{file_name}-{}.toml",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
     }
 
     #[test]
@@ -289,5 +324,50 @@ web_bind = "127.0.0.1:9842"
         assert_eq!(loaded, config);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_repo_config_parses_spec_shape() {
+        let repo = parse_repo_config(sample_repo()).expect("parse repo config");
+        assert_eq!(repo.repo_id, "example");
+        assert_eq!(repo.base_branch, "main");
+        assert_eq!(repo.nix.dev_shell, "nix develop");
+        assert_eq!(repo.verify.quick.commands.len(), 3);
+        assert_eq!(repo.verify.full.commands.len(), 1);
+        assert_eq!(
+            repo.graphite.submit_mode,
+            Some(crate::types::SubmitMode::Single)
+        );
+    }
+
+    #[test]
+    fn load_repo_config_classifies_read_and_parse_errors() {
+        let missing_path = unique_temp_path("othala-missing-repo-config");
+        let err = load_repo_config(&missing_path).expect_err("missing file should fail");
+        assert!(matches!(err, ConfigError::Read { path, .. } if path == missing_path));
+
+        let invalid_path = unique_temp_path("othala-invalid-repo-config");
+        fs::write(&invalid_path, "repo_id = [").expect("write invalid repo config fixture");
+        let err = load_repo_config(&invalid_path).expect_err("invalid config should fail");
+        assert!(matches!(err, ConfigError::Parse { path, .. } if path == invalid_path));
+        let _ = fs::remove_file(invalid_path);
+    }
+
+    #[test]
+    fn save_org_config_creates_parent_directories() {
+        let config = sample_org();
+        let base = std::env::temp_dir().join(format!(
+            "othala-config-parent-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = base.join("nested/config/org.toml");
+
+        save_org_config(&path, &config).expect("save config in nested path");
+        assert!(path.exists());
+
+        let loaded = load_org_config(&path).expect("load config from nested path");
+        assert_eq!(loaded, config);
+
+        let _ = fs::remove_dir_all(base);
     }
 }
