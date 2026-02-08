@@ -240,6 +240,18 @@ mod tests {
     }
 
     #[test]
+    fn org_config_validation_allows_low_min_approvals_in_strict_policy() {
+        let mut config = valid_org_config();
+        config.models.policy = ReviewPolicy::Strict;
+        config.models.min_approvals = 1;
+
+        let issues = config.validate();
+        assert!(issues
+            .iter()
+            .all(|issue| issue.code != "models.min_approvals.too_low"));
+    }
+
+    #[test]
     fn repo_config_validation_reports_errors_and_warning() {
         let mut config = valid_repo_config();
         config.repo_id = "  ".to_string();
