@@ -159,3 +159,45 @@ fn file_state_from_code(code: &str) -> FileState {
     }
     FileState::Unknown
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{file_state_from_code, parse_porcelain_status, FileState};
+
+    #[test]
+    fn parse_porcelain_status_parses_common_status_codes() {
+        let raw = concat!(
+            " M src/lib.rs\n",
+            "A  src/new.rs\n",
+            "D  src/old.rs\n",
+            "R  src/renamed.rs\n",
+            "C  src/copied.rs\n",
+            "UU src/conflict.rs\n",
+            "?? src/untracked.rs\n",
+        );
+        let parsed = parse_porcelain_status(raw).expect("parse porcelain");
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed[0].state, FileState::Modified);
+        assert_eq!(parsed[0].path, PathBuf::from("src/lib.rs"));
+        assert_eq!(parsed[1].state, FileState::Added);
+        assert_eq!(parsed[2].state, FileState::Deleted);
+        assert_eq!(parsed[3].state, FileState::Renamed);
+        assert_eq!(parsed[4].state, FileState::Copied);
+        assert_eq!(parsed[5].state, FileState::Unmerged);
+        assert_eq!(parsed[6].state, FileState::Untracked);
+    }
+
+    #[test]
+    fn parse_porcelain_status_rejects_short_invalid_lines() {
+        let err = parse_porcelain_status("M\n").expect_err("expected parse error");
+        assert!(matches!(err, crate::error::GitError::Parse { .. }));
+    }
+
+    #[test]
+    fn file_state_from_code_returns_unknown_for_unhandled_codes() {
+        assert_eq!(file_state_from_code("!!"), FileState::Unknown);
+        assert_eq!(file_state_from_code("  "), FileState::Unknown);
+    }
+}

@@ -143,3 +143,62 @@ fn render_command(binary: &Path, args: &[OsString]) -> String {
     }
     rendered
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::{validate_contract, AllowedAutoCommand, GraphiteCli};
+    use crate::error::GraphiteError;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn validate_contract_accepts_allowed_invocations() {
+        assert!(validate_contract(AllowedAutoCommand::Create, &os(&["create", "task/T1"])).is_ok());
+        assert!(validate_contract(AllowedAutoCommand::Restack, &os(&["restack"])).is_ok());
+        assert!(
+            validate_contract(AllowedAutoCommand::AddAllForConflict, &os(&["add", "-A"])).is_ok()
+        );
+        assert!(
+            validate_contract(AllowedAutoCommand::ContinueConflict, &os(&["continue"])).is_ok()
+        );
+        assert!(validate_contract(AllowedAutoCommand::LogShort, &os(&["log", "short"])).is_ok());
+        assert!(validate_contract(AllowedAutoCommand::Status, &os(&["status"])).is_ok());
+        assert!(validate_contract(AllowedAutoCommand::Submit, &os(&["submit"])).is_ok());
+        assert!(
+            validate_contract(AllowedAutoCommand::SubmitStack, &os(&["submit", "--stack"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_contract_rejects_disallowed_or_mismatched_invocations() {
+        let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", ""]))
+            .expect_err("empty create branch should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(AllowedAutoCommand::Restack, &os(&["restack", "--stack"]))
+            .expect_err("restack extra args should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(AllowedAutoCommand::Submit, &os(&["submit", "--stack"]))
+            .expect_err("submit stack args require SubmitStack variant");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn run_allowed_checks_contract_before_spawning_binary() {
+        let cli = GraphiteCli::new("/definitely/missing/gt-binary");
+        let err = cli
+            .run_allowed(
+                Path::new("."),
+                AllowedAutoCommand::Restack,
+                ["restack", "--bad-arg"],
+            )
+            .expect_err("contract violation should be returned first");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+}

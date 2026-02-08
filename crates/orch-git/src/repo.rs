@@ -45,3 +45,105 @@ pub fn head_sha(repo: &RepoHandle, git: &GitCli) -> Result<String, GitError> {
     let output = git.run(&repo.root, ["rev-parse", "HEAD"])?;
     Ok(output.stdout.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{current_branch, discover_repo, head_sha};
+    use crate::command::GitCli;
+    use crate::error::GitError;
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("othala-orch-git-{prefix}-{now}"))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(with_commit: bool) -> PathBuf {
+        let root = unique_temp_dir("repo");
+        fs::create_dir_all(&root).expect("create temp repo");
+        run_git(&root, &["init"]);
+
+        if with_commit {
+            fs::write(root.join("README.md"), "init\n").expect("write file");
+            run_git(&root, &["add", "README.md"]);
+            run_git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "init",
+                ],
+            );
+        }
+
+        root
+    }
+
+    #[test]
+    fn discover_repo_finds_root_from_nested_path() {
+        let root = init_repo(false);
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let git = GitCli::default();
+        let repo = discover_repo(&nested, &git).expect("discover repo");
+
+        assert_eq!(repo.root, root);
+        assert_eq!(repo.git_dir, repo.root.join(".git"));
+
+        let _ = fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn discover_repo_returns_not_a_repository_for_plain_directory() {
+        let dir = unique_temp_dir("not-repo");
+        fs::create_dir_all(&dir).expect("create plain dir");
+
+        let git = GitCli::default();
+        let err = discover_repo(&dir, &git).expect_err("expected not a repository");
+        assert!(matches!(err, GitError::NotARepository { path } if path == dir));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_branch_and_head_sha_resolve_in_initialized_repository() {
+        let root = init_repo(true);
+        let git = GitCli::default();
+        let repo = discover_repo(&root, &git).expect("discover repo");
+
+        let branch = current_branch(&repo, &git).expect("current branch");
+        assert!(!branch.trim().is_empty());
+
+        let sha = head_sha(&repo, &git).expect("head sha");
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
