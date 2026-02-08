@@ -225,8 +225,9 @@ mod tests {
     use crate::error::VerifyError;
     use crate::runner::{
         classify_failure, command_has_prefix, commands_for_tier, prepare_verify_command,
+        VerifyRunner,
     };
-    use crate::types::VerifyFailureClass;
+    use crate::types::{VerifyFailureClass, VerifyOutcome};
 
     fn mk_repo_config() -> RepoConfig {
         RepoConfig {
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn run_tier_validates_empty_commands_and_blank_dev_shell() {
-        let runner = crate::runner::VerifyRunner::default();
+        let runner = VerifyRunner::default();
 
         let err = runner
             .run_tier(
@@ -350,5 +351,51 @@ mod tests {
             )
             .expect_err("blank dev shell should be invalid");
         assert!(matches!(err, VerifyError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn run_tier_stops_after_first_failure_when_fail_fast_enabled() {
+        let runner = VerifyRunner::new("bash");
+        let commands = vec![
+            "printf boom 1>&2; exit 2".to_string(),
+            "printf should-not-run".to_string(),
+        ];
+
+        let result = runner
+            .run_tier(
+                PathBuf::from(".").as_path(),
+                "bash",
+                VerifyTier::Quick,
+                &commands,
+            )
+            .expect("run tier");
+
+        assert_eq!(result.outcome, VerifyOutcome::Failed);
+        assert_eq!(result.commands.len(), 1);
+        assert_eq!(result.commands[0].outcome, VerifyOutcome::Failed);
+        assert_eq!(result.commands[0].exit_code, Some(2));
+    }
+
+    #[test]
+    fn run_tier_continues_after_failure_when_fail_fast_disabled() {
+        let runner = VerifyRunner::new("bash").with_fail_fast(false);
+        let commands = vec!["exit 3".to_string(), "printf second-pass".to_string()];
+
+        let result = runner
+            .run_tier(
+                PathBuf::from(".").as_path(),
+                "bash",
+                VerifyTier::Quick,
+                &commands,
+            )
+            .expect("run tier");
+
+        assert_eq!(result.outcome, VerifyOutcome::Failed);
+        assert_eq!(result.commands.len(), 2);
+        assert_eq!(result.commands[0].outcome, VerifyOutcome::Failed);
+        assert_eq!(result.commands[0].exit_code, Some(3));
+        assert_eq!(result.commands[1].outcome, VerifyOutcome::Passed);
+        assert_eq!(result.commands[1].exit_code, Some(0));
+        assert!(result.commands[1].stdout.contains("second-pass"));
     }
 }
