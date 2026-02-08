@@ -11,6 +11,12 @@ use crate::types::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestackOutcome {
+    Restacked,
+    Conflict { stdout: String, stderr: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphiteClient {
     pub cli: GraphiteCli,
     pub repo_root: PathBuf,
@@ -52,6 +58,15 @@ impl GraphiteClient {
             ["restack"],
         )?;
         Ok(())
+    }
+
+    pub fn restack_with_outcome(&self) -> Result<RestackOutcome, GraphiteError> {
+        let result = self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::Restack,
+            ["restack"],
+        );
+        classify_restack_result(result)
     }
 
     pub fn begin_conflict_resolution(&self) -> Result<(), GraphiteError> {
@@ -98,7 +113,10 @@ impl GraphiteClient {
         branch_to_task: &HashMap<String, TaskId>,
     ) -> Result<Vec<InferredStackDependency>, GraphiteError> {
         let snapshot = self.log_short_snapshot()?;
-        Ok(infer_task_dependencies_from_stack(&snapshot, branch_to_task))
+        Ok(infer_task_dependencies_from_stack(
+            &snapshot,
+            branch_to_task,
+        ))
     }
 
     pub fn submit(&self, mode: SubmitMode) -> Result<(), GraphiteError> {
@@ -123,5 +141,67 @@ impl GraphiteClient {
 
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+}
+
+fn classify_restack_result(
+    result: Result<crate::command::GraphiteOutput, GraphiteError>,
+) -> Result<RestackOutcome, GraphiteError> {
+    match result {
+        Ok(_) => Ok(RestackOutcome::Restacked),
+        Err(err @ GraphiteError::CommandFailed { .. }) if err.is_restack_conflict() => {
+            if let GraphiteError::CommandFailed { stdout, stderr, .. } = err {
+                Ok(RestackOutcome::Conflict { stdout, stderr })
+            } else {
+                unreachable!("guard guarantees CommandFailed");
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command::GraphiteOutput;
+    use crate::error::GraphiteError;
+
+    use super::{classify_restack_result, RestackOutcome};
+
+    #[test]
+    fn classifies_successful_restack() {
+        let outcome = classify_restack_result(Ok(GraphiteOutput {
+            stdout: "ok".to_string(),
+            stderr: "".to_string(),
+        }))
+        .expect("classify");
+        assert_eq!(outcome, RestackOutcome::Restacked);
+    }
+
+    #[test]
+    fn classifies_conflict_restack_failure() {
+        let outcome = classify_restack_result(Err(GraphiteError::CommandFailed {
+            command: "gt restack".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "CONFLICT (content)".to_string(),
+        }))
+        .expect("conflict becomes typed outcome");
+
+        assert_eq!(
+            outcome,
+            RestackOutcome::Conflict {
+                stdout: "".to_string(),
+                stderr: "CONFLICT (content)".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_non_conflict_errors() {
+        let err = classify_restack_result(Err(GraphiteError::ContractViolation {
+            message: "bad args".to_string(),
+        }))
+        .expect_err("must be error");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
     }
 }

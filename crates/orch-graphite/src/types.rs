@@ -51,7 +51,11 @@ pub fn infer_task_dependencies_from_stack(
     let branches = snapshot
         .nodes
         .iter()
-        .filter_map(|node| node.branch.as_ref().map(|branch| (branch.clone(), node.depth_hint)))
+        .filter_map(|node| {
+            node.branch
+                .as_ref()
+                .map(|branch| (branch.clone(), node.depth_hint))
+        })
         .collect::<Vec<_>>();
     if branches.len() < 2 {
         return Vec::new();
@@ -117,7 +121,10 @@ fn looks_like_branch_token(token: &str) -> bool {
     if token.eq_ignore_ascii_case("gt") || token.eq_ignore_ascii_case("graphite") {
         return false;
     }
-    if token.chars().all(|c| matches!(c, '|' | '/' | '\\' | '-' | '*' | 'o' | 'O')) {
+    if token
+        .chars()
+        .all(|c| matches!(c, '|' | '/' | '\\' | '-' | '*' | 'o' | 'O'))
+    {
         return false;
     }
     token

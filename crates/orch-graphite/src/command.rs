@@ -96,10 +96,7 @@ impl GraphiteCli {
     }
 }
 
-fn validate_contract(
-    allowed: AllowedAutoCommand,
-    args: &[OsString],
-) -> Result<(), GraphiteError> {
+fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(), GraphiteError> {
     let ok = match allowed {
         AllowedAutoCommand::Create => {
             args.len() == 2 && arg_eq(args, 0, "create") && !arg_at(args, 1).trim().is_empty()

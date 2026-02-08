@@ -57,22 +57,47 @@ pub struct ReviewOutput {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     TaskCreated,
-    TaskStateChanged { from: String, to: String },
-    DraftPrCreated { number: u64, url: String },
-    ParentHeadUpdated { parent_task_id: TaskId },
+    TaskStateChanged {
+        from: String,
+        to: String,
+    },
+    DraftPrCreated {
+        number: u64,
+        url: String,
+    },
+    ParentHeadUpdated {
+        parent_task_id: TaskId,
+    },
     RestackStarted,
     RestackCompleted,
     RestackConflict,
     RestackResolved,
-    VerifyRequested { tier: VerifyTier },
-    VerifyCompleted { tier: VerifyTier, success: bool },
-    ReviewRequested { required_models: Vec<ModelKind> },
-    ReviewCompleted { reviewer: ModelKind, output: ReviewOutput },
+    VerifyRequested {
+        tier: VerifyTier,
+    },
+    VerifyCompleted {
+        tier: VerifyTier,
+        success: bool,
+    },
+    ReviewRequested {
+        required_models: Vec<ModelKind>,
+    },
+    ReviewCompleted {
+        reviewer: ModelKind,
+        output: ReviewOutput,
+    },
     ReadyReached,
-    SubmitStarted { mode: SubmitMode },
+    SubmitStarted {
+        mode: SubmitMode,
+    },
     SubmitCompleted,
-    NeedsHuman { reason: String },
-    Error { code: String, message: String },
+    NeedsHuman {
+        reason: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

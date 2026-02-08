@@ -19,7 +19,10 @@ pub struct RunnerPtySize {
 
 impl Default for RunnerPtySize {
     fn default() -> Self {
-        Self { rows: 40, cols: 120 }
+        Self {
+            rows: 40,
+            cols: 120,
+        }
     }
 }
 
@@ -88,9 +91,12 @@ impl EpochRunner {
             })?;
         drop(pair.slave);
 
-        let reader = pair.master.try_clone_reader().map_err(|err| AgentError::PtySetup {
-            message: err.to_string(),
-        })?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| AgentError::PtySetup {
+                message: err.to_string(),
+            })?;
         let (tx, rx) = mpsc::channel::<String>();
         let reader_handle = thread::spawn(move || {
             let mut buf = BufReader::new(reader);

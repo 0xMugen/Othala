@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
-use orch_core::state::TaskState;
-use orch_core::types::{EventId, Task, TaskApproval, TaskId};
+use orch_core::state::{TaskState, VerifyStatus, VerifyTier};
+use orch_core::types::{EventId, PullRequestRef, SubmitMode, Task, TaskApproval, TaskId};
 use orch_notify::{notification_for_event, NotificationDispatcher};
 use std::path::PathBuf;
 
@@ -43,6 +43,34 @@ pub struct PromoteTaskEventIds {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftPrEventIds {
+    pub draft_pr_state_changed: EventId,
+    pub draft_pr_created: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteQuickVerifyEventIds {
+    pub verify_completed: EventId,
+    pub success_state_changed: EventId,
+    pub failure_state_changed: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteFullVerifyEventIds {
+    pub verify_completed: EventId,
+    pub success_state_changed: EventId,
+    pub failure_state_changed: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteRestackEventIds {
+    pub restack_completed: EventId,
+    pub success_state_changed: EventId,
+    pub conflict_event: EventId,
+    pub conflict_state_changed: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromoteTaskOutcome {
     pub task: Task,
     pub ready_gate: ReadyGateDecision,
@@ -53,6 +81,64 @@ pub struct PromoteTaskOutcome {
 pub struct TaskReviewComputation {
     pub requirement: ReviewRequirement,
     pub evaluation: ReviewEvaluation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteReviewEventIds {
+    pub review_completed: EventId,
+    pub needs_human_state_changed: EventId,
+    pub needs_human_event: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteReviewOutcome {
+    pub task: Task,
+    pub computation: TaskReviewComputation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestReviewEventIds {
+    pub review_requested: EventId,
+    pub needs_human_state_changed: EventId,
+    pub needs_human_event: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestReviewOutcome {
+    pub task: Task,
+    pub computation: TaskReviewComputation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRestackEventIds {
+    pub restack_state_changed: EventId,
+    pub restack_started: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartVerifyEventIds {
+    pub verify_state_changed: EventId,
+    pub verify_requested: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartSubmitEventIds {
+    pub submit_state_changed: EventId,
+    pub submit_started: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkNeedsHumanEventIds {
+    pub needs_human_state_changed: EventId,
+    pub needs_human_event: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteSubmitEventIds {
+    pub submit_completed: EventId,
+    pub success_state_changed: EventId,
+    pub failure_state_changed: EventId,
+    pub failure_error_event: EventId,
 }
 
 pub struct OrchdService {
@@ -190,6 +276,110 @@ impl OrchdService {
         Ok((task, computation))
     }
 
+    pub fn request_review(
+        &self,
+        task_id: &TaskId,
+        config: &ReviewGateConfig,
+        availability: &[ReviewerAvailability],
+        event_ids: RequestReviewEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<RequestReviewOutcome, ServiceError> {
+        let (mut task, computation) =
+            self.recompute_task_review_status(task_id, config, availability, at)?;
+
+        self.record_event(&Event {
+            id: event_ids.review_requested,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::ReviewRequested {
+                required_models: computation.requirement.required_models.clone(),
+            },
+        })?;
+
+        if computation.evaluation.needs_human && task.state == TaskState::Reviewing {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::NeedsHuman,
+                event_ids.needs_human_state_changed,
+                at,
+            )?;
+            self.record_event(&Event {
+                id: event_ids.needs_human_event,
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::NeedsHuman {
+                    reason: "review capacity insufficient for required approvals".to_string(),
+                },
+            })?;
+        }
+
+        Ok(RequestReviewOutcome { task, computation })
+    }
+
+    pub fn complete_review(
+        &self,
+        task_id: &TaskId,
+        reviewer: orch_core::types::ModelKind,
+        output: orch_core::events::ReviewOutput,
+        config: &ReviewGateConfig,
+        availability: &[ReviewerAvailability],
+        event_ids: CompleteReviewEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<CompleteReviewOutcome, ServiceError> {
+        let task = self
+            .store
+            .load_task(task_id)?
+            .ok_or_else(|| ServiceError::TaskNotFound {
+                task_id: task_id.0.clone(),
+            })?;
+
+        self.record_approval(&TaskApproval {
+            task_id: task.id.clone(),
+            reviewer,
+            verdict: output.verdict,
+            issued_at: at,
+        })?;
+
+        self.record_event(&Event {
+            id: event_ids.review_completed,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::ReviewCompleted {
+                reviewer,
+                output: output.clone(),
+            },
+        })?;
+
+        let (mut updated, computation) =
+            self.recompute_task_review_status(task_id, config, availability, at)?;
+
+        if computation.evaluation.needs_human && updated.state == TaskState::Reviewing {
+            self.apply_transition_with_state_event(
+                &mut updated,
+                TaskState::NeedsHuman,
+                event_ids.needs_human_state_changed,
+                at,
+            )?;
+            self.record_event(&Event {
+                id: event_ids.needs_human_event,
+                task_id: Some(updated.id.clone()),
+                repo_id: Some(updated.repo_id.clone()),
+                at,
+                kind: EventKind::NeedsHuman {
+                    reason: "review capacity insufficient for required approvals".to_string(),
+                },
+            })?;
+        }
+
+        Ok(CompleteReviewOutcome {
+            task: updated,
+            computation,
+        })
+    }
+
     pub fn transition_task_state(
         &self,
         task_id: &TaskId,
@@ -217,6 +407,428 @@ impl OrchdService {
             },
         };
         self.record_event(&event)?;
+        Ok(task)
+    }
+
+    pub fn mark_task_draft_pr_open(
+        &self,
+        task_id: &TaskId,
+        pr_number: u64,
+        pr_url: String,
+        event_ids: DraftPrEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        task.pr = Some(PullRequestRef {
+            number: pr_number,
+            url: pr_url.clone(),
+            draft: true,
+        });
+
+        if task.state != TaskState::DraftPrOpen {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::DraftPrOpen,
+                event_ids.draft_pr_state_changed,
+                at,
+            )?;
+        } else {
+            task.updated_at = at;
+            self.store.upsert_task(&task)?;
+        }
+
+        self.record_event(&Event {
+            id: event_ids.draft_pr_created,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::DraftPrCreated {
+                number: pr_number,
+                url: pr_url,
+            },
+        })?;
+
+        Ok(task)
+    }
+
+    pub fn complete_quick_verify(
+        &self,
+        task_id: &TaskId,
+        success: bool,
+        failure_summary: Option<String>,
+        event_ids: CompleteQuickVerifyEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        task.verify_status = if success {
+            VerifyStatus::Passed {
+                tier: VerifyTier::Quick,
+            }
+        } else {
+            VerifyStatus::Failed {
+                tier: VerifyTier::Quick,
+                summary: failure_summary.unwrap_or_else(|| "verify.quick failed".to_string()),
+            }
+        };
+        task.updated_at = at;
+        self.store.upsert_task(&task)?;
+
+        self.record_event(&Event {
+            id: event_ids.verify_completed,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::VerifyCompleted {
+                tier: VerifyTier::Quick,
+                success,
+            },
+        })?;
+
+        if task.state == TaskState::VerifyingQuick {
+            let (target_state, event_id) = if success {
+                (TaskState::Reviewing, event_ids.success_state_changed)
+            } else {
+                (TaskState::Running, event_ids.failure_state_changed)
+            };
+            self.apply_transition_with_state_event(&mut task, target_state, event_id, at)?;
+        }
+
+        Ok(task)
+    }
+
+    pub fn complete_full_verify(
+        &self,
+        task_id: &TaskId,
+        success: bool,
+        failure_summary: Option<String>,
+        success_state_if_verifying_full: TaskState,
+        failure_state_if_verifying_full: TaskState,
+        event_ids: CompleteFullVerifyEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        task.verify_status = if success {
+            VerifyStatus::Passed {
+                tier: VerifyTier::Full,
+            }
+        } else {
+            VerifyStatus::Failed {
+                tier: VerifyTier::Full,
+                summary: failure_summary.unwrap_or_else(|| "verify.full failed".to_string()),
+            }
+        };
+        task.updated_at = at;
+        self.store.upsert_task(&task)?;
+
+        self.record_event(&Event {
+            id: event_ids.verify_completed,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::VerifyCompleted {
+                tier: VerifyTier::Full,
+                success,
+            },
+        })?;
+
+        if task.state == TaskState::VerifyingFull {
+            let (target_state, event_id) = if success {
+                (
+                    success_state_if_verifying_full,
+                    event_ids.success_state_changed,
+                )
+            } else {
+                (
+                    failure_state_if_verifying_full,
+                    event_ids.failure_state_changed,
+                )
+            };
+            self.apply_transition_with_state_event(&mut task, target_state, event_id, at)?;
+        }
+
+        Ok(task)
+    }
+
+    pub fn complete_restack(
+        &self,
+        task_id: &TaskId,
+        conflict: bool,
+        event_ids: CompleteRestackEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if conflict {
+            self.record_event(&Event {
+                id: event_ids.conflict_event,
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::RestackConflict,
+            })?;
+
+            if task.state == TaskState::Restacking {
+                self.apply_transition_with_state_event(
+                    &mut task,
+                    TaskState::RestackConflict,
+                    event_ids.conflict_state_changed,
+                    at,
+                )?;
+            }
+            return Ok(task);
+        }
+
+        self.record_event(&Event {
+            id: event_ids.restack_completed,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::RestackCompleted,
+        })?;
+
+        if task.state == TaskState::Restacking {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::VerifyingQuick,
+                event_ids.success_state_changed,
+                at,
+            )?;
+        }
+
+        Ok(task)
+    }
+
+    pub fn start_restack(
+        &self,
+        task_id: &TaskId,
+        event_ids: StartRestackEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if task.state != TaskState::Restacking {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Restacking,
+                event_ids.restack_state_changed,
+                at,
+            )?;
+        }
+
+        self.record_event(&Event {
+            id: event_ids.restack_started,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::RestackStarted,
+        })?;
+
+        Ok(task)
+    }
+
+    pub fn start_verify(
+        &self,
+        task_id: &TaskId,
+        tier: VerifyTier,
+        event_ids: StartVerifyEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        let target_state = match tier {
+            VerifyTier::Quick => TaskState::VerifyingQuick,
+            VerifyTier::Full => TaskState::VerifyingFull,
+        };
+
+        if task.state != target_state {
+            self.apply_transition_with_state_event(
+                &mut task,
+                target_state,
+                event_ids.verify_state_changed,
+                at,
+            )?;
+        }
+
+        task.verify_status = VerifyStatus::Running { tier };
+        task.updated_at = at;
+        self.store.upsert_task(&task)?;
+
+        self.record_event(&Event {
+            id: event_ids.verify_requested,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::VerifyRequested { tier },
+        })?;
+
+        Ok(task)
+    }
+
+    pub fn start_submit(
+        &self,
+        task_id: &TaskId,
+        mode: SubmitMode,
+        event_ids: StartSubmitEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if task.state != TaskState::Submitting {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Submitting,
+                event_ids.submit_state_changed,
+                at,
+            )?;
+        }
+
+        self.record_event(&Event {
+            id: event_ids.submit_started,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::SubmitStarted { mode },
+        })?;
+
+        Ok(task)
+    }
+
+    pub fn mark_needs_human(
+        &self,
+        task_id: &TaskId,
+        reason: impl Into<String>,
+        event_ids: MarkNeedsHumanEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if task.state != TaskState::NeedsHuman {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::NeedsHuman,
+                event_ids.needs_human_state_changed,
+                at,
+            )?;
+        }
+
+        let reason = reason.into();
+        let normalized_reason = if reason.trim().is_empty() {
+            "manual intervention required".to_string()
+        } else {
+            reason.trim().to_string()
+        };
+
+        self.record_event(&Event {
+            id: event_ids.needs_human_event,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::NeedsHuman {
+                reason: normalized_reason,
+            },
+        })?;
+
+        Ok(task)
+    }
+
+    pub fn complete_submit(
+        &self,
+        task_id: &TaskId,
+        success: bool,
+        failure_message: Option<String>,
+        event_ids: CompleteSubmitEventIds,
+        at: DateTime<Utc>,
+    ) -> Result<Task, ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+
+        if success {
+            self.record_event(&Event {
+                id: event_ids.submit_completed,
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::SubmitCompleted,
+            })?;
+
+            if task.state == TaskState::Submitting {
+                self.apply_transition_with_state_event(
+                    &mut task,
+                    TaskState::AwaitingMerge,
+                    event_ids.success_state_changed,
+                    at,
+                )?;
+            }
+            return Ok(task);
+        }
+
+        self.record_event(&Event {
+            id: event_ids.failure_error_event,
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::Error {
+                code: "submit_failed".to_string(),
+                message: failure_message.unwrap_or_else(|| "graphite submit failed".to_string()),
+            },
+        })?;
+
+        if task.state == TaskState::Submitting {
+            self.apply_transition_with_state_event(
+                &mut task,
+                TaskState::Failed,
+                event_ids.failure_state_changed,
+                at,
+            )?;
+        }
+
         Ok(task)
     }
 
@@ -268,6 +880,15 @@ impl OrchdService {
                 ready_gate,
                 auto_submit,
             });
+        }
+
+        // Ready gate promotes draft PRs to ready-for-review metadata.
+        if let Some(pr) = task.pr.as_mut() {
+            if pr.draft {
+                pr.draft = false;
+                task.updated_at = at;
+                self.store.upsert_task(&task)?;
+            }
         }
 
         if task.state != TaskState::Ready {
@@ -355,12 +976,15 @@ impl OrchdService {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use orch_core::events::{EventKind, ReviewVerdict};
+    use orch_core::events::{
+        EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
+    };
     use orch_core::state::{
-        ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus,
+        ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
     };
     use orch_core::types::{
-        EventId, ModelKind, RepoId, SubmitMode, Task, TaskApproval, TaskId, TaskRole, TaskType,
+        EventId, ModelKind, PullRequestRef, RepoId, SubmitMode, Task, TaskApproval, TaskId,
+        TaskRole, TaskType,
     };
     use orch_notify::{
         NotificationDispatcher, NotificationMessage, NotificationSink, NotificationSinkKind,
@@ -378,7 +1002,12 @@ mod tests {
     };
     use crate::scheduler::{Scheduler, SchedulerConfig};
 
-    use super::{OrchdService, PromoteTaskEventIds};
+    use super::{
+        CompleteFullVerifyEventIds, CompleteQuickVerifyEventIds, CompleteRestackEventIds,
+        CompleteReviewEventIds, CompleteSubmitEventIds, DraftPrEventIds, MarkNeedsHumanEventIds,
+        OrchdService, PromoteTaskEventIds, RequestReviewEventIds, StartRestackEventIds,
+        StartSubmitEventIds, StartVerifyEventIds,
+    };
 
     fn mk_service() -> OrchdService {
         mk_service_with_notifier(None)
@@ -475,6 +1104,22 @@ mod tests {
         }
     }
 
+    fn mk_review_output(verdict: ReviewVerdict) -> ReviewOutput {
+        ReviewOutput {
+            verdict,
+            issues: Vec::new(),
+            risk_flags: Vec::new(),
+            graphite_hygiene: GraphiteHygieneReport {
+                ok: true,
+                notes: "ok".to_string(),
+            },
+            test_assessment: TestAssessment {
+                ok: true,
+                notes: "ok".to_string(),
+            },
+        }
+    }
+
     struct CaptureSink {
         captured: Arc<Mutex<Vec<NotificationMessage>>>,
     }
@@ -528,6 +1173,1035 @@ mod tests {
     }
 
     #[test]
+    fn mark_task_draft_pr_open_sets_pr_and_transitions_state() {
+        let svc = mk_service();
+        let task = mk_task("TPR", TaskState::Initializing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .mark_task_draft_pr_open(
+                &task.id,
+                42,
+                "https://github.com/example/repo/pull/42".to_string(),
+                DraftPrEventIds {
+                    draft_pr_state_changed: EventId("E-DRAFT-STATE".to_string()),
+                    draft_pr_created: EventId("E-DRAFT-CREATED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("mark draft pr open");
+
+        assert_eq!(updated.state, TaskState::DraftPrOpen);
+        let pr = updated.pr.expect("pr must be set");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://github.com/example/repo/pull/42");
+        assert!(pr.draft);
+
+        let stored = svc.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(stored.state, TaskState::DraftPrOpen);
+        assert_eq!(stored.pr, Some(pr.clone()));
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "INITIALIZING" && to == "DRAFT_PR_OPEN"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::DraftPrCreated { number, url }
+                    if *number == 42 && url == "https://github.com/example/repo/pull/42"
+            )
+        }));
+    }
+
+    #[test]
+    fn mark_task_draft_pr_open_is_idempotent_on_state_transition() {
+        let svc = mk_service();
+        let task = mk_task("TPR2", TaskState::DraftPrOpen, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let _updated = svc
+            .mark_task_draft_pr_open(
+                &task.id,
+                77,
+                "https://github.com/example/repo/pull/77".to_string(),
+                DraftPrEventIds {
+                    draft_pr_state_changed: EventId("E-DRAFT-STATE-2".to_string()),
+                    draft_pr_created: EventId("E-DRAFT-CREATED-2".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("mark draft pr open");
+
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|event| {
+            matches!(&event.kind, EventKind::DraftPrCreated { number, .. } if *number == 77)
+        }));
+    }
+
+    #[test]
+    fn complete_quick_verify_success_transitions_to_reviewing() {
+        let svc = mk_service();
+        let task = mk_task("TVQ1", TaskState::VerifyingQuick, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_quick_verify(
+                &task.id,
+                true,
+                None,
+                CompleteQuickVerifyEventIds {
+                    verify_completed: EventId("E-VQ1-DONE".to_string()),
+                    success_state_changed: EventId("E-VQ1-REVIEWING".to_string()),
+                    failure_state_changed: EventId("E-VQ1-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete quick verify");
+
+        assert_eq!(updated.state, TaskState::Reviewing);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Passed {
+                tier: VerifyTier::Quick
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Quick,
+                success: true
+            }
+        )));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "VERIFYING_QUICK" && to == "REVIEWING"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_quick_verify_failure_transitions_back_to_running() {
+        let svc = mk_service();
+        let task = mk_task("TVQ2", TaskState::VerifyingQuick, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_quick_verify(
+                &task.id,
+                false,
+                Some("lint failed".to_string()),
+                CompleteQuickVerifyEventIds {
+                    verify_completed: EventId("E-VQ2-DONE".to_string()),
+                    success_state_changed: EventId("E-VQ2-REVIEWING".to_string()),
+                    failure_state_changed: EventId("E-VQ2-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete quick verify");
+
+        assert_eq!(updated.state, TaskState::Running);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Failed {
+                tier: VerifyTier::Quick,
+                summary: "lint failed".to_string()
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Quick,
+                success: false
+            }
+        )));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "VERIFYING_QUICK" && to == "RUNNING"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_quick_verify_updates_status_without_state_jump_when_not_verifying() {
+        let svc = mk_service();
+        let task = mk_task("TVQ3", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_quick_verify(
+                &task.id,
+                true,
+                None,
+                CompleteQuickVerifyEventIds {
+                    verify_completed: EventId("E-VQ3-DONE".to_string()),
+                    success_state_changed: EventId("E-VQ3-REVIEWING".to_string()),
+                    failure_state_changed: EventId("E-VQ3-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete quick verify");
+
+        assert_eq!(updated.state, TaskState::Running);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Passed {
+                tier: VerifyTier::Quick
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Quick,
+                success: true
+            }
+        )));
+    }
+
+    #[test]
+    fn complete_full_verify_success_transitions_to_target_state() {
+        let svc = mk_service();
+        let task = mk_task("TVF1", TaskState::VerifyingFull, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_full_verify(
+                &task.id,
+                true,
+                None,
+                TaskState::AwaitingMerge,
+                TaskState::Running,
+                CompleteFullVerifyEventIds {
+                    verify_completed: EventId("E-VF1-DONE".to_string()),
+                    success_state_changed: EventId("E-VF1-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-VF1-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete full verify");
+
+        assert_eq!(updated.state, TaskState::AwaitingMerge);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Passed {
+                tier: VerifyTier::Full
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Full,
+                success: true
+            }
+        )));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "VERIFYING_FULL" && to == "AWAITING_MERGE"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_full_verify_failure_transitions_to_target_state() {
+        let svc = mk_service();
+        let task = mk_task("TVF2", TaskState::VerifyingFull, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_full_verify(
+                &task.id,
+                false,
+                Some("integration failed".to_string()),
+                TaskState::AwaitingMerge,
+                TaskState::Running,
+                CompleteFullVerifyEventIds {
+                    verify_completed: EventId("E-VF2-DONE".to_string()),
+                    success_state_changed: EventId("E-VF2-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-VF2-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete full verify");
+
+        assert_eq!(updated.state, TaskState::Running);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Failed {
+                tier: VerifyTier::Full,
+                summary: "integration failed".to_string()
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Full,
+                success: false
+            }
+        )));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "VERIFYING_FULL" && to == "RUNNING"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_full_verify_updates_status_without_state_jump_when_not_verifying() {
+        let svc = mk_service();
+        let task = mk_task("TVF3", TaskState::Ready, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_full_verify(
+                &task.id,
+                true,
+                None,
+                TaskState::AwaitingMerge,
+                TaskState::Running,
+                CompleteFullVerifyEventIds {
+                    verify_completed: EventId("E-VF3-DONE".to_string()),
+                    success_state_changed: EventId("E-VF3-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-VF3-RUNNING".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete full verify");
+
+        assert_eq!(updated.state, TaskState::Ready);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Passed {
+                tier: VerifyTier::Full
+            }
+        );
+
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::VerifyCompleted {
+                tier: VerifyTier::Full,
+                success: true
+            }
+        )));
+    }
+
+    #[test]
+    fn start_verify_quick_transitions_to_verifying_quick_and_sets_running_status() {
+        let svc = mk_service();
+        let task = mk_task("TVSTART1", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_verify(
+                &task.id,
+                VerifyTier::Quick,
+                StartVerifyEventIds {
+                    verify_state_changed: EventId("E-VSTART1-STATE".to_string()),
+                    verify_requested: EventId("E-VSTART1-REQUESTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start verify");
+
+        assert_eq!(updated.state, TaskState::VerifyingQuick);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Running {
+                tier: VerifyTier::Quick
+            }
+        );
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RUNNING" && to == "VERIFYING_QUICK"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::VerifyRequested {
+                    tier: VerifyTier::Quick
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_verify_full_transitions_to_verifying_full_and_sets_running_status() {
+        let svc = mk_service();
+        let task = mk_task("TVSTART2", TaskState::Ready, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_verify(
+                &task.id,
+                VerifyTier::Full,
+                StartVerifyEventIds {
+                    verify_state_changed: EventId("E-VSTART2-STATE".to_string()),
+                    verify_requested: EventId("E-VSTART2-REQUESTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start verify");
+
+        assert_eq!(updated.state, TaskState::VerifyingFull);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Running {
+                tier: VerifyTier::Full
+            }
+        );
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "READY" && to == "VERIFYING_FULL"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::VerifyRequested {
+                    tier: VerifyTier::Full
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_verify_in_current_state_emits_request_without_state_jump() {
+        let svc = mk_service();
+        let task = mk_task("TVSTART3", TaskState::VerifyingQuick, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_verify(
+                &task.id,
+                VerifyTier::Quick,
+                StartVerifyEventIds {
+                    verify_state_changed: EventId("E-VSTART3-STATE".to_string()),
+                    verify_requested: EventId("E-VSTART3-REQUESTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start verify");
+
+        assert_eq!(updated.state, TaskState::VerifyingQuick);
+        assert_eq!(
+            updated.verify_status,
+            VerifyStatus::Running {
+                tier: VerifyTier::Quick
+            }
+        );
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::VerifyRequested {
+                    tier: VerifyTier::Quick
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_verify_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TVSTART4", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .start_verify(
+                &task.id,
+                VerifyTier::Quick,
+                StartVerifyEventIds {
+                    verify_state_changed: EventId("E-VSTART4-STATE".to_string()),
+                    verify_requested: EventId("E-VSTART4-REQUESTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("quick verify from reviewing should be invalid");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::StateMachine(
+                crate::state_machine::StateMachineError::InvalidTransition {
+                    from: TaskState::Reviewing,
+                    to: TaskState::VerifyingQuick
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn start_submit_transitions_ready_to_submitting_and_emits_started() {
+        let svc = mk_service();
+        let task = mk_task("TSSTART1", TaskState::Ready, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Stack,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART1-STATE".to_string()),
+                    submit_started: EventId("E-SSTART1-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start submit");
+
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "READY" && to == "SUBMITTING"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::SubmitStarted {
+                    mode: SubmitMode::Stack
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_submit_emits_started_without_state_jump_when_already_submitting() {
+        let svc = mk_service();
+        let task = mk_task("TSSTART2", TaskState::Submitting, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Single,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART2-STATE".to_string()),
+                    submit_started: EventId("E-SSTART2-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start submit");
+
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::SubmitStarted {
+                    mode: SubmitMode::Single
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_submit_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TSSTART3", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Single,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART3-STATE".to_string()),
+                    submit_started: EventId("E-SSTART3-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("submit from running should be invalid");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::StateMachine(
+                crate::state_machine::StateMachineError::InvalidTransition {
+                    from: TaskState::Running,
+                    to: TaskState::Submitting
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn mark_needs_human_transitions_and_emits_reason_event() {
+        let svc = mk_service();
+        let task = mk_task("TNH1", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .mark_needs_human(
+                &task.id,
+                " waiting for product decision ",
+                MarkNeedsHumanEventIds {
+                    needs_human_state_changed: EventId("E-NH1-STATE".to_string()),
+                    needs_human_event: EventId("E-NH1-EVENT".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("mark needs human");
+
+        assert_eq!(updated.state, TaskState::NeedsHuman);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RUNNING" && to == "NEEDS_HUMAN"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::NeedsHuman { reason } if reason == "waiting for product decision"
+            )
+        }));
+    }
+
+    #[test]
+    fn mark_needs_human_emits_event_without_state_jump_when_already_needs_human() {
+        let svc = mk_service();
+        let task = mk_task("TNH2", TaskState::NeedsHuman, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .mark_needs_human(
+                &task.id,
+                "",
+                MarkNeedsHumanEventIds {
+                    needs_human_state_changed: EventId("E-NH2-STATE".to_string()),
+                    needs_human_event: EventId("E-NH2-EVENT".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("mark needs human");
+
+        assert_eq!(updated.state, TaskState::NeedsHuman);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::NeedsHuman { reason } if reason == "manual intervention required"
+            )
+        }));
+    }
+
+    #[test]
+    fn mark_needs_human_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TNH3", TaskState::Ready, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .mark_needs_human(
+                &task.id,
+                "manual hold",
+                MarkNeedsHumanEventIds {
+                    needs_human_state_changed: EventId("E-NH3-STATE".to_string()),
+                    needs_human_event: EventId("E-NH3-EVENT".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect_err("ready->needs_human should be invalid");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::StateMachine(
+                crate::state_machine::StateMachineError::InvalidTransition {
+                    from: TaskState::Ready,
+                    to: TaskState::NeedsHuman
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn start_restack_transitions_running_to_restacking_and_emits_started() {
+        let svc = mk_service();
+        let task = mk_task("TRSTART1", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_restack(
+                &task.id,
+                StartRestackEventIds {
+                    restack_state_changed: EventId("E-RSTART1-STATE".to_string()),
+                    restack_started: EventId("E-RSTART1-START".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start restack");
+
+        assert_eq!(updated.state, TaskState::Restacking);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackStarted)));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RUNNING" && to == "RESTACKING"
+            )
+        }));
+    }
+
+    #[test]
+    fn start_restack_transitions_from_restack_conflict() {
+        let svc = mk_service();
+        let task = mk_task("TRSTART2", TaskState::RestackConflict, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_restack(
+                &task.id,
+                StartRestackEventIds {
+                    restack_state_changed: EventId("E-RSTART2-STATE".to_string()),
+                    restack_started: EventId("E-RSTART2-START".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start restack");
+
+        assert_eq!(updated.state, TaskState::Restacking);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RESTACK_CONFLICT" && to == "RESTACKING"
+            )
+        }));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackStarted)));
+    }
+
+    #[test]
+    fn start_restack_emits_started_without_state_jump_when_already_restacking() {
+        let svc = mk_service();
+        let task = mk_task("TRSTART3", TaskState::Restacking, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_restack(
+                &task.id,
+                StartRestackEventIds {
+                    restack_state_changed: EventId("E-RSTART3-STATE".to_string()),
+                    restack_started: EventId("E-RSTART3-START".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start restack");
+
+        assert_eq!(updated.state, TaskState::Restacking);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackStarted)));
+    }
+
+    #[test]
+    fn complete_restack_success_transitions_to_verifying_quick() {
+        let svc = mk_service();
+        let task = mk_task("TRS1", TaskState::Restacking, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_restack(
+                &task.id,
+                false,
+                CompleteRestackEventIds {
+                    restack_completed: EventId("E-RS1-DONE".to_string()),
+                    success_state_changed: EventId("E-RS1-VQ".to_string()),
+                    conflict_event: EventId("E-RS1-CONFLICT".to_string()),
+                    conflict_state_changed: EventId("E-RS1-CONFLICT-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete restack");
+
+        assert_eq!(updated.state, TaskState::VerifyingQuick);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackCompleted)));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RESTACKING" && to == "VERIFYING_QUICK"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_restack_conflict_transitions_to_restack_conflict() {
+        let svc = mk_service();
+        let task = mk_task("TRS2", TaskState::Restacking, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_restack(
+                &task.id,
+                true,
+                CompleteRestackEventIds {
+                    restack_completed: EventId("E-RS2-DONE".to_string()),
+                    success_state_changed: EventId("E-RS2-VQ".to_string()),
+                    conflict_event: EventId("E-RS2-CONFLICT".to_string()),
+                    conflict_state_changed: EventId("E-RS2-CONFLICT-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete restack");
+
+        assert_eq!(updated.state, TaskState::RestackConflict);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackConflict)));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RESTACKING" && to == "RESTACK_CONFLICT"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_restack_emits_events_without_state_jump_when_not_restacking() {
+        let svc = mk_service();
+        let task = mk_task("TRS3", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_restack(
+                &task.id,
+                false,
+                CompleteRestackEventIds {
+                    restack_completed: EventId("E-RS3-DONE".to_string()),
+                    success_state_changed: EventId("E-RS3-VQ".to_string()),
+                    conflict_event: EventId("E-RS3-CONFLICT".to_string()),
+                    conflict_state_changed: EventId("E-RS3-CONFLICT-STATE".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete restack");
+
+        assert_eq!(updated.state, TaskState::Running);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RestackCompleted)));
+    }
+
+    #[test]
+    fn complete_submit_success_transitions_to_awaiting_merge() {
+        let svc = mk_service();
+        let task = mk_task("TSUB1", TaskState::Submitting, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_submit(
+                &task.id,
+                true,
+                None,
+                CompleteSubmitEventIds {
+                    submit_completed: EventId("E-SUB1-DONE".to_string()),
+                    success_state_changed: EventId("E-SUB1-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-SUB1-FAILED".to_string()),
+                    failure_error_event: EventId("E-SUB1-ERR".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete submit");
+
+        assert_eq!(updated.state, TaskState::AwaitingMerge);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SubmitCompleted)));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "SUBMITTING" && to == "AWAITING_MERGE"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_submit_failure_transitions_to_failed_and_records_error() {
+        let svc = mk_service();
+        let task = mk_task("TSUB2", TaskState::Submitting, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_submit(
+                &task.id,
+                false,
+                Some("gt submit exited with status 1".to_string()),
+                CompleteSubmitEventIds {
+                    submit_completed: EventId("E-SUB2-DONE".to_string()),
+                    success_state_changed: EventId("E-SUB2-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-SUB2-FAILED".to_string()),
+                    failure_error_event: EventId("E-SUB2-ERR".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete submit");
+
+        assert_eq!(updated.state, TaskState::Failed);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::Error { code, message }
+                    if code == "submit_failed" && message.contains("status 1")
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "SUBMITTING" && to == "FAILED"
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_submit_emits_event_without_state_jump_when_not_submitting() {
+        let svc = mk_service();
+        let task = mk_task("TSUB3", TaskState::Ready, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .complete_submit(
+                &task.id,
+                true,
+                None,
+                CompleteSubmitEventIds {
+                    submit_completed: EventId("E-SUB3-DONE".to_string()),
+                    success_state_changed: EventId("E-SUB3-AWAITING".to_string()),
+                    failure_state_changed: EventId("E-SUB3-FAILED".to_string()),
+                    failure_error_event: EventId("E-SUB3-ERR".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete submit");
+
+        assert_eq!(updated.state, TaskState::Ready);
+        let events = svc.task_events(&task.id).expect("events");
+        let state_change_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TaskStateChanged { .. }))
+            .count();
+        assert_eq!(state_change_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SubmitCompleted)));
+    }
+
+    #[test]
     fn restack_targets_for_parent_update_uses_union_graph() {
         let svc = mk_service();
         let t1 = mk_task("T1", TaskState::Running, &[]);
@@ -557,7 +2231,12 @@ mod tests {
     #[test]
     fn promote_task_after_review_moves_to_submitting_when_ready_and_auto_submit_enabled() {
         let svc = mk_service();
-        let task = mk_task("T9", TaskState::Reviewing, &[]);
+        let mut task = mk_task("T9", TaskState::Reviewing, &[]);
+        task.pr = Some(PullRequestRef {
+            number: 9,
+            url: "https://github.com/example/repo/pull/9".to_string(),
+            draft: true,
+        });
         svc.create_task(&task, &mk_created_event(&task))
             .expect("create task");
 
@@ -589,9 +2268,11 @@ mod tests {
         assert!(outcome.ready_gate.ready);
         assert!(outcome.auto_submit.should_submit);
         assert_eq!(outcome.task.state, TaskState::Submitting);
+        assert_eq!(outcome.task.pr.as_ref().map(|pr| pr.draft), Some(false));
 
         let stored = svc.task(&task.id).expect("load task").expect("task exists");
         assert_eq!(stored.state, TaskState::Submitting);
+        assert_eq!(stored.pr.as_ref().map(|pr| pr.draft), Some(false));
 
         let events = svc.task_events(&task.id).expect("events");
         assert!(events
@@ -600,6 +2281,47 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::SubmitStarted { .. })));
+    }
+
+    #[test]
+    fn promote_task_after_review_keeps_pr_draft_when_not_ready() {
+        let svc = mk_service();
+        let mut task = mk_task("T9NR", TaskState::Reviewing, &[]);
+        task.pr = Some(PullRequestRef {
+            number: 91,
+            url: "https://github.com/example/repo/pull/91".to_string(),
+            draft: true,
+        });
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let outcome = svc
+            .promote_task_after_review(
+                &task.id,
+                ReadyGateInput {
+                    verify_status: VerifyStatus::NotRun,
+                    review_evaluation: approved_review_eval(),
+                    graphite_hygiene_ok: true,
+                },
+                SubmitPolicy {
+                    org_default: SubmitMode::Single,
+                    repo_override: None,
+                    auto_submit: true,
+                },
+                PromoteTaskEventIds {
+                    ready_state_changed: EventId("E-NR-READY-STATE".to_string()),
+                    ready_reached: EventId("E-NR-READY".to_string()),
+                    submit_state_changed: EventId("E-NR-SUBMIT-STATE".to_string()),
+                    submit_started: EventId("E-NR-SUBMIT".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("promote");
+
+        assert!(!outcome.ready_gate.ready);
+        assert_eq!(outcome.task.pr.as_ref().map(|pr| pr.draft), Some(true));
+        let stored = svc.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(stored.pr.as_ref().map(|pr| pr.draft), Some(true));
     }
 
     #[test]
@@ -763,5 +2485,240 @@ mod tests {
         assert_eq!(updated.review_status.approvals_received, 0);
         assert!(computation.evaluation.needs_human);
         assert!(!computation.evaluation.approved);
+    }
+
+    #[test]
+    fn request_review_emits_required_models_and_keeps_reviewing_when_capacity_is_sufficient() {
+        let svc = mk_service();
+        let task = mk_task("TREQ1", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let outcome = svc
+            .request_review(
+                &task.id,
+                &ReviewGateConfig {
+                    enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+                    policy: ReviewPolicy::Adaptive,
+                    min_approvals: 2,
+                },
+                &[
+                    ReviewerAvailability {
+                        model: ModelKind::Claude,
+                        available: true,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Codex,
+                        available: true,
+                    },
+                ],
+                RequestReviewEventIds {
+                    review_requested: EventId("E-REQ1-REQUESTED".to_string()),
+                    needs_human_state_changed: EventId("E-REQ1-NH-STATE".to_string()),
+                    needs_human_event: EventId("E-REQ1-NH".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("request review");
+
+        assert_eq!(outcome.task.state, TaskState::Reviewing);
+        assert_eq!(
+            outcome.task.review_status.required_models,
+            vec![ModelKind::Claude, ModelKind::Codex]
+        );
+        assert_eq!(outcome.task.review_status.approvals_required, 2);
+        assert!(!outcome.computation.evaluation.needs_human);
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ReviewRequested { required_models }
+                    if required_models == &vec![ModelKind::Claude, ModelKind::Codex]
+            )
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::NeedsHuman { .. })));
+    }
+
+    #[test]
+    fn request_review_transitions_to_needs_human_when_capacity_is_insufficient() {
+        let svc = mk_service();
+        let task = mk_task("TREQ2", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let outcome = svc
+            .request_review(
+                &task.id,
+                &ReviewGateConfig {
+                    enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                    policy: ReviewPolicy::Adaptive,
+                    min_approvals: 2,
+                },
+                &[
+                    ReviewerAvailability {
+                        model: ModelKind::Claude,
+                        available: true,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Codex,
+                        available: false,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Gemini,
+                        available: false,
+                    },
+                ],
+                RequestReviewEventIds {
+                    review_requested: EventId("E-REQ2-REQUESTED".to_string()),
+                    needs_human_state_changed: EventId("E-REQ2-NH-STATE".to_string()),
+                    needs_human_event: EventId("E-REQ2-NH".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("request review");
+
+        assert_eq!(outcome.task.state, TaskState::NeedsHuman);
+        assert_eq!(
+            outcome.task.review_status.capacity_state,
+            ReviewCapacityState::NeedsHuman
+        );
+        assert!(outcome.computation.evaluation.needs_human);
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ReviewRequested { required_models }
+                    if required_models == &vec![ModelKind::Claude]
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "REVIEWING" && to == "NEEDS_HUMAN"
+            )
+        }));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::NeedsHuman { .. })));
+    }
+
+    #[test]
+    fn complete_review_records_approval_event_and_recomputes_status() {
+        let svc = mk_service();
+        let task = mk_task("TREV1", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let outcome = svc
+            .complete_review(
+                &task.id,
+                ModelKind::Claude,
+                mk_review_output(ReviewVerdict::Approve),
+                &ReviewGateConfig {
+                    enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+                    policy: ReviewPolicy::Adaptive,
+                    min_approvals: 2,
+                },
+                &[
+                    ReviewerAvailability {
+                        model: ModelKind::Claude,
+                        available: true,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Codex,
+                        available: true,
+                    },
+                ],
+                CompleteReviewEventIds {
+                    review_completed: EventId("E-REV1-COMPLETE".to_string()),
+                    needs_human_state_changed: EventId("E-REV1-NH-STATE".to_string()),
+                    needs_human_event: EventId("E-REV1-NH".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete review");
+
+        assert_eq!(outcome.task.state, TaskState::Reviewing);
+        assert_eq!(outcome.task.review_status.approvals_received, 1);
+        assert_eq!(outcome.task.review_status.approvals_required, 2);
+        assert!(!outcome.computation.evaluation.approved);
+
+        let approvals = svc.task_approvals(&task.id).expect("approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].reviewer, ModelKind::Claude);
+        assert_eq!(approvals[0].verdict, ReviewVerdict::Approve);
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ReviewCompleted { reviewer, .. } if *reviewer == ModelKind::Claude
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_review_moves_to_needs_human_when_capacity_is_insufficient() {
+        let svc = mk_service();
+        let task = mk_task("TREV2", TaskState::Reviewing, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let outcome = svc
+            .complete_review(
+                &task.id,
+                ModelKind::Claude,
+                mk_review_output(ReviewVerdict::Approve),
+                &ReviewGateConfig {
+                    enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                    policy: ReviewPolicy::Adaptive,
+                    min_approvals: 2,
+                },
+                &[
+                    ReviewerAvailability {
+                        model: ModelKind::Claude,
+                        available: true,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Codex,
+                        available: false,
+                    },
+                    ReviewerAvailability {
+                        model: ModelKind::Gemini,
+                        available: false,
+                    },
+                ],
+                CompleteReviewEventIds {
+                    review_completed: EventId("E-REV2-COMPLETE".to_string()),
+                    needs_human_state_changed: EventId("E-REV2-NH-STATE".to_string()),
+                    needs_human_event: EventId("E-REV2-NH".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("complete review");
+
+        assert_eq!(outcome.task.state, TaskState::NeedsHuman);
+        assert_eq!(
+            outcome.task.review_status.capacity_state,
+            ReviewCapacityState::NeedsHuman
+        );
+        assert!(outcome.computation.evaluation.needs_human);
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "REVIEWING" && to == "NEEDS_HUMAN"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(&event.kind, EventKind::NeedsHuman { reason } if reason.contains("review capacity"))
+        }));
     }
 }

@@ -42,15 +42,20 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (Queued, Initializing) => true,
         (Initializing, DraftPrOpen | Failed | Paused) => true,
         (DraftPrOpen, Running | Failed | Paused) => true,
-        (Running, Restacking | VerifyingQuick | NeedsHuman | Failed | Paused) => true,
+        (Running, Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Failed | Paused) => {
+            true
+        }
         (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
         (RestackConflict, Restacking | NeedsHuman | Failed | Paused) => true,
-        (VerifyingQuick, Reviewing | Failed | NeedsHuman | Paused) => true,
-        (VerifyingFull, AwaitingMerge | Failed | NeedsHuman | Paused) => true,
-        (Reviewing, Ready | Running | NeedsHuman | Failed | Paused) => true,
-        (Ready, Submitting | AwaitingMerge | Failed | Paused) => true,
+        (VerifyingQuick, Reviewing | Running | Failed | NeedsHuman | Paused) => true,
+        (
+            VerifyingFull,
+            Running | Reviewing | Ready | AwaitingMerge | Failed | NeedsHuman | Paused,
+        ) => true,
+        (Reviewing, Ready | Running | VerifyingFull | NeedsHuman | Failed | Paused) => true,
+        (Ready, VerifyingFull | Submitting | AwaitingMerge | Failed | Paused) => true,
         (Submitting, AwaitingMerge | Failed | Paused) => true,
-        (AwaitingMerge, Merged | Running | Failed | Paused) => true,
+        (AwaitingMerge, VerifyingFull | Merged | Running | Failed | Paused) => true,
         (NeedsHuman, Running | Paused | Failed) => true,
         (Paused, Running | Failed) => true,
         (Failed, Running | Paused) => true,
@@ -77,5 +82,102 @@ pub fn task_state_tag(state: TaskState) -> &'static str {
         Merged => "MERGED",
         Failed => "FAILED",
         Paused => "PAUSED",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::{ReviewCapacityState, ReviewStatus, VerifyStatus};
+    use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+
+    use super::{is_transition_allowed, transition_task};
+    use orch_core::state::TaskState;
+
+    fn mk_task(state: TaskState) -> Task {
+        Task {
+            id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "task".to_string(),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some("task/T1".to_string()),
+            worktree_path: ".orch/wt/T1".into(),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn allows_full_verify_from_active_lifecycle_states() {
+        assert!(is_transition_allowed(
+            TaskState::Running,
+            TaskState::VerifyingFull
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Reviewing,
+            TaskState::VerifyingFull
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Ready,
+            TaskState::VerifyingFull
+        ));
+        assert!(is_transition_allowed(
+            TaskState::AwaitingMerge,
+            TaskState::VerifyingFull
+        ));
+    }
+
+    #[test]
+    fn allows_return_from_full_verify_to_prior_progress_states() {
+        assert!(is_transition_allowed(
+            TaskState::VerifyingFull,
+            TaskState::Running
+        ));
+        assert!(is_transition_allowed(
+            TaskState::VerifyingFull,
+            TaskState::Reviewing
+        ));
+        assert!(is_transition_allowed(
+            TaskState::VerifyingFull,
+            TaskState::Ready
+        ));
+        assert!(is_transition_allowed(
+            TaskState::VerifyingFull,
+            TaskState::AwaitingMerge
+        ));
+    }
+
+    #[test]
+    fn disallows_full_verify_from_queued() {
+        assert!(!is_transition_allowed(
+            TaskState::Queued,
+            TaskState::VerifyingFull
+        ));
+    }
+
+    #[test]
+    fn transition_updates_task_state_for_new_verify_full_path() {
+        let mut task = mk_task(TaskState::Ready);
+        let at = Utc::now();
+        let transition =
+            transition_task(&mut task, TaskState::VerifyingFull, at).expect("valid transition");
+        assert_eq!(transition.from, TaskState::Ready);
+        assert_eq!(transition.to, TaskState::VerifyingFull);
+        assert_eq!(task.state, TaskState::VerifyingFull);
+        assert_eq!(task.updated_at, at);
     }
 }

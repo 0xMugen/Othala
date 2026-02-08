@@ -20,10 +20,7 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         || lower.contains("too many requests")
     {
         Some(AgentSignalKind::RateLimited)
-    } else if lower.contains("error:")
-        || lower.contains("fatal:")
-        || lower.contains("traceback")
-    {
+    } else if lower.contains("error:") || lower.contains("fatal:") || lower.contains("traceback") {
         Some(AgentSignalKind::ErrorHint)
     } else {
         None

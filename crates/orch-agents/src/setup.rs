@@ -88,6 +88,24 @@ pub struct ValidatedSetupSelection {
     pub enabled_models: Vec<ModelKind>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSummaryItem {
+    pub model: ModelKind,
+    pub executable: String,
+    pub detected: bool,
+    pub healthy: bool,
+    pub selected: bool,
+    pub missing_env_any_of: Vec<Vec<String>>,
+    pub version_output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSummary {
+    pub selected_models: Vec<ModelKind>,
+    pub all_selected_healthy: bool,
+    pub items: Vec<SetupSummaryItem>,
+}
+
 pub trait SetupCommandRunner {
     fn command_exists(&self, executable: &str) -> bool;
     fn command_version(&self, executable: &str) -> Result<String, String>;
@@ -224,6 +242,49 @@ pub fn validate_setup_selection(
     Ok(ValidatedSetupSelection { enabled_models })
 }
 
+pub fn summarize_setup(
+    report: &SetupProbeReport,
+    selection: &ValidatedSetupSelection,
+) -> SetupSummary {
+    let selected = selection.enabled_models.clone();
+    let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+
+    let mut items = report
+        .models
+        .iter()
+        .map(|probe| {
+            let missing_env_any_of = probe
+                .env_status
+                .iter()
+                .filter(|status| !status.satisfied)
+                .map(|status| status.any_of.clone())
+                .collect::<Vec<_>>();
+
+            SetupSummaryItem {
+                model: probe.model,
+                executable: probe.executable.clone(),
+                detected: probe.installed,
+                healthy: probe.healthy,
+                selected: selected_set.contains(&probe.model),
+                missing_env_any_of,
+                version_output: probe.version_output.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| model_rank(&item.model));
+
+    let all_selected_healthy = items
+        .iter()
+        .filter(|item| item.selected)
+        .all(|item| item.healthy);
+
+    SetupSummary {
+        selected_models: selected,
+        all_selected_healthy,
+        items,
+    }
+}
+
 fn model_rank(model: &ModelKind) -> u8 {
     match model {
         ModelKind::Claude => 0,
@@ -248,8 +309,9 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        probe_models_with_runner, validate_setup_selection, ModelProbeResult, ModelSetupSelection,
-        SetupCommandRunner, SetupError, SetupProbeConfig,
+        probe_models_with_runner, summarize_setup, validate_setup_selection, ModelProbeResult,
+        ModelSetupSelection, SetupCommandRunner, SetupError, SetupProbeConfig,
+        ValidatedSetupSelection,
     };
     use orch_core::types::ModelKind;
     use std::collections::HashMap;
@@ -285,7 +347,9 @@ mod tests {
         runner
             .versions
             .insert("codex".to_string(), Ok("codex 1.0.0".to_string()));
-        runner.env_present.insert("OPENAI_API_KEY".to_string(), false);
+        runner
+            .env_present
+            .insert("OPENAI_API_KEY".to_string(), false);
 
         let report = probe_models_with_runner(&SetupProbeConfig::default(), &runner);
         let codex = report
@@ -381,6 +445,58 @@ mod tests {
         assert_eq!(
             validated.enabled_models,
             vec![ModelKind::Codex, ModelKind::Claude]
+        );
+    }
+
+    #[test]
+    fn summarize_setup_reports_selected_health_and_missing_env_groups() {
+        let report = super::SetupProbeReport {
+            models: vec![
+                ModelProbeResult {
+                    model: ModelKind::Claude,
+                    executable: "claude".to_string(),
+                    installed: true,
+                    version_ok: true,
+                    version_output: Some("claude 1".to_string()),
+                    env_status: vec![],
+                    healthy: true,
+                },
+                ModelProbeResult {
+                    model: ModelKind::Codex,
+                    executable: "codex".to_string(),
+                    installed: true,
+                    version_ok: true,
+                    version_output: Some("codex 2".to_string()),
+                    env_status: vec![super::EnvRequirementStatus {
+                        any_of: vec!["OPENAI_API_KEY".to_string()],
+                        satisfied: false,
+                    }],
+                    healthy: false,
+                },
+            ],
+        };
+
+        let summary = summarize_setup(
+            &report,
+            &ValidatedSetupSelection {
+                enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+            },
+        );
+
+        assert_eq!(
+            summary.selected_models,
+            vec![ModelKind::Claude, ModelKind::Codex]
+        );
+        assert!(!summary.all_selected_healthy);
+        assert_eq!(summary.items.len(), 2);
+        assert!(summary.items[0].selected);
+        assert_eq!(summary.items[0].model, ModelKind::Claude);
+        assert!(summary.items[0].healthy);
+        assert!(summary.items[0].missing_env_any_of.is_empty());
+        assert_eq!(summary.items[1].model, ModelKind::Codex);
+        assert_eq!(
+            summary.items[1].missing_env_any_of,
+            vec![vec!["OPENAI_API_KEY".to_string()]]
         );
     }
 }
