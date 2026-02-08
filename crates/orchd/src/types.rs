@@ -83,4 +83,39 @@ mod tests {
         let decoded: ArtifactRecord = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, record);
     }
+
+    #[test]
+    fn task_run_record_roundtrip_preserves_nonzero_exit_code() {
+        let now = Utc::now();
+        let record = TaskRunRecord {
+            run_id: "R3".to_string(),
+            task_id: TaskId("T3".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Gemini,
+            started_at: now,
+            finished_at: Some(now),
+            stop_reason: Some("timeout".to_string()),
+            exit_code: Some(124),
+        };
+
+        let encoded = serde_json::to_string(&record).expect("serialize");
+        let decoded: TaskRunRecord = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn artifact_record_roundtrip_with_none_metadata() {
+        let record = ArtifactRecord {
+            artifact_id: "A2".to_string(),
+            task_id: TaskId("T2".to_string()),
+            kind: "log".to_string(),
+            path: "/tmp/run.log".to_string(),
+            created_at: Utc::now(),
+            metadata_json: None,
+        };
+
+        let encoded = serde_json::to_string(&record).expect("serialize");
+        let decoded: ArtifactRecord = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, record);
+    }
 }
