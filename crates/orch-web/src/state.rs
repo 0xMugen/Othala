@@ -299,4 +299,14 @@ mod tests {
         assert_eq!(state.next_sandbox_id(), "SBX-2");
         assert_eq!(state.next_sandbox_id(), "SBX-3");
     }
+
+    #[test]
+    fn next_sandbox_id_counter_is_shared_across_clones() {
+        let state = WebState::default();
+        let cloned = state.clone();
+
+        assert_eq!(state.next_sandbox_id(), "SBX-1");
+        assert_eq!(cloned.next_sandbox_id(), "SBX-2");
+        assert_eq!(state.next_sandbox_id(), "SBX-3");
+    }
 }
