@@ -45,3 +45,47 @@ pub fn run_shell_command(
         stderr,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run_shell_command;
+    use crate::error::VerifyError;
+
+    #[test]
+    fn run_shell_command_returns_stdout_for_successful_command() {
+        let cwd = std::env::current_dir().expect("resolve cwd");
+        let output = run_shell_command(cwd.as_path(), "bash", "printf 'ok'")
+            .expect("successful shell command");
+
+        assert!(output.success);
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "ok");
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn run_shell_command_returns_non_zero_exit_and_stderr() {
+        let cwd = std::env::current_dir().expect("resolve cwd");
+        let output = run_shell_command(cwd.as_path(), "bash", "printf 'bad' 1>&2; exit 7")
+            .expect("command should still return output structure");
+
+        assert!(!output.success);
+        assert_eq!(output.exit_code, Some(7));
+        assert!(output.stderr.ends_with("bad"));
+    }
+
+    #[test]
+    fn run_shell_command_classifies_missing_shell_as_io_error() {
+        let cwd = std::env::current_dir().expect("resolve cwd");
+        let err = run_shell_command(
+            cwd.as_path(),
+            "definitely-not-a-shell-binary-for-othala-tests",
+            "echo ignored",
+        )
+        .expect_err("missing shell should fail");
+
+        assert!(
+            matches!(err, VerifyError::Io { ref command, .. } if command.contains("definitely-not-a-shell-binary-for-othala-tests -lc echo ignored"))
+        );
+    }
+}
