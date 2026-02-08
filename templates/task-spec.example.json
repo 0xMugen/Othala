@@ -1,0 +1,10 @@
+{
+  "repo_id": "othala",
+  "task_id": "T1001",
+  "title": "Implement feature slice",
+  "type": "feature",
+  "role": "general",
+  "preferred_model": "codex",
+  "depends_on": [],
+  "submit_mode": "single"
+}
