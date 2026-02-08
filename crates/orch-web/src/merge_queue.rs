@@ -315,4 +315,23 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn build_merge_queue_ignores_dependencies_outside_awaiting_set() {
+        let tasks = vec![
+            mk_task("P1", TaskState::Running, &[], None),
+            mk_task("C1", TaskState::AwaitingMerge, &["P1"], None),
+            mk_task("C2", TaskState::AwaitingMerge, &["C1"], None),
+        ];
+
+        let queue = build_merge_queue(&tasks);
+        assert_eq!(queue.groups.len(), 1);
+        let group = &queue.groups[0];
+        assert_eq!(group.task_ids, vec!["C1".to_string(), "C2".to_string()]);
+        assert_eq!(
+            group.recommended_merge_order,
+            vec!["C1".to_string(), "C2".to_string()]
+        );
+        assert!(!group.contains_cycle);
+    }
 }
