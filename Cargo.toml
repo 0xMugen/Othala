@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/orch-core",
+  "crates/orch-git",
+  "crates/orch-graphite",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
