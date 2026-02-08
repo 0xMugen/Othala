@@ -1,3 +1,4 @@
+use chrono::Utc;
 use orch_agents::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupError,
     SetupProbeConfig, SetupSummary,
@@ -6,7 +7,10 @@ use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
     ConfigError, RepoConfig, SetupApplyError,
 };
+use orch_core::events::{Event, EventKind};
+use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
 use orch_core::types::ModelKind;
+use orch_core::types::{EventId, Task, TaskSpec};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orchd::{OrchdService, Scheduler, SchedulerConfig, ServiceError};
 use std::env;
@@ -37,9 +41,19 @@ struct SetupCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskCliArgs {
+    org_config_path: PathBuf,
+    repos_config_dir: PathBuf,
+    sqlite_path: PathBuf,
+    event_log_root: PathBuf,
+    spec_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run(RunCliArgs),
     Setup(SetupCliArgs),
+    CreateTask(CreateTaskCliArgs),
     Help(String),
 }
 
@@ -70,6 +84,18 @@ enum MainError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to read task spec file at {path}: {source}")]
+    ReadTaskSpecFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse task spec json at {path}: {source}")]
+    ParseTaskSpecJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
     },
     #[error(transparent)]
     Setup(#[from] SetupError),
@@ -102,6 +128,7 @@ fn run() -> Result<(), MainError> {
         }
         CliCommand::Run(args) => run_daemon(args),
         CliCommand::Setup(args) => run_setup(args),
+        CliCommand::CreateTask(args) => run_create_task(args),
     }
 }
 
@@ -211,6 +238,110 @@ fn run_setup(args: SetupCliArgs) -> Result<(), MainError> {
 
     let summary = summarize_setup(&report, &validated);
     print_setup_summary(&summary, per_model_concurrency, &args.org_config_path);
+
+    Ok(())
+}
+
+fn run_create_task(args: CreateTaskCliArgs) -> Result<(), MainError> {
+    ensure_parent_dir(&args.sqlite_path)?;
+    ensure_dir(&args.event_log_root)?;
+
+    let org = load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+    validate_org_config(&org.validate())?;
+
+    let repo_configs = load_repo_configs(&args.repos_config_dir)?;
+    validate_repo_configs(&repo_configs)?;
+
+    let spec_raw =
+        fs::read_to_string(&args.spec_path).map_err(|source| MainError::ReadTaskSpecFile {
+            path: args.spec_path.clone(),
+            source,
+        })?;
+    let spec: TaskSpec =
+        serde_json::from_str(&spec_raw).map_err(|source| MainError::ParseTaskSpecJson {
+            path: args.spec_path.clone(),
+            source,
+        })?;
+
+    let spec_errors = spec
+        .validate()
+        .into_iter()
+        .filter(|issue| issue.level == ValidationLevel::Error)
+        .collect::<Vec<_>>();
+    if !spec_errors.is_empty() {
+        let rendered = spec_errors
+            .iter()
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(MainError::InvalidConfig(format!(
+            "task spec validation failed ({})",
+            rendered
+        )));
+    }
+
+    if !repo_configs
+        .iter()
+        .any(|(_, cfg)| cfg.repo_id == spec.repo_id.0)
+    {
+        return Err(MainError::InvalidConfig(format!(
+            "task repo_id '{}' is missing in {}",
+            spec.repo_id.0,
+            args.repos_config_dir.display()
+        )));
+    }
+
+    let now = Utc::now();
+    let task = Task {
+        id: spec.task_id.clone(),
+        repo_id: spec.repo_id.clone(),
+        title: spec.title.clone(),
+        state: TaskState::Queued,
+        role: spec.role,
+        task_type: spec.task_type.clone(),
+        preferred_model: spec.preferred_model,
+        depends_on: spec.depends_on.clone(),
+        submit_mode: spec.submit_mode.unwrap_or(org.graphite.submit_mode_default),
+        branch_name: None,
+        worktree_path: PathBuf::from(format!(".orch/wt/{}", spec.task_id.0)),
+        pr: None,
+        verify_status: VerifyStatus::NotRun,
+        review_status: ReviewStatus {
+            required_models: Vec::new(),
+            approvals_received: 0,
+            approvals_required: 0,
+            unanimous: false,
+            capacity_state: ReviewCapacityState::Sufficient,
+        },
+        created_at: now,
+        updated_at: now,
+    };
+    let created_event = Event {
+        id: EventId(format!(
+            "E-CREATE-{}-{}",
+            task.id.0,
+            now.timestamp_nanos_opt().unwrap_or_default()
+        )),
+        task_id: Some(task.id.clone()),
+        repo_id: Some(task.repo_id.clone()),
+        at: now,
+        kind: EventKind::TaskCreated,
+    };
+
+    let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
+    let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
+    service.create_task(&task, &created_event)?;
+
+    println!(
+        "created task id={} repo={} state={} spec={}",
+        task.id.0,
+        task.repo_id.0,
+        "QUEUED",
+        args.spec_path.display()
+    );
 
     Ok(())
 }
@@ -359,6 +490,7 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
 
     match args[0].as_str() {
         "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
+        "create-task" => parse_create_task_cli_args(args[1..].to_vec(), program),
         "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
         _ => parse_run_cli_args(args, program),
     }
@@ -477,6 +609,74 @@ fn parse_setup_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, 
     Ok(CliCommand::Setup(parsed))
 }
 
+fn parse_create_task_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = CreateTaskCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        repos_config_dir: PathBuf::from(DEFAULT_REPOS_CONFIG_DIR),
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
+        spec_path: PathBuf::new(),
+    };
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(create_task_usage(program))),
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--repos-config-dir" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --repos-config-dir".to_string())
+                })?;
+                parsed.repos_config_dir = PathBuf::from(value);
+            }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                parsed.sqlite_path = PathBuf::from(value);
+            }
+            "--event-log-root" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --event-log-root".to_string())
+                })?;
+                parsed.event_log_root = PathBuf::from(value);
+            }
+            "--spec" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --spec".to_string()))?;
+                parsed.spec_path = PathBuf::from(value);
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown create-task argument: {other}\n\n{}",
+                    create_task_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    if parsed.spec_path.as_os_str().is_empty() {
+        return Err(MainError::Args(
+            "missing required --spec <path> for create-task".to_string(),
+        ));
+    }
+
+    Ok(CliCommand::CreateTask(parsed))
+}
+
 fn parse_enabled_models(raw: &str) -> Result<Vec<ModelKind>, MainError> {
     let mut models = Vec::new();
     for token in raw.split(',') {
@@ -519,7 +719,7 @@ fn default_run_args() -> RunCliArgs {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n\
+        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 \nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
     )
 }
@@ -532,11 +732,18 @@ fn setup_usage(program: &str) -> String {
     )
 }
 
+fn create_task_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+\nNotes:\n  --spec expects JSON matching orch_core::types::TaskSpec"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage, usage, CliCommand,
-        RunCliArgs, SetupCliArgs,
+        create_task_usage, load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage,
+        usage, CliCommand, CreateTaskCliArgs, RunCliArgs, SetupCliArgs,
     };
     use orch_core::types::ModelKind;
     use std::fs;
@@ -668,6 +875,58 @@ mod tests {
         let parsed = parse_cli_args(vec!["setup".to_string(), "--help".to_string()], "orchd")
             .expect("setup help");
         assert_eq!(parsed, CliCommand::Help(setup_usage("orchd")));
+    }
+
+    #[test]
+    fn parse_cli_args_create_task_requires_spec() {
+        let err = parse_cli_args(vec!["create-task".to_string()], "orchd")
+            .expect_err("missing --spec should fail");
+        assert_eq!(
+            err.to_string(),
+            "missing required --spec <path> for create-task"
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_create_task_parses_paths() {
+        let parsed = parse_cli_args(
+            vec![
+                "create-task".to_string(),
+                "--spec".to_string(),
+                "/tmp/task.json".to_string(),
+                "--org-config".to_string(),
+                "/tmp/org.toml".to_string(),
+                "--repos-config-dir".to_string(),
+                "/tmp/repos".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+                "--event-log-root".to_string(),
+                "/tmp/events".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("create-task parse");
+
+        assert_eq!(
+            parsed,
+            CliCommand::CreateTask(CreateTaskCliArgs {
+                org_config_path: PathBuf::from("/tmp/org.toml"),
+                repos_config_dir: PathBuf::from("/tmp/repos"),
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                event_log_root: PathBuf::from("/tmp/events"),
+                spec_path: PathBuf::from("/tmp/task.json"),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_create_task_help_returns_usage() {
+        let parsed = parse_cli_args(
+            vec!["create-task".to_string(), "--help".to_string()],
+            "orchd",
+        )
+        .expect("create-task help");
+        assert_eq!(parsed, CliCommand::Help(create_task_usage("orchd")));
     }
 
     #[test]
