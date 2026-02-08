@@ -194,4 +194,61 @@ mod tests {
         assert_eq!(codex.model(), ModelKind::Codex);
         assert_eq!(gemini.model(), ModelKind::Gemini);
     }
+
+    #[test]
+    fn adapters_preserve_empty_prompt_as_last_argument() {
+        let mut request = mk_request(ModelKind::Claude);
+        request.prompt = "".to_string();
+        request.extra_args = vec!["--json".to_string()];
+
+        let claude = ClaudeAdapter::default().build_command(&request);
+        let codex = CodexAdapter::default().build_command(&EpochRequest {
+            model: ModelKind::Codex,
+            ..request.clone()
+        });
+        let gemini = GeminiAdapter::default().build_command(&EpochRequest {
+            model: ModelKind::Gemini,
+            ..request.clone()
+        });
+
+        assert_eq!(
+            claude.args,
+            vec!["--json".to_string(), "".to_string()],
+            "claude must append prompt slot even when empty"
+        );
+        assert_eq!(
+            codex.args,
+            vec!["--json".to_string(), "".to_string()],
+            "codex must append prompt slot even when empty"
+        );
+        assert_eq!(
+            gemini.args,
+            vec!["--json".to_string(), "".to_string()],
+            "gemini must append prompt slot even when empty"
+        );
+    }
+
+    #[test]
+    fn adapters_keep_extra_args_order_before_prompt() {
+        let request = EpochRequest {
+            extra_args: vec![
+                "--first".to_string(),
+                "--second".to_string(),
+                "--third".to_string(),
+            ],
+            prompt: "final prompt".to_string(),
+            ..mk_request(ModelKind::Claude)
+        };
+
+        let command = ClaudeAdapter::default().build_command(&request);
+        assert_eq!(
+            command.args,
+            vec![
+                "--first".to_string(),
+                "--second".to_string(),
+                "--third".to_string(),
+                "final prompt".to_string()
+            ]
+        );
+    }
 }
