@@ -3,12 +3,12 @@ processes:
   orchd:
     command: "nix develop -c cargo run -p orchd -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --event-log-root .orch/events"
   orch-web:
-    command: "nix develop -c cargo run -p orch-web -- --org-config config/org.toml"
+    command: "nix develop -c cargo run -p orch-web -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --sync-interval-ms 1000"
     depends_on:
       orchd:
         condition: process_started
   orch-tui:
-    command: "nix develop -c cargo run -p orch-tui -- --tick-ms 250"
+    command: "nix develop -c cargo run -p orch-tui -- --tick-ms 250 --sqlite-path .orch/state.sqlite"
     depends_on:
       orchd:
         condition: process_started
