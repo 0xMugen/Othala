@@ -107,3 +107,84 @@ fn append_json_line(path: &Path, event: &Event) -> Result<(), EventLogError> {
         })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::events::{Event, EventKind};
+    use orch_core::types::{EventId, RepoId, TaskId};
+    use std::fs;
+
+    use super::JsonlEventLog;
+
+    fn mk_event(task_id: Option<&str>) -> Event {
+        Event {
+            id: EventId("E1".to_string()),
+            task_id: task_id.map(|id| TaskId(id.to_string())),
+            repo_id: Some(RepoId("example".to_string())),
+            at: Utc::now(),
+            kind: EventKind::TaskCreated,
+        }
+    }
+
+    fn mk_log() -> JsonlEventLog {
+        let root = std::env::temp_dir().join(format!(
+            "othala-event-log-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        JsonlEventLog::new(root)
+    }
+
+    #[test]
+    fn ensure_layout_creates_root_and_task_directories() {
+        let log = mk_log();
+        log.ensure_layout().expect("ensure layout");
+        assert!(log.root.exists());
+        assert!(log.task_dir.exists());
+    }
+
+    #[test]
+    fn append_both_writes_global_and_task_log_when_task_id_present() {
+        let log = mk_log();
+        let event = mk_event(Some("T100"));
+
+        log.append_both(&event).expect("append both");
+
+        let global = fs::read_to_string(log.global_log_path()).expect("read global");
+        let task = fs::read_to_string(log.task_log_path("T100")).expect("read task");
+        assert!(global.contains("\"id\":\"E1\""));
+        assert!(task.contains("\"id\":\"E1\""));
+        assert_eq!(global.lines().count(), 1);
+        assert_eq!(task.lines().count(), 1);
+    }
+
+    #[test]
+    fn append_both_writes_only_global_when_task_id_missing() {
+        let log = mk_log();
+        let event = mk_event(None);
+
+        log.append_both(&event).expect("append both");
+
+        let global = fs::read_to_string(log.global_log_path()).expect("read global");
+        assert!(global.contains("\"id\":\"E1\""));
+        assert!(!log.task_log_path("T100").exists());
+    }
+
+    #[test]
+    fn append_global_appends_multiple_lines() {
+        let log = mk_log();
+        log.ensure_layout().expect("ensure layout");
+
+        let e1 = mk_event(Some("T1"));
+        let mut e2 = mk_event(Some("T1"));
+        e2.id = EventId("E2".to_string());
+
+        log.append_global(&e1).expect("append e1");
+        log.append_global(&e2).expect("append e2");
+
+        let global = fs::read_to_string(log.global_log_path()).expect("read global");
+        assert_eq!(global.lines().count(), 2);
+        assert!(global.contains("\"id\":\"E1\""));
+        assert!(global.contains("\"id\":\"E2\""));
+    }
+}
