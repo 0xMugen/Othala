@@ -33,9 +33,16 @@
               git
               gh
               jq
+              ripgrep
+              fd
+              tree
               just
               process-compose
               sqlite
+              sops
+              age
+              cargo-nextest
+              watchexec
               pkg-config
               openssl
               nil
