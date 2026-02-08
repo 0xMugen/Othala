@@ -174,7 +174,7 @@ mod tests {
     use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
     use std::path::PathBuf;
 
-    use super::TaskView;
+    use super::{web_event_name, SandboxSpawnRequest, TaskView, WebEventKind};
 
     #[test]
     fn task_view_carries_verify_and_review_details() {
@@ -212,5 +212,54 @@ mod tests {
         assert_eq!(view.verify_status, task.verify_status);
         assert_eq!(view.review_status, task.review_status);
         assert_eq!(view.depends_on, vec!["T100".to_string()]);
+    }
+
+    #[test]
+    fn sandbox_spawn_request_defaults_cleanup_worktree_to_true() {
+        let value = serde_json::json!({
+            "target": { "task": { "task_id": "T1" } },
+            "repo_path": "/tmp/repo",
+            "nix_dev_shell": "nix develop",
+            "verify_full_commands": ["echo ok"]
+        });
+        let request: SandboxSpawnRequest =
+            serde_json::from_value(value).expect("sandbox spawn request json");
+        assert!(request.cleanup_worktree);
+    }
+
+    #[test]
+    fn sandbox_spawn_request_honors_explicit_cleanup_worktree_false() {
+        let value = serde_json::json!({
+            "target": { "task": { "task_id": "T1" } },
+            "repo_path": "/tmp/repo",
+            "nix_dev_shell": "nix develop",
+            "verify_full_commands": ["echo ok"],
+            "cleanup_worktree": false
+        });
+        let request: SandboxSpawnRequest =
+            serde_json::from_value(value).expect("sandbox spawn request json");
+        assert!(!request.cleanup_worktree);
+    }
+
+    #[test]
+    fn web_event_name_maps_all_variants() {
+        assert_eq!(
+            web_event_name(&WebEventKind::TasksReplaced { count: 1 }),
+            "tasks_replaced"
+        );
+        assert_eq!(
+            web_event_name(&WebEventKind::TaskUpserted {
+                task_id: "T1".to_string(),
+                state: TaskState::Running
+            }),
+            "task_upserted"
+        );
+        assert_eq!(
+            web_event_name(&WebEventKind::SandboxUpdated {
+                sandbox_id: "SBX-1".to_string(),
+                status: super::SandboxStatus::Running
+            }),
+            "sandbox_updated"
+        );
     }
 }
