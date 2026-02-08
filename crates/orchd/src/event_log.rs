@@ -187,4 +187,22 @@ mod tests {
         assert!(global.contains("\"id\":\"E1\""));
         assert!(global.contains("\"id\":\"E2\""));
     }
+
+    #[test]
+    fn append_task_appends_multiple_lines_for_same_task() {
+        let log = mk_log();
+        log.ensure_layout().expect("ensure layout");
+
+        let e1 = mk_event(Some("T1"));
+        let mut e2 = mk_event(Some("T1"));
+        e2.id = EventId("E2".to_string());
+
+        log.append_task(&e1).expect("append task e1");
+        log.append_task(&e2).expect("append task e2");
+
+        let task = fs::read_to_string(log.task_log_path("T1")).expect("read task log");
+        assert_eq!(task.lines().count(), 2);
+        assert!(task.contains("\"id\":\"E1\""));
+        assert!(task.contains("\"id\":\"E2\""));
+    }
 }
