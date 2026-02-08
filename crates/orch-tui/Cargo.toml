@@ -8,6 +8,7 @@ license.workspace = true
 chrono = { version = "0.4", features = ["serde", "clock"] }
 crossterm = "0.28"
 orch-core = { path = "../orch-core" }
+orchd = { path = "../orchd" }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"

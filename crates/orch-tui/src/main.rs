@@ -1,12 +1,15 @@
 use orch_tui::{run_tui, TuiApp, TuiError};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_TICK_MS: u64 = 250;
+const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     tick_ms: u64,
+    sqlite_path: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -29,14 +32,38 @@ fn run() -> Result<(), MainError> {
     let program = argv.next().unwrap_or_else(|| "orch-tui".to_string());
     let args = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
 
-    let mut app = TuiApp::default();
-    app.state.status_line = format!("orch-tui started tick_ms={}", args.tick_ms);
+    let mut app = match load_tasks_from_sqlite(&args.sqlite_path) {
+        Ok(tasks) => {
+            let mut app = TuiApp::from_tasks(&tasks);
+            app.state.status_line = format!(
+                "orch-tui started tick_ms={} tasks={}",
+                args.tick_ms,
+                tasks.len()
+            );
+            app
+        }
+        Err(err) => {
+            let mut app = TuiApp::default();
+            app.state.status_line = format!(
+                "orch-tui started tick_ms={} task_load_warning={}",
+                args.tick_ms, err
+            );
+            app
+        }
+    };
     run_tui(&mut app, Duration::from_millis(args.tick_ms))?;
     Ok(())
 }
 
+fn load_tasks_from_sqlite(path: &Path) -> Result<Vec<orch_core::types::Task>, String> {
+    let store = orchd::SqliteStore::open(path).map_err(|err| err.to_string())?;
+    store.migrate().map_err(|err| err.to_string())?;
+    store.list_tasks().map_err(|err| err.to_string())
+}
+
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {
     let mut tick_ms = DEFAULT_TICK_MS;
+    let mut sqlite_path = PathBuf::from(DEFAULT_SQLITE_PATH);
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -57,6 +84,13 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
                     ));
                 }
             }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                sqlite_path = PathBuf::from(value);
+            }
             other => {
                 return Err(MainError::Args(format!(
                     "unknown argument: {other}\n\n{}",
@@ -67,32 +101,57 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
         idx += 1;
     }
 
-    Ok(CliArgs { tick_ms })
+    Ok(CliArgs {
+        tick_ms,
+        sqlite_path,
+    })
 }
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--tick-ms <u64>]\n\
+        "Usage: {program} [--tick-ms <u64>] [--sqlite-path <path>]\n\
 Defaults:\n\
-  --tick-ms {DEFAULT_TICK_MS}"
+  --tick-ms {DEFAULT_TICK_MS}\n\
+  --sqlite-path {DEFAULT_SQLITE_PATH}"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_cli_args, usage, CliArgs};
+    use std::path::PathBuf;
 
     #[test]
     fn parse_cli_args_uses_default_tick_rate() {
         let parsed = parse_cli_args(Vec::new(), "orch-tui").expect("parse");
-        assert_eq!(parsed, CliArgs { tick_ms: 250 });
+        assert_eq!(
+            parsed,
+            CliArgs {
+                tick_ms: 250,
+                sqlite_path: PathBuf::from(".orch/state.sqlite"),
+            }
+        );
     }
 
     #[test]
-    fn parse_cli_args_applies_tick_rate_override() {
-        let parsed = parse_cli_args(vec!["--tick-ms".to_string(), "500".to_string()], "orch-tui")
-            .expect("parse");
-        assert_eq!(parsed, CliArgs { tick_ms: 500 });
+    fn parse_cli_args_applies_tick_rate_and_sqlite_override() {
+        let parsed = parse_cli_args(
+            vec![
+                "--tick-ms".to_string(),
+                "500".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+            ],
+            "orch-tui",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed,
+            CliArgs {
+                tick_ms: 500,
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+            }
+        );
     }
 
     #[test]
@@ -100,6 +159,10 @@ mod tests {
         let err =
             parse_cli_args(vec!["--tick-ms".to_string()], "orch-tui").expect_err("should fail");
         assert_eq!(err.to_string(), "missing value for --tick-ms");
+
+        let err =
+            parse_cli_args(vec!["--sqlite-path".to_string()], "orch-tui").expect_err("should fail");
+        assert_eq!(err.to_string(), "missing value for --sqlite-path");
     }
 
     #[test]

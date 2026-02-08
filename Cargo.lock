@@ -769,6 +769,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "orch-core",
+ "orchd",
  "ratatui",
  "serde",
  "serde_json",
