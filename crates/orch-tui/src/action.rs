@@ -76,3 +76,84 @@ pub fn action_label(action: UiAction) -> &'static str {
         UiAction::ResumeTask => "resume_task",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{action_label, map_key_to_command, UiAction, UiCommand};
+
+    #[test]
+    fn map_key_to_command_maps_navigation_and_actions() {
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(UiCommand::SelectNextTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(UiCommand::SelectPreviousTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(UiCommand::SelectNextPane)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(UiCommand::SelectPreviousPane)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(UiCommand::ToggleFocusedPane)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::RunVerifyQuick))
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::RunVerifyFull))
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::PauseTask))
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::ResumeTask))
+        );
+    }
+
+    #[test]
+    fn map_key_to_command_maps_quit_shortcuts_and_ignores_unknown() {
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(UiCommand::Quit)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(UiCommand::Quit)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn action_label_matches_expected_snake_case_values() {
+        assert_eq!(action_label(UiAction::CreateTask), "create_task");
+        assert_eq!(action_label(UiAction::StartAgent), "start_agent");
+        assert_eq!(action_label(UiAction::StopAgent), "stop_agent");
+        assert_eq!(action_label(UiAction::RestartAgent), "restart_agent");
+        assert_eq!(action_label(UiAction::RunVerifyQuick), "run_verify_quick");
+        assert_eq!(action_label(UiAction::RunVerifyFull), "run_verify_full");
+        assert_eq!(action_label(UiAction::TriggerRestack), "trigger_restack");
+        assert_eq!(action_label(UiAction::MarkNeedsHuman), "mark_needs_human");
+        assert_eq!(
+            action_label(UiAction::OpenWebUiForTask),
+            "open_web_ui_for_task"
+        );
+        assert_eq!(action_label(UiAction::PauseTask), "pause_task");
+        assert_eq!(action_label(UiAction::ResumeTask), "resume_task");
+    }
+}
