@@ -374,6 +374,46 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_single_enabled_available_is_sufficient_with_one_required() {
+        let cfg = ReviewGateConfig {
+            enabled_models: vec![ModelKind::Claude],
+            policy: ReviewPolicy::Adaptive,
+            min_approvals: 2,
+        };
+        let requirement = compute_review_requirement(
+            &cfg,
+            &[ReviewerAvailability {
+                model: ModelKind::Claude,
+                available: true,
+            }],
+        );
+
+        assert_eq!(requirement.capacity_state, ReviewCapacityState::Sufficient);
+        assert_eq!(requirement.required_models, vec![ModelKind::Claude]);
+        assert_eq!(requirement.approvals_required, 1);
+    }
+
+    #[test]
+    fn adaptive_single_enabled_unavailable_needs_human() {
+        let cfg = ReviewGateConfig {
+            enabled_models: vec![ModelKind::Claude],
+            policy: ReviewPolicy::Adaptive,
+            min_approvals: 1,
+        };
+        let requirement = compute_review_requirement(
+            &cfg,
+            &[ReviewerAvailability {
+                model: ModelKind::Claude,
+                available: false,
+            }],
+        );
+
+        assert_eq!(requirement.capacity_state, ReviewCapacityState::NeedsHuman);
+        assert!(requirement.required_models.is_empty());
+        assert_eq!(requirement.approvals_required, 0);
+    }
+
+    #[test]
     fn evaluate_review_gate_uses_latest_verdict_per_reviewer() {
         let cfg = ReviewGateConfig {
             enabled_models: vec![ModelKind::Claude],
@@ -408,6 +448,50 @@ mod tests {
         assert_eq!(eval.blocking_verdicts.len(), 1);
         assert_eq!(eval.blocking_verdicts[0].0, ModelKind::Claude);
         assert_eq!(eval.blocking_verdicts[0].1, ReviewVerdict::RequestChanges);
+    }
+
+    #[test]
+    fn evaluate_review_gate_short_circuits_on_waiting_capacity() {
+        let requirement = super::ReviewRequirement {
+            required_models: vec![ModelKind::Claude, ModelKind::Codex],
+            approvals_required: 0,
+            unanimous_required: true,
+            capacity_state: ReviewCapacityState::WaitingForReviewCapacity,
+        };
+        let approvals = vec![TaskApproval {
+            task_id: TaskId("T-WAIT".to_string()),
+            reviewer: ModelKind::Claude,
+            verdict: ReviewVerdict::Approve,
+            issued_at: Utc::now(),
+        }];
+
+        let eval = evaluate_review_gate(&requirement, &approvals);
+        assert!(!eval.approved);
+        assert!(!eval.needs_human);
+        assert_eq!(eval.approvals_received, 0);
+        assert!(eval.blocking_verdicts.is_empty());
+    }
+
+    #[test]
+    fn evaluate_review_gate_short_circuits_on_needs_human_capacity() {
+        let requirement = super::ReviewRequirement {
+            required_models: vec![ModelKind::Claude],
+            approvals_required: 0,
+            unanimous_required: true,
+            capacity_state: ReviewCapacityState::NeedsHuman,
+        };
+        let approvals = vec![TaskApproval {
+            task_id: TaskId("T-NH".to_string()),
+            reviewer: ModelKind::Claude,
+            verdict: ReviewVerdict::Approve,
+            issued_at: Utc::now(),
+        }];
+
+        let eval = evaluate_review_gate(&requirement, &approvals);
+        assert!(!eval.approved);
+        assert!(eval.needs_human);
+        assert_eq!(eval.approvals_received, 0);
+        assert!(eval.blocking_verdicts.is_empty());
     }
 
     #[test]
