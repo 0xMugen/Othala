@@ -1,0 +1,22 @@
+repo_id = "othala"
+repo_path = "/home/mugen/projects/Othala"
+base_branch = "main"
+
+[nix]
+dev_shell = "nix develop"
+
+[verify.quick]
+commands = [
+  "nix develop -c cargo fmt --all -- --check",
+  "nix develop -c cargo check",
+  "nix develop -c cargo test --workspace"
+]
+
+[verify.full]
+commands = [
+  "nix develop -c cargo test --workspace"
+]
+
+[graphite]
+draft_on_start = true
+submit_mode = "single"
