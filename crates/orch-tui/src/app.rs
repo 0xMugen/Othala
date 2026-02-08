@@ -160,11 +160,12 @@ impl TuiApp {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use orch_core::state::TaskState;
     use orch_core::types::RepoId;
     use orch_core::types::{ModelKind, TaskId};
 
-    use crate::{AgentPaneStatus, TaskOverviewRow, TuiApp, TuiEvent, UiAction};
+    use crate::{AgentPane, AgentPaneStatus, TaskOverviewRow, TuiApp, TuiEvent, UiAction};
 
     #[test]
     fn apply_event_agent_output_creates_and_updates_pane() {
@@ -264,5 +265,98 @@ mod tests {
         assert_eq!(drained[0].action, UiAction::TriggerRestack);
         assert_eq!(drained[0].task_id, None);
         assert_eq!(app.state.status_line, "queued action=trigger_restack");
+    }
+
+    #[test]
+    fn set_panes_clamps_selected_index_when_list_shrinks() {
+        let mut app = TuiApp::default();
+        app.state.selected_pane_idx = 2;
+
+        app.set_panes(vec![
+            AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex),
+            AgentPane::new("A2", TaskId("T2".to_string()), ModelKind::Claude),
+        ]);
+        assert_eq!(app.state.selected_pane_idx, 1);
+
+        app.set_panes(vec![]);
+        assert_eq!(app.state.selected_pane_idx, 0);
+    }
+
+    #[test]
+    fn handle_key_event_dispatches_action_from_keymap() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+    }
+
+    #[test]
+    fn handle_key_event_tab_toggles_focused_pane_and_escape_quits() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["boot".to_string()],
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, Some(0));
+        assert_eq!(app.state.status_line, "focused pane 1");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.status_line, "pane focus cleared");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn apply_event_agent_output_does_not_override_failed_or_exited_status() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["start".to_string()],
+        });
+
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "A1".to_string(),
+            status: AgentPaneStatus::Failed,
+        });
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["after-failure".to_string()],
+        });
+        assert_eq!(app.state.panes[0].status, AgentPaneStatus::Failed);
+
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "A1".to_string(),
+            status: AgentPaneStatus::Exited,
+        });
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["after-exit".to_string()],
+        });
+        assert_eq!(app.state.panes[0].status, AgentPaneStatus::Exited);
     }
 }
