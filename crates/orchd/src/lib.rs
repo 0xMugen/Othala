@@ -17,3 +17,30 @@ pub use scheduler::*;
 pub use service::*;
 pub use state_machine::*;
 pub use types::*;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_transition_allowed, task_state_tag, JsonlEventLog, OrchdService, SchedulerConfig,
+        SqliteStore, TaskRunRecord,
+    };
+    use orch_core::state::TaskState;
+
+    #[test]
+    fn crate_root_reexports_state_machine_helpers() {
+        assert_eq!(task_state_tag(TaskState::DraftPrOpen), "DRAFT_PR_OPEN");
+        assert!(is_transition_allowed(
+            TaskState::Queued,
+            TaskState::Initializing
+        ));
+    }
+
+    #[test]
+    fn crate_root_reexports_core_types() {
+        let _ = std::any::TypeId::of::<SchedulerConfig>();
+        let _ = std::any::TypeId::of::<SqliteStore>();
+        let _ = std::any::TypeId::of::<JsonlEventLog>();
+        let _ = std::any::TypeId::of::<OrchdService>();
+        let _ = std::any::TypeId::of::<TaskRunRecord>();
+    }
+}
