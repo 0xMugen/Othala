@@ -359,3 +359,191 @@ fn review_verdict_tag(verdict: orch_core::events::ReviewVerdict) -> &'static str
         orch_core::events::ReviewVerdict::Block => "block",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use orch_core::events::{Event, EventKind, ReviewVerdict};
+    use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
+    use orch_core::types::{
+        EventId, ModelKind, RepoId, SubmitMode, Task, TaskApproval, TaskId, TaskRole, TaskType,
+    };
+    use rusqlite::params;
+    use std::path::PathBuf;
+
+    use crate::types::{ArtifactRecord, TaskRunRecord};
+
+    use super::SqliteStore;
+
+    fn mk_store() -> SqliteStore {
+        let store = SqliteStore::open_in_memory().expect("in-memory store");
+        store.migrate().expect("migrate");
+        store
+    }
+
+    fn mk_task(id: &str, state: TaskState, updated_at: chrono::DateTime<Utc>) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{id}")),
+            worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    fn mk_event(id: &str, task_id: &str, at: chrono::DateTime<Utc>) -> Event {
+        Event {
+            id: EventId(id.to_string()),
+            task_id: Some(TaskId(task_id.to_string())),
+            repo_id: Some(RepoId("example".to_string())),
+            at,
+            kind: EventKind::TaskCreated,
+        }
+    }
+
+    #[test]
+    fn upsert_and_load_task_roundtrip() {
+        let store = mk_store();
+        let task = mk_task("T1", TaskState::Running, Utc::now());
+        store.upsert_task(&task).expect("upsert task");
+
+        let loaded = store
+            .load_task(&TaskId("T1".to_string()))
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(loaded, task);
+    }
+
+    #[test]
+    fn list_tasks_by_state_filters_and_sorts_by_updated_desc() {
+        let store = mk_store();
+        let base = Utc::now();
+        let t1 = mk_task("T1", TaskState::Running, base + Duration::seconds(1));
+        let t2 = mk_task("T2", TaskState::Reviewing, base + Duration::seconds(2));
+        let t3 = mk_task("T3", TaskState::Running, base + Duration::seconds(3));
+        store.upsert_task(&t1).expect("upsert t1");
+        store.upsert_task(&t2).expect("upsert t2");
+        store.upsert_task(&t3).expect("upsert t3");
+
+        let running = store
+            .list_tasks_by_state(TaskState::Running)
+            .expect("list by state");
+        let ids = running
+            .into_iter()
+            .map(|task| task.id.0)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["T3".to_string(), "T1".to_string()]);
+    }
+
+    #[test]
+    fn append_event_and_latest_event_at_for_task() {
+        let store = mk_store();
+        let base = Utc::now();
+        let e1 = mk_event("E1", "T1", base);
+        let e2 = mk_event("E2", "T1", base + Duration::seconds(10));
+        store.append_event(&e1).expect("append e1");
+        store.append_event(&e2).expect("append e2");
+
+        let events = store
+            .list_events_for_task(&TaskId("T1".to_string()))
+            .expect("list events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id.0, "E1");
+        assert_eq!(events[1].id.0, "E2");
+
+        let latest = store
+            .latest_event_at_for_task(&TaskId("T1".to_string()))
+            .expect("latest event")
+            .expect("latest present");
+        assert_eq!(latest, e2.at);
+    }
+
+    #[test]
+    fn upsert_approval_replaces_existing_reviewer_verdict() {
+        let store = mk_store();
+        let task_id = TaskId("T1".to_string());
+        let first = TaskApproval {
+            task_id: task_id.clone(),
+            reviewer: ModelKind::Codex,
+            verdict: ReviewVerdict::Approve,
+            issued_at: Utc::now(),
+        };
+        let second = TaskApproval {
+            task_id: task_id.clone(),
+            reviewer: ModelKind::Codex,
+            verdict: ReviewVerdict::RequestChanges,
+            issued_at: Utc::now() + Duration::seconds(5),
+        };
+        store.upsert_approval(&first).expect("upsert first");
+        store.upsert_approval(&second).expect("upsert second");
+
+        let approvals = store
+            .list_approvals_for_task(&task_id)
+            .expect("list approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].reviewer, ModelKind::Codex);
+        assert_eq!(approvals[0].verdict, ReviewVerdict::RequestChanges);
+    }
+
+    #[test]
+    fn insert_run_and_artifact_persist_rows() {
+        let store = mk_store();
+        let now = Utc::now();
+        let run = TaskRunRecord {
+            run_id: "R1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            started_at: now,
+            finished_at: Some(now + Duration::seconds(1)),
+            stop_reason: Some("completed".to_string()),
+            exit_code: Some(0),
+        };
+        let artifact = ArtifactRecord {
+            artifact_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            kind: "patch".to_string(),
+            path: "/tmp/patch.diff".to_string(),
+            created_at: now,
+            metadata_json: Some("{\"size\":1}".to_string()),
+        };
+        store.insert_run(&run).expect("insert run");
+        store.insert_artifact(&artifact).expect("insert artifact");
+
+        let run_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE run_id = ?1",
+                params!["R1"],
+                |row| row.get(0),
+            )
+            .expect("count run");
+        let artifact_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?1",
+                params!["A1"],
+                |row| row.get(0),
+            )
+            .expect("count artifact");
+        assert_eq!(run_count, 1);
+        assert_eq!(artifact_count, 1);
+    }
+}
