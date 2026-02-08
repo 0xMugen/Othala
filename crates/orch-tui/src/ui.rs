@@ -225,3 +225,109 @@ fn to_local_time(value: DateTime<Utc>) -> String {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::state::TaskState;
+    use orch_core::types::{ModelKind, RepoId, TaskId};
+
+    use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
+    use crate::TuiApp;
+
+    use super::{format_pane_tabs, format_task_row, pane_status_tag, to_local_time};
+
+    fn mk_row(task_id: &str) -> TaskOverviewRow {
+        TaskOverviewRow {
+            task_id: TaskId(task_id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: format!("task/{task_id}"),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn pane_status_tag_maps_all_statuses() {
+        let task_id = TaskId("T1".to_string());
+
+        let mut pane = AgentPane::new("A1", task_id.clone(), ModelKind::Codex);
+        pane.status = AgentPaneStatus::Starting;
+        assert_eq!(pane_status_tag(&pane), "starting");
+
+        pane.status = AgentPaneStatus::Running;
+        assert_eq!(pane_status_tag(&pane), "running");
+
+        pane.status = AgentPaneStatus::Waiting;
+        assert_eq!(pane_status_tag(&pane), "waiting");
+
+        pane.status = AgentPaneStatus::Exited;
+        assert_eq!(pane_status_tag(&pane), "exited");
+
+        pane.status = AgentPaneStatus::Failed;
+        assert_eq!(pane_status_tag(&pane), "failed");
+    }
+
+    #[test]
+    fn format_pane_tabs_handles_empty_and_selected_pane() {
+        let mut app = TuiApp::default();
+        assert_eq!(format_pane_tabs(&app), "none");
+
+        app.state.panes = vec![
+            AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex),
+            AgentPane::new("A2", TaskId("T2".to_string()), ModelKind::Claude),
+        ];
+        app.state.panes[0].status = AgentPaneStatus::Running;
+        app.state.panes[1].status = AgentPaneStatus::Waiting;
+        app.state.selected_pane_idx = 1;
+
+        let tabs = format_pane_tabs(&app);
+        assert_eq!(tabs, " 1:A1:running | *2:A2:waiting");
+    }
+
+    #[test]
+    fn format_task_row_includes_expected_columns() {
+        let row = mk_row("T9");
+        let output = format_task_row(">", &row);
+        let expected_ts = to_local_time(row.last_activity);
+
+        assert!(output.contains("> example | T9 | task/T9 | Running"));
+        assert!(output.contains("| not_run | 0/0 unanimous=false cap=ok |"));
+        assert!(output.ends_with(&expected_ts));
+    }
+
+    #[test]
+    fn to_local_time_uses_fixed_format() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-02-08T12:34:56Z")
+            .expect("parse rfc3339")
+            .with_timezone(&Utc);
+        let formatted = to_local_time(dt);
+
+        assert_eq!(formatted.len(), 19);
+        assert_eq!(formatted.chars().nth(4), Some('-'));
+        assert_eq!(formatted.chars().nth(7), Some('-'));
+        assert_eq!(formatted.chars().nth(10), Some(' '));
+        assert_eq!(formatted.chars().nth(13), Some(':'));
+        assert_eq!(formatted.chars().nth(16), Some(':'));
+    }
+
+    #[test]
+    fn format_pane_tabs_marks_first_selected_by_default() {
+        let mut state = DashboardState::default();
+        state.panes.push(AgentPane::new(
+            "A1",
+            TaskId("T1".to_string()),
+            ModelKind::Codex,
+        ));
+        state.panes[0].status = AgentPaneStatus::Starting;
+
+        let app = TuiApp {
+            state,
+            ..TuiApp::default()
+        };
+        assert_eq!(format_pane_tabs(&app), "*1:A1:starting");
+    }
+}
