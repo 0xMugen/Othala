@@ -210,6 +210,23 @@ mod tests {
     }
 
     #[test]
+    fn ready_gate_rejects_full_verify_when_quick_is_required() {
+        let input = ReadyGateInput {
+            verify_status: VerifyStatus::Passed {
+                tier: orch_core::state::VerifyTier::Full,
+            },
+            review_evaluation: approved_review(),
+            graphite_hygiene_ok: true,
+        };
+        let decision = evaluate_ready_gate(&input);
+        assert!(!decision.ready);
+        assert_eq!(
+            decision.reasons,
+            vec![ReadyFailureReason::VerifyQuickNotPassed]
+        );
+    }
+
+    #[test]
     fn auto_submit_blocked_when_not_ready_or_disabled() {
         let task = mk_task(SubmitMode::Single);
         let not_ready = super::ReadyGateDecision {
@@ -272,6 +289,27 @@ mod tests {
         );
         assert!(decision.should_submit);
         assert_eq!(decision.mode, Some(SubmitMode::Stack));
+    }
+
+    #[test]
+    fn auto_submit_uses_task_submit_mode_when_no_override() {
+        let task = mk_task(SubmitMode::Stack);
+        let ready = super::ReadyGateDecision {
+            ready: true,
+            reasons: Vec::new(),
+        };
+        let decision = decide_auto_submit(
+            &task,
+            SubmitPolicy {
+                org_default: SubmitMode::Single,
+                repo_override: None,
+                auto_submit: true,
+            },
+            &ready,
+        );
+        assert!(decision.should_submit);
+        assert_eq!(decision.mode, Some(SubmitMode::Stack));
+        assert_eq!(decision.blocked_reason, None);
     }
 
     #[test]
@@ -361,6 +399,20 @@ mod tests {
             SubmitPolicy {
                 org_default: SubmitMode::Single,
                 repo_override: None,
+                auto_submit: true,
+            },
+        );
+        assert_eq!(mode, SubmitMode::Stack);
+    }
+
+    #[test]
+    fn resolve_submit_mode_prefers_repo_override() {
+        let task = mk_task(SubmitMode::Single);
+        let mode = resolve_submit_mode(
+            &task,
+            SubmitPolicy {
+                org_default: SubmitMode::Single,
+                repo_override: Some(SubmitMode::Stack),
                 auto_submit: true,
             },
         );
