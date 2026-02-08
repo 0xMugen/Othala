@@ -197,7 +197,8 @@ mod tests {
     use orch_core::types::{ModelKind, TaskApproval, TaskId};
 
     use super::{
-        compute_review_requirement, evaluate_review_gate, ReviewGateConfig, ReviewerAvailability,
+        compute_review_requirement, dedupe_models, evaluate_review_gate, ReviewGateConfig,
+        ReviewerAvailability,
     };
 
     #[test]
@@ -341,5 +342,86 @@ mod tests {
         let eval = evaluate_review_gate(&requirement, &approvals);
         assert!(!eval.approved);
         assert_eq!(eval.blocking_verdicts.len(), 1);
+    }
+
+    #[test]
+    fn strict_with_all_enabled_available_is_sufficient() {
+        let cfg = ReviewGateConfig {
+            enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+            policy: ReviewPolicy::Strict,
+            min_approvals: 2,
+        };
+        let requirement = compute_review_requirement(
+            &cfg,
+            &[
+                ReviewerAvailability {
+                    model: ModelKind::Claude,
+                    available: true,
+                },
+                ReviewerAvailability {
+                    model: ModelKind::Codex,
+                    available: true,
+                },
+            ],
+        );
+
+        assert_eq!(requirement.capacity_state, ReviewCapacityState::Sufficient);
+        assert_eq!(
+            requirement.required_models,
+            vec![ModelKind::Claude, ModelKind::Codex]
+        );
+        assert_eq!(requirement.approvals_required, 2);
+    }
+
+    #[test]
+    fn evaluate_review_gate_uses_latest_verdict_per_reviewer() {
+        let cfg = ReviewGateConfig {
+            enabled_models: vec![ModelKind::Claude],
+            policy: ReviewPolicy::Adaptive,
+            min_approvals: 1,
+        };
+        let requirement = compute_review_requirement(
+            &cfg,
+            &[ReviewerAvailability {
+                model: ModelKind::Claude,
+                available: true,
+            }],
+        );
+
+        let approvals = vec![
+            TaskApproval {
+                task_id: TaskId("T2".to_string()),
+                reviewer: ModelKind::Claude,
+                verdict: ReviewVerdict::Approve,
+                issued_at: Utc::now(),
+            },
+            TaskApproval {
+                task_id: TaskId("T2".to_string()),
+                reviewer: ModelKind::Claude,
+                verdict: ReviewVerdict::RequestChanges,
+                issued_at: Utc::now(),
+            },
+        ];
+        let eval = evaluate_review_gate(&requirement, &approvals);
+        assert!(!eval.approved);
+        assert_eq!(eval.approvals_received, 0);
+        assert_eq!(eval.blocking_verdicts.len(), 1);
+        assert_eq!(eval.blocking_verdicts[0].0, ModelKind::Claude);
+        assert_eq!(eval.blocking_verdicts[0].1, ReviewVerdict::RequestChanges);
+    }
+
+    #[test]
+    fn dedupe_models_preserves_first_seen_order() {
+        let deduped = dedupe_models(&[
+            ModelKind::Codex,
+            ModelKind::Claude,
+            ModelKind::Codex,
+            ModelKind::Gemini,
+            ModelKind::Claude,
+        ]);
+        assert_eq!(
+            deduped,
+            vec![ModelKind::Codex, ModelKind::Claude, ModelKind::Gemini]
+        );
     }
 }
