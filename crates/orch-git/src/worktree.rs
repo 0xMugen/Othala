@@ -150,9 +150,61 @@ fn parse_worktree_list(raw: &str) -> Result<Vec<ListedWorktree>, GitError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::parse_worktree_list;
+    use orch_core::types::TaskId;
+
+    use super::{parse_worktree_list, WorktreeManager, WorktreeSpec};
+    use crate::command::GitCli;
+    use crate::repo::discover_repo;
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("othala-orch-git-worktree-{prefix}-{now}"))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo_with_branch(branch: &str) -> PathBuf {
+        let root = unique_temp_dir("repo");
+        fs::create_dir_all(&root).expect("create temp repo");
+        run_git(&root, &["init"]);
+        fs::write(root.join("README.md"), "init\n").expect("write file");
+        run_git(&root, &["add", "README.md"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&root, &["branch", branch]);
+        root
+    }
 
     #[test]
     fn parse_worktree_list_parses_multiple_entries_and_trims_refs_prefix() {
@@ -202,5 +254,49 @@ detached
     fn parse_worktree_list_rejects_non_empty_unparseable_output() {
         let err = parse_worktree_list("nonsense output").expect_err("expected parse error");
         assert!(matches!(err, crate::error::GitError::Parse { .. }));
+    }
+
+    #[test]
+    fn task_worktree_path_joins_repo_root_relative_root_and_task_id() {
+        let manager = WorktreeManager::default();
+        let repo_root = PathBuf::from("/tmp/repo");
+        let repo = crate::repo::RepoHandle {
+            root: repo_root.clone(),
+            git_dir: repo_root.join(".git"),
+        };
+
+        let path = manager.task_worktree_path(&repo, &TaskId("T77".to_string()));
+        assert_eq!(path, repo_root.join(".orch/wt/T77"));
+    }
+
+    #[test]
+    fn create_list_and_remove_worktree_for_existing_branch() {
+        let root = init_repo_with_branch("task/T1");
+        let git = GitCli::default();
+        let repo = discover_repo(&root, &git).expect("discover repo");
+        let manager = WorktreeManager::default();
+        let spec = WorktreeSpec {
+            task_id: TaskId("T1".to_string()),
+            branch: "task/T1".to_string(),
+        };
+
+        let info = manager
+            .create_for_existing_branch(&repo, &spec)
+            .expect("create worktree");
+        assert_eq!(info.task_id.0, "T1");
+        assert_eq!(info.branch, "task/T1");
+        assert!(info.path.exists(), "worktree path should exist");
+
+        let listed = manager.list(&repo).expect("list worktrees");
+        assert!(listed.iter().any(|entry| {
+            entry.path == info.path && entry.branch.as_deref() == Some("task/T1")
+        }));
+
+        manager
+            .remove(&repo, &TaskId("T1".to_string()), true)
+            .expect("remove worktree");
+        assert!(!info.path.exists(), "worktree path should be removed");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
