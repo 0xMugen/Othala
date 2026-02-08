@@ -50,10 +50,18 @@ struct CreateTaskCliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ListTasksCliArgs {
+    org_config_path: PathBuf,
+    sqlite_path: PathBuf,
+    event_log_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run(RunCliArgs),
     Setup(SetupCliArgs),
     CreateTask(CreateTaskCliArgs),
+    ListTasks(ListTasksCliArgs),
     Help(String),
 }
 
@@ -97,6 +105,11 @@ enum MainError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to serialize task list as json: {source}")]
+    SerializeTaskList {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error(transparent)]
     Setup(#[from] SetupError),
     #[error(transparent)]
@@ -129,6 +142,7 @@ fn run() -> Result<(), MainError> {
         CliCommand::Run(args) => run_daemon(args),
         CliCommand::Setup(args) => run_setup(args),
         CliCommand::CreateTask(args) => run_create_task(args),
+        CliCommand::ListTasks(args) => run_list_tasks(args),
     }
 }
 
@@ -346,6 +360,26 @@ fn run_create_task(args: CreateTaskCliArgs) -> Result<(), MainError> {
     Ok(())
 }
 
+fn run_list_tasks(args: ListTasksCliArgs) -> Result<(), MainError> {
+    ensure_parent_dir(&args.sqlite_path)?;
+    ensure_dir(&args.event_log_root)?;
+
+    let org = load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+    validate_org_config(&org.validate())?;
+
+    let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
+    let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
+    let tasks = service.list_tasks()?;
+    let rendered = serde_json::to_string_pretty(&tasks)
+        .map_err(|source| MainError::SerializeTaskList { source })?;
+    println!("{rendered}");
+
+    Ok(())
+}
+
 fn print_setup_summary(summary: &SetupSummary, per_model_concurrency: usize, path: &Path) {
     println!(
         "setup saved org config to {} (per-model concurrency={})",
@@ -491,6 +525,7 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
     match args[0].as_str() {
         "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
         "create-task" => parse_create_task_cli_args(args[1..].to_vec(), program),
+        "list-tasks" => parse_list_tasks_cli_args(args[1..].to_vec(), program),
         "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
         _ => parse_run_cli_args(args, program),
     }
@@ -677,6 +712,52 @@ fn parse_create_task_cli_args(args: Vec<String>, program: &str) -> Result<CliCom
     Ok(CliCommand::CreateTask(parsed))
 }
 
+fn parse_list_tasks_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = ListTasksCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
+    };
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(list_tasks_usage(program))),
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                parsed.sqlite_path = PathBuf::from(value);
+            }
+            "--event-log-root" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --event-log-root".to_string())
+                })?;
+                parsed.event_log_root = PathBuf::from(value);
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown list-tasks argument: {other}\n\n{}",
+                    list_tasks_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(CliCommand::ListTasks(parsed))
+}
+
 fn parse_enabled_models(raw: &str) -> Result<Vec<ModelKind>, MainError> {
     let mut models = Vec::new();
     for token in raw.split(',') {
@@ -719,7 +800,7 @@ fn default_run_args() -> RunCliArgs {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 \nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
     )
 }
@@ -739,11 +820,18 @@ fn create_task_usage(program: &str) -> String {
     )
 }
 
+fn list_tasks_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        create_task_usage, load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage,
-        usage, CliCommand, CreateTaskCliArgs, RunCliArgs, SetupCliArgs,
+        create_task_usage, list_tasks_usage, load_repo_configs, parse_cli_args,
+        parse_enabled_models, setup_usage, usage, CliCommand, CreateTaskCliArgs, ListTasksCliArgs,
+        RunCliArgs, SetupCliArgs,
     };
     use orch_core::types::ModelKind;
     use std::fs;
@@ -927,6 +1015,55 @@ mod tests {
         )
         .expect("create-task help");
         assert_eq!(parsed, CliCommand::Help(create_task_usage("orchd")));
+    }
+
+    #[test]
+    fn parse_cli_args_list_tasks_defaults() {
+        let parsed =
+            parse_cli_args(vec!["list-tasks".to_string()], "orchd").expect("list-tasks parse");
+        assert_eq!(
+            parsed,
+            CliCommand::ListTasks(ListTasksCliArgs {
+                org_config_path: PathBuf::from("config/org.toml"),
+                sqlite_path: PathBuf::from(".orch/state.sqlite"),
+                event_log_root: PathBuf::from(".orch/events"),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_list_tasks_overrides_paths() {
+        let parsed = parse_cli_args(
+            vec![
+                "list-tasks".to_string(),
+                "--org-config".to_string(),
+                "/tmp/org.toml".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+                "--event-log-root".to_string(),
+                "/tmp/events".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("list-tasks parse");
+        assert_eq!(
+            parsed,
+            CliCommand::ListTasks(ListTasksCliArgs {
+                org_config_path: PathBuf::from("/tmp/org.toml"),
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                event_log_root: PathBuf::from("/tmp/events"),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_list_tasks_help_returns_usage() {
+        let parsed = parse_cli_args(
+            vec!["list-tasks".to_string(), "--help".to_string()],
+            "orchd",
+        )
+        .expect("list-tasks help");
+        assert_eq!(parsed, CliCommand::Help(list_tasks_usage("orchd")));
     }
 
     #[test]
