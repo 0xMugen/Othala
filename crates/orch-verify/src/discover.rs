@@ -153,4 +153,50 @@ mod tests {
         let resolved = resolve_verify_commands(&dir, VerifyTier::Quick, &configured);
         assert_eq!(resolved, configured);
     }
+
+    #[test]
+    fn falls_back_to_node_when_no_just_or_cargo_present() {
+        let dir = tmp_dir("node");
+        fs::write(dir.join("package.json"), "{ \"name\": \"x\" }\n").expect("write package.json");
+
+        let quick = discover_verify_commands(&dir, VerifyTier::Quick);
+        let full = discover_verify_commands(&dir, VerifyTier::Full);
+
+        assert_eq!(
+            quick,
+            vec![
+                "npm run format:check --if-present".to_string(),
+                "npm run lint --if-present".to_string(),
+                "npm run test --if-present".to_string()
+            ]
+        );
+        assert_eq!(full, vec!["npm run test --if-present".to_string()]);
+    }
+
+    #[test]
+    fn falls_back_to_python_when_only_python_markers_exist() {
+        let dir = tmp_dir("python");
+        fs::write(dir.join("pyproject.toml"), "[project]\nname='x'\n").expect("write pyproject");
+
+        let quick = discover_verify_commands(&dir, VerifyTier::Quick);
+        let full = discover_verify_commands(&dir, VerifyTier::Full);
+
+        assert_eq!(
+            quick,
+            vec![
+                "python -m ruff check .".to_string(),
+                "python -m pytest -q".to_string()
+            ]
+        );
+        assert_eq!(full, vec!["python -m pytest".to_string()]);
+    }
+
+    #[test]
+    fn returns_empty_when_no_known_repo_markers_exist() {
+        let dir = tmp_dir("empty");
+        let quick = discover_verify_commands(&dir, VerifyTier::Quick);
+        let full = discover_verify_commands(&dir, VerifyTier::Full);
+        assert!(quick.is_empty());
+        assert!(full.is_empty());
+    }
 }
