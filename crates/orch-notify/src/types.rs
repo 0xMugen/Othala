@@ -50,3 +50,54 @@ impl Default for NotificationPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use orch_core::types::{RepoId, TaskId};
+
+    use super::{
+        NotificationMessage, NotificationPolicy, NotificationSeverity, NotificationSinkKind,
+        NotificationTopic,
+    };
+
+    #[test]
+    fn notification_policy_defaults_to_stdout_sink() {
+        let policy = NotificationPolicy::default();
+        assert_eq!(policy.enabled_sinks, vec![NotificationSinkKind::Stdout]);
+    }
+
+    #[test]
+    fn enums_serialize_in_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&NotificationSeverity::Info).expect("serialize severity"),
+            "\"info\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationTopic::VerifyFailed).expect("serialize topic"),
+            "\"verify_failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationSinkKind::Stdout).expect("serialize sink kind"),
+            "\"stdout\""
+        );
+    }
+
+    #[test]
+    fn notification_message_roundtrip_preserves_optional_fields() {
+        let message = NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::TaskError,
+            severity: NotificationSeverity::Error,
+            title: "task failed".to_string(),
+            body: "details".to_string(),
+            task_id: Some(TaskId("T1".to_string())),
+            repo_id: Some(RepoId("R1".to_string())),
+        };
+
+        let encoded = serde_json::to_string(&message).expect("serialize message");
+        let decoded: NotificationMessage =
+            serde_json::from_str(&encoded).expect("deserialize message");
+        assert_eq!(decoded, message);
+    }
+}
