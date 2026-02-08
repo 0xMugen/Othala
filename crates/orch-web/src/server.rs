@@ -17,6 +17,7 @@ pub async fn run_web_server(bind_addr: &str, state: WebState) -> Result<(), WebE
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
     use tokio::net::TcpListener;
 
     use crate::error::WebError;
@@ -44,5 +45,16 @@ mod tests {
             .await
             .expect_err("address in use should fail");
         assert!(matches!(err, WebError::Io { .. }));
+    }
+
+    #[tokio::test]
+    async fn run_web_server_io_error_preserves_source_chain() {
+        let err = run_web_server("not-a-valid-bind-addr", WebState::default())
+            .await
+            .expect_err("invalid bind address should fail");
+
+        assert!(matches!(err, WebError::Io { .. }));
+        assert!(err.source().is_some());
+        assert!(err.to_string().contains("io error"));
     }
 }
