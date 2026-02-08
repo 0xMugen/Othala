@@ -8,7 +8,10 @@ license.workspace = true
 chrono = { version = "0.4", features = ["serde", "clock"] }
 orch-agents = { path = "../orch-agents" }
 orch-core = { path = "../orch-core" }
+orch-git = { path = "../orch-git" }
+orch-graphite = { path = "../orch-graphite" }
 orch-notify = { path = "../orch-notify" }
+orch-verify = { path = "../orch-verify" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

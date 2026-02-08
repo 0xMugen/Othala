@@ -12,7 +12,8 @@ use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatu
 use orch_core::types::ModelKind;
 use orch_core::types::{EventId, Task, TaskSpec};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
-use orchd::{OrchdService, Scheduler, SchedulerConfig, ServiceError};
+use orchd::{OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig, ServiceError};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -119,6 +120,8 @@ enum MainError {
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
     Web(#[from] std::io::Error),
 }
 
@@ -161,6 +164,11 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
 
     let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
+    let runtime = RuntimeEngine::default();
+    let repo_config_by_id = repo_configs
+        .iter()
+        .map(|(_, cfg)| (cfg.repo_id.clone(), cfg.clone()))
+        .collect::<HashMap<_, _>>();
 
     let task_count = service.list_tasks()?.len();
     println!(
@@ -198,6 +206,20 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
             first_tick.blocked.len()
         );
     }
+    let runtime_tick = runtime.tick(&service, &org, &repo_config_by_id, Utc::now())?;
+    if runtime_tick.touched() {
+        println!(
+            "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
+            runtime_tick.initialized,
+            runtime_tick.restacked,
+            runtime_tick.restack_conflicts,
+            runtime_tick.verify_passed,
+            runtime_tick.verify_failed,
+            runtime_tick.submitted,
+            runtime_tick.submit_failed,
+            runtime_tick.errors
+        );
+    }
 
     if args.once {
         println!("orchd exiting after bootstrap + single scheduler tick (--once)");
@@ -213,6 +235,21 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
                 "orchd scheduler tick scheduled={} blocked={}",
                 tick.scheduled.len(),
                 tick.blocked.len()
+            );
+        }
+
+        let runtime_tick = runtime.tick(&service, &org, &repo_config_by_id, Utc::now())?;
+        if runtime_tick.touched() {
+            println!(
+                "orchd runtime tick initialized={} restacked={} restack_conflicts={} verify_passed={} verify_failed={} submitted={} submit_failed={} errors={}",
+                runtime_tick.initialized,
+                runtime_tick.restacked,
+                runtime_tick.restack_conflicts,
+                runtime_tick.verify_passed,
+                runtime_tick.verify_failed,
+                runtime_tick.submitted,
+                runtime_tick.submit_failed,
+                runtime_tick.errors
             );
         }
     }
