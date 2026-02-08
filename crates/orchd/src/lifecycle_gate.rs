@@ -131,8 +131,8 @@ mod tests {
     use crate::review_gate::{ReviewEvaluation, ReviewRequirement};
 
     use super::{
-        decide_auto_submit, evaluate_ready_gate, AutoSubmitDecision, ReadyFailureReason,
-        ReadyGateInput, SubmitBlockReason, SubmitPolicy,
+        decide_auto_submit, evaluate_ready_gate, resolve_submit_mode, AutoSubmitDecision,
+        ReadyFailureReason, ReadyGateInput, SubmitBlockReason, SubmitPolicy,
     };
 
     fn mk_task(submit_mode: SubmitMode) -> Task {
@@ -272,5 +272,98 @@ mod tests {
         );
         assert!(decision.should_submit);
         assert_eq!(decision.mode, Some(SubmitMode::Stack));
+    }
+
+    #[test]
+    fn ready_gate_reports_waiting_for_review_capacity_reason() {
+        let mut review = approved_review();
+        review.requirement.capacity_state = ReviewCapacityState::WaitingForReviewCapacity;
+        review.approved = false;
+
+        let input = ReadyGateInput {
+            verify_status: VerifyStatus::Passed {
+                tier: orch_core::state::VerifyTier::Quick,
+            },
+            review_evaluation: review,
+            graphite_hygiene_ok: true,
+        };
+        let decision = evaluate_ready_gate(&input);
+        assert!(!decision.ready);
+        assert_eq!(
+            decision.reasons,
+            vec![
+                ReadyFailureReason::WaitingForReviewCapacity,
+                ReadyFailureReason::ReviewNotApproved
+            ]
+        );
+    }
+
+    #[test]
+    fn ready_gate_reports_needs_human_capacity_reason() {
+        let mut review = approved_review();
+        review.requirement.capacity_state = ReviewCapacityState::NeedsHuman;
+        review.approved = false;
+        review.needs_human = true;
+
+        let input = ReadyGateInput {
+            verify_status: VerifyStatus::Passed {
+                tier: orch_core::state::VerifyTier::Quick,
+            },
+            review_evaluation: review,
+            graphite_hygiene_ok: true,
+        };
+        let decision = evaluate_ready_gate(&input);
+        assert!(!decision.ready);
+        assert_eq!(
+            decision.reasons,
+            vec![
+                ReadyFailureReason::NeedsHumanReviewerCapacity,
+                ReadyFailureReason::ReviewNotApproved
+            ]
+        );
+    }
+
+    #[test]
+    fn ready_gate_dedupes_reason_when_capacity_needs_human_and_review_not_approved() {
+        let input = ReadyGateInput {
+            verify_status: VerifyStatus::NotRun,
+            review_evaluation: ReviewEvaluation {
+                requirement: ReviewRequirement {
+                    required_models: vec![],
+                    approvals_required: 0,
+                    unanimous_required: true,
+                    capacity_state: ReviewCapacityState::NeedsHuman,
+                },
+                approvals_received: 0,
+                blocking_verdicts: Vec::new(),
+                approved: false,
+                needs_human: true,
+            },
+            graphite_hygiene_ok: false,
+        };
+        let decision = evaluate_ready_gate(&input);
+        assert_eq!(
+            decision.reasons,
+            vec![
+                ReadyFailureReason::VerifyQuickNotPassed,
+                ReadyFailureReason::NeedsHumanReviewerCapacity,
+                ReadyFailureReason::ReviewNotApproved,
+                ReadyFailureReason::GraphiteHygieneFailed
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_submit_mode_uses_task_mode_when_no_repo_override() {
+        let task = mk_task(SubmitMode::Stack);
+        let mode = resolve_submit_mode(
+            &task,
+            SubmitPolicy {
+                org_default: SubmitMode::Single,
+                repo_override: None,
+                auto_submit: true,
+            },
+        );
+        assert_eq!(mode, SubmitMode::Stack);
     }
 }
