@@ -251,6 +251,47 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn update_sandbox_returns_none_for_unknown_id_and_emits_no_event() {
+        let state = WebState::default();
+        let mut rx = state.subscribe();
+
+        let updated = state
+            .update_sandbox("SBX-404", |run| {
+                run.status = SandboxStatus::Failed;
+            })
+            .await;
+        assert!(updated.is_none());
+
+        let next = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            next.is_err(),
+            "no event should be emitted for missing sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_tasks_replaces_previous_task_set() {
+        let state = WebState::default();
+        state
+            .replace_tasks(vec![
+                mk_task("T1", TaskState::Running),
+                mk_task("T2", TaskState::Reviewing),
+            ])
+            .await;
+        assert_eq!(state.list_tasks().await.len(), 2);
+
+        state
+            .replace_tasks(vec![mk_task("T3", TaskState::AwaitingMerge)])
+            .await;
+
+        let tasks = state.list_tasks().await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id.0, "T3");
+        assert!(state.task("T1").await.is_none());
+        assert!(state.task("T2").await.is_none());
+    }
+
     #[test]
     fn next_sandbox_id_increments_monotonically() {
         let state = WebState::default();
