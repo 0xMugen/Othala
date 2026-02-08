@@ -14,3 +14,19 @@ pub async fn run_web_server(bind_addr: &str, state: WebState) -> Result<(), WebE
         })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::error::WebError;
+    use crate::state::WebState;
+
+    use super::run_web_server;
+
+    #[tokio::test]
+    async fn run_web_server_returns_io_error_for_invalid_bind_address() {
+        let err = run_web_server("not-a-valid-bind-addr", WebState::default())
+            .await
+            .expect_err("invalid bind address should fail");
+        assert!(matches!(err, WebError::Io { .. }));
+    }
+}
