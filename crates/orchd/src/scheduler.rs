@@ -214,6 +214,8 @@ fn candidate_models_for_task(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
+    use orch_core::config::parse_org_config;
+    use orch_core::state::ReviewPolicy;
     use orch_core::types::{ModelKind, RepoId, TaskId};
     use std::collections::HashMap;
 
@@ -416,6 +418,118 @@ mod tests {
             running: Vec::new(),
             enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
             availability: Vec::new(),
+        };
+
+        let plan = scheduler.plan(input);
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, BlockReason::NoAvailableModel);
+    }
+
+    #[test]
+    fn scheduler_config_from_org_config_maps_repo_and_model_limits() {
+        let org = parse_org_config(
+            r#"
+[models]
+enabled = ["claude", "codex", "gemini"]
+policy = "strict"
+min_approvals = 3
+
+[concurrency]
+per_repo = 7
+claude = 11
+codex = 13
+gemini = 17
+
+[graphite]
+auto_submit = true
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+"#,
+        )
+        .expect("parse org config");
+        assert_eq!(org.models.policy, ReviewPolicy::Strict);
+
+        let cfg = SchedulerConfig::from_org_config(&org);
+        assert_eq!(cfg.per_repo_limit, 7);
+        assert_eq!(cfg.per_model_limit.get(&ModelKind::Claude), Some(&11));
+        assert_eq!(cfg.per_model_limit.get(&ModelKind::Codex), Some(&13));
+        assert_eq!(cfg.per_model_limit.get(&ModelKind::Gemini), Some(&17));
+    }
+
+    #[test]
+    fn plan_treats_missing_availability_entry_as_available() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Codex, 10), (ModelKind::Claude, 10)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Codex),
+                &[ModelKind::Codex],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex, ModelKind::Claude],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Claude,
+                available: false,
+            }],
+        };
+
+        let plan = scheduler.plan(input);
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Codex);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_falls_back_when_preferred_model_unavailable() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Codex, 10), (ModelKind::Claude, 10)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Codex),
+                &[ModelKind::Codex, ModelKind::Claude],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex, ModelKind::Claude],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Codex,
+                available: false,
+            }],
+        };
+
+        let plan = scheduler.plan(input);
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Claude);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_never_uses_models_not_enabled_even_if_marked_available() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Gemini, 10)]);
+        let input = SchedulingInput {
+            queued: vec![mk_queued(
+                "TQ",
+                "repo-a",
+                1,
+                Utc::now(),
+                Some(ModelKind::Gemini),
+                &[ModelKind::Gemini],
+            )],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Codex],
+            availability: vec![ModelAvailability {
+                model: ModelKind::Gemini,
+                available: true,
+            }],
         };
 
         let plan = scheduler.plan(input);
