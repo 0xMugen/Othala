@@ -1318,6 +1318,76 @@ mod tests {
     }
 
     #[test]
+    fn transition_task_state_updates_task_and_records_event() {
+        let svc = mk_service();
+        let task = mk_task("TTRANS1", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let at = Utc::now();
+        let updated = svc
+            .transition_task_state(
+                &task.id,
+                TaskState::Paused,
+                EventId("E-TRANS1".to_string()),
+                at,
+            )
+            .expect("transition task");
+
+        assert_eq!(updated.state, TaskState::Paused);
+
+        let stored = svc.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(stored.state, TaskState::Paused);
+
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::TaskStateChanged { from, to } if from == "RUNNING" && to == "PAUSED"
+            )
+        }));
+    }
+
+    #[test]
+    fn transition_task_state_rejects_invalid_transition() {
+        let svc = mk_service();
+        let task = mk_task("TTRANS2", TaskState::Queued, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let err = svc
+            .transition_task_state(
+                &task.id,
+                TaskState::Ready,
+                EventId("E-TRANS2".to_string()),
+                Utc::now(),
+            )
+            .expect_err("queued -> ready should fail");
+        assert!(matches!(err, crate::service::ServiceError::StateMachine(_)));
+
+        let stored = svc.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(stored.state, TaskState::Queued);
+    }
+
+    #[test]
+    fn transition_task_state_requires_existing_task() {
+        let svc = mk_service();
+        let err = svc
+            .transition_task_state(
+                &TaskId("MISSING-TRANS".to_string()),
+                TaskState::Paused,
+                EventId("E-TRANS3".to_string()),
+                Utc::now(),
+            )
+            .expect_err("missing task should fail");
+
+        assert!(matches!(
+            err,
+            crate::service::ServiceError::TaskNotFound { task_id } if task_id == "MISSING-TRANS"
+        ));
+    }
+
+    #[test]
     fn mark_task_draft_pr_open_sets_pr_and_transitions_state() {
         let svc = mk_service();
         let task = mk_task("TPR", TaskState::Initializing, &[]);
@@ -2678,6 +2748,51 @@ mod tests {
             err,
             crate::service::ServiceError::TaskNotFound { task_id } if task_id == "MISSING"
         ));
+    }
+
+    #[test]
+    fn restack_targets_for_event_returns_empty_for_non_parent_update_event() {
+        let svc = mk_service();
+        let t1 = mk_task("TEVT1", TaskState::Running, &[]);
+        let t2 = mk_task("TEVT2", TaskState::Running, &["TEVT1"]);
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+        svc.create_task(&t2, &mk_created_event(&t2))
+            .expect("create t2");
+
+        let targets = svc
+            .restack_targets_for_event(&EventKind::RestackStarted, &[])
+            .expect("restack targets for non-parent event");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn restack_targets_for_event_uses_parent_head_updated_task_id() {
+        let svc = mk_service();
+        let t1 = mk_task("TEVT3", TaskState::Running, &[]);
+        let t2 = mk_task("TEVT4", TaskState::Running, &["TEVT3"]);
+        let t3 = mk_task("TEVT5", TaskState::Running, &[]);
+        svc.create_task(&t1, &mk_created_event(&t1))
+            .expect("create t1");
+        svc.create_task(&t2, &mk_created_event(&t2))
+            .expect("create t2");
+        svc.create_task(&t3, &mk_created_event(&t3))
+            .expect("create t3");
+
+        let targets = svc
+            .restack_targets_for_event(
+                &EventKind::ParentHeadUpdated {
+                    parent_task_id: TaskId("TEVT3".to_string()),
+                },
+                &[InferredDependency {
+                    parent_task_id: TaskId("TEVT4".to_string()),
+                    child_task_id: TaskId("TEVT5".to_string()),
+                }],
+            )
+            .expect("restack targets for parent update");
+
+        let ids = targets.into_iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["TEVT4".to_string(), "TEVT5".to_string()]);
     }
 
     #[test]
