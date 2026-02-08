@@ -4,6 +4,12 @@ members = [
   "crates/orch-core",
   "crates/orch-git",
   "crates/orch-graphite",
+  "crates/orch-verify",
+  "crates/orch-agents",
+  "crates/orch-notify",
+  "crates/orchd",
+  "crates/orch-tui",
+  "crates/orch-web",
 ]
 
 [workspace.package]

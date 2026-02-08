@@ -1,0 +1,12 @@
+[package]
+name = "orch-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde", "clock"] }
+orch-core = { path = "../orch-core" }
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

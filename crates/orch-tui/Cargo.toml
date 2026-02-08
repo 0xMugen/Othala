@@ -1,0 +1,13 @@
+[package]
+name = "orch-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde", "clock"] }
+crossterm = "0.28"
+orch-core = { path = "../orch-core" }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

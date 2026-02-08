@@ -1,0 +1,11 @@
+[package]
+name = "orch-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde", "clock"] }
+orch-core = { path = "../orch-core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

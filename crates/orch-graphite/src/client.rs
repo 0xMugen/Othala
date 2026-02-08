@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use orch_core::types::SubmitMode;
+use orch_core::types::{SubmitMode, TaskId};
 
 use crate::command::{AllowedAutoCommand, GraphiteCli};
 use crate::error::GraphiteError;
-use crate::types::{parse_gt_log_short, GraphiteStackSnapshot, GraphiteStatusSnapshot};
+use crate::types::{
+    infer_task_dependencies_from_stack, parse_gt_log_short, GraphiteStackSnapshot,
+    GraphiteStatusSnapshot, InferredStackDependency,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphiteClient {
@@ -87,6 +91,14 @@ impl GraphiteClient {
             ["log", "short"],
         )?;
         Ok(parse_gt_log_short(&output.stdout))
+    }
+
+    pub fn infer_stack_dependencies(
+        &self,
+        branch_to_task: &HashMap<String, TaskId>,
+    ) -> Result<Vec<InferredStackDependency>, GraphiteError> {
+        let snapshot = self.log_short_snapshot()?;
+        Ok(infer_task_dependencies_from_stack(&snapshot, branch_to_task))
     }
 
     pub fn submit(&self, mode: SubmitMode) -> Result<(), GraphiteError> {
