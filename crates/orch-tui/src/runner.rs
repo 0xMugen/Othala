@@ -36,12 +36,41 @@ fn run_loop(
         terminal.draw(|frame| render_dashboard(frame, app))?;
 
         if event::poll(tick_rate)? {
-            match event::read()? {
-                CEvent::Key(key) => app.handle_key_event(key),
-                CEvent::Resize(_, _) => {}
-                _ => {}
-            }
+            handle_terminal_event(app, event::read()?);
         }
     }
     Ok(())
+}
+
+fn handle_terminal_event(app: &mut TuiApp, event: CEvent) {
+    match event {
+        CEvent::Key(key) => app.handle_key_event(key),
+        CEvent::Resize(_, _) => {}
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::runner::handle_terminal_event;
+    use crate::TuiApp;
+
+    #[test]
+    fn handle_terminal_event_routes_key_events_to_app() {
+        let mut app = TuiApp::default();
+        handle_terminal_event(
+            &mut app,
+            CEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handle_terminal_event_ignores_resize_events() {
+        let mut app = TuiApp::default();
+        handle_terminal_event(&mut app, CEvent::Resize(120, 40));
+        assert!(!app.should_quit);
+    }
 }
