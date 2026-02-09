@@ -123,7 +123,14 @@ impl RuntimeEngine {
             }
         }
 
-        let submitting = service.list_tasks_by_state(TaskState::Submitting)?;
+        let mut submitting = service.list_tasks_by_state(TaskState::Submitting)?;
+        // Preserve completion order when multiple agent chats finish close together.
+        submitting.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
         for task in submitting {
             if self.submit_task(service, repo_configs, &task, at)? {
                 summary.submitted += 1;
@@ -512,6 +519,27 @@ impl RuntimeEngine {
         let submit_result = client.submit(mode);
 
         let success = submit_result.is_ok();
+        if success {
+            if let Some(anchor_branch) =
+                select_submit_stack_anchor_branch(&service.list_tasks()?, task)
+            {
+                if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
+                    service.record_event(&Event {
+                        id: event_id(&task.id, "SUBMIT-MOVE-ERROR", at),
+                        task_id: Some(task.id.clone()),
+                        repo_id: Some(task.repo_id.clone()),
+                        at,
+                        kind: EventKind::Error {
+                            code: "submit_move_onto_first_failed".to_string(),
+                            message: format!(
+                                "submitted task {} but failed to move onto {}: {err}",
+                                task.id.0, anchor_branch
+                            ),
+                        },
+                    })?;
+                }
+            }
+        }
         let failure_message = submit_result.err().map(|err| err.to_string());
         let _ = service.complete_submit(
             &task.id,
@@ -660,6 +688,30 @@ fn task_runtime_path(task: &Task, repo_config: &RepoConfig) -> PathBuf {
     repo_config.repo_path.clone()
 }
 
+fn select_submit_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> {
+    tasks
+        .iter()
+        .filter(|task| {
+            task.id != current.id
+                && task.repo_id == current.repo_id
+                && matches!(task.state, TaskState::AwaitingMerge | TaskState::Merged)
+        })
+        .filter_map(|task| {
+            let branch = task.branch_name.as_deref()?.trim();
+            if branch.is_empty() {
+                return None;
+            }
+            Some((task.updated_at, task.created_at, task.id.0.as_str(), branch))
+        })
+        .min_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(right.2))
+        })
+        .map(|(_, _, _, branch)| branch.to_string())
+}
+
 fn render_verify_failure_summary(result: &orch_verify::VerifyResult) -> String {
     if result.commands.is_empty() {
         return "verification failed without command output".to_string();
@@ -729,8 +781,11 @@ fn synthetic_draft_pr_url(task_id: &TaskId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_branch_name, synthetic_draft_pr_url, task_runtime_path};
-    use chrono::Utc;
+    use super::{
+        default_branch_name, select_submit_stack_anchor_branch, synthetic_draft_pr_url,
+        task_runtime_path,
+    };
+    use chrono::{Duration, Utc};
     use orch_core::config::{
         NixConfig, RepoConfig, RepoGraphiteConfig, VerifyCommands, VerifyConfig,
     };
@@ -789,6 +844,40 @@ mod tests {
         }
     }
 
+    fn task_with_state_and_times(
+        id: &str,
+        repo_id: &str,
+        state: TaskState,
+        branch_name: Option<&str>,
+        created_at: chrono::DateTime<Utc>,
+        updated_at: chrono::DateTime<Utc>,
+    ) -> Task {
+        Task {
+            id: TaskId(id.to_string()),
+            repo_id: RepoId(repo_id.to_string()),
+            title: "task".to_string(),
+            state,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: branch_name.map(|value| value.to_string()),
+            worktree_path: PathBuf::from(format!(".orch/wt/{id}")),
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at,
+            updated_at,
+        }
+    }
+
     #[test]
     fn default_branch_name_uses_task_prefix() {
         let task = task_with_worktree("T77", PathBuf::from(".orch/wt/T77"));
@@ -831,5 +920,73 @@ mod tests {
         assert_eq!(task_runtime_path(&task, &cfg), base);
 
         let _ = fs::remove_dir_all(cfg.repo_path);
+    }
+
+    #[test]
+    fn select_submit_stack_anchor_branch_uses_oldest_completed_peer_in_repo() {
+        let now = Utc::now();
+        let current = task_with_state_and_times(
+            "T2",
+            "example",
+            TaskState::Submitting,
+            Some("task/T2"),
+            now,
+            now,
+        );
+        let first_done = task_with_state_and_times(
+            "T1",
+            "example",
+            TaskState::AwaitingMerge,
+            Some("task/T1"),
+            now - Duration::minutes(5),
+            now - Duration::minutes(3),
+        );
+        let newer_done = task_with_state_and_times(
+            "T3",
+            "example",
+            TaskState::AwaitingMerge,
+            Some("task/T3"),
+            now - Duration::minutes(2),
+            now - Duration::minutes(1),
+        );
+
+        let anchor =
+            select_submit_stack_anchor_branch(&[current.clone(), newer_done, first_done], &current);
+        assert_eq!(anchor.as_deref(), Some("task/T1"));
+    }
+
+    #[test]
+    fn select_submit_stack_anchor_branch_ignores_other_repos_and_missing_branches() {
+        let now = Utc::now();
+        let current = task_with_state_and_times(
+            "T2",
+            "example",
+            TaskState::Submitting,
+            Some("task/T2"),
+            now,
+            now,
+        );
+        let wrong_repo = task_with_state_and_times(
+            "T9",
+            "other",
+            TaskState::AwaitingMerge,
+            Some("task/T9"),
+            now - Duration::minutes(5),
+            now - Duration::minutes(5),
+        );
+        let empty_branch = task_with_state_and_times(
+            "T8",
+            "example",
+            TaskState::AwaitingMerge,
+            Some(""),
+            now - Duration::minutes(4),
+            now - Duration::minutes(4),
+        );
+
+        let anchor = select_submit_stack_anchor_branch(
+            &[current.clone(), wrong_repo, empty_branch],
+            &current,
+        );
+        assert!(anchor.is_none());
     }
 }
