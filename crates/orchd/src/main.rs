@@ -1363,18 +1363,39 @@ fn execute_tui_action(
             }
         }
         UiAction::TriggerRestack => {
-            let _ = service.start_restack(
-                &selected_task_id,
-                orchd::StartRestackEventIds {
-                    restack_state_changed: tui_event_id(&selected_task_id, "RESTACK-S", at),
-                    restack_started: tui_event_id(&selected_task_id, "RESTACK-E", at),
-                },
-                at,
-            )?;
-            TuiActionOutcome {
-                message: format!("started restack for {}", selected_task_id.0),
-                force_tick: true,
-                events: Vec::new(),
+            if task.state == TaskState::RestackConflict {
+                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                let _ = service.start_submit(
+                    &selected_task_id,
+                    mode,
+                    orchd::StartSubmitEventIds {
+                        submit_state_changed: tui_event_id(&selected_task_id, "RESTACK-SUBMIT-S", at),
+                        submit_started: tui_event_id(&selected_task_id, "RESTACK-SUBMIT-E", at),
+                    },
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!(
+                        "restack conflict on {}; started graphite submit ({mode:?})",
+                        selected_task_id.0
+                    ),
+                    force_tick: true,
+                    events: Vec::new(),
+                }
+            } else {
+                let _ = service.start_restack(
+                    &selected_task_id,
+                    orchd::StartRestackEventIds {
+                        restack_state_changed: tui_event_id(&selected_task_id, "RESTACK-S", at),
+                        restack_started: tui_event_id(&selected_task_id, "RESTACK-E", at),
+                    },
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("started restack for {}", selected_task_id.0),
+                    force_tick: true,
+                    events: Vec::new(),
+                }
             }
         }
         UiAction::MarkNeedsHuman => {
@@ -3703,6 +3724,12 @@ submit_mode = "single"
         }
     }
 
+    fn mk_task_with_state(task_id: &str, state: TaskState) -> Task {
+        let mut task = mk_reviewing_task(task_id);
+        task.state = state;
+        task
+    }
+
     fn mk_service(root: &Path) -> OrchdService {
         let sqlite = root.join("state.sqlite");
         let events = root.join("events");
@@ -3819,6 +3846,62 @@ submit_mode = "single"
         assert_eq!(tasks[0].preferred_model, Some(ModelKind::Claude));
         assert_eq!(agent_supervisor.pending_start_by_task.len(), 1);
         assert!(agent_supervisor.pending_start_by_task.contains_key(&tasks[0].id.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_tui_action_trigger_restack_submits_when_task_in_restack_conflict() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-restack-submit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let task = mk_task_with_state("T-RESTACK-CONFLICT", TaskState::RestackConflict);
+        service
+            .create_task(
+                &task,
+                &super::Event {
+                    id: EventId("E-TEST-RESTACK-SUBMIT-CREATE".to_string()),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                },
+            )
+            .expect("create task");
+        let repo_configs = HashMap::new();
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
+
+        let outcome = execute_tui_action(
+            UiAction::TriggerRestack,
+            Some(&task.id),
+            None,
+            None,
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
+            Utc::now(),
+        )
+        .expect("trigger restack action");
+
+        assert!(outcome.force_tick);
+        assert!(outcome.message.contains("started graphite submit"));
+
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = service.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SubmitStarted { .. })));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -2361,6 +2361,44 @@ mod tests {
     }
 
     #[test]
+    fn start_submit_transitions_restack_conflict_to_submitting_and_emits_started() {
+        let svc = mk_service();
+        let task = mk_task("TSSTART4", TaskState::RestackConflict, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Stack,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART4-STATE".to_string()),
+                    submit_started: EventId("E-SSTART4-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start submit");
+
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RESTACK_CONFLICT" && to == "SUBMITTING"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::SubmitStarted {
+                    mode: SubmitMode::Stack
+                }
+            )
+        }));
+    }
+
+    #[test]
     fn mark_needs_human_transitions_and_emits_reason_event() {
         let svc = mk_service();
         let task = mk_task("TNH1", TaskState::Running, &[]);

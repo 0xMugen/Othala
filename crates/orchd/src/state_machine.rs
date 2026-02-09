@@ -48,7 +48,7 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
                 | Paused,
         ) => true,
         (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
-        (RestackConflict, Restacking | NeedsHuman | Failed | Paused) => true,
+        (RestackConflict, Restacking | NeedsHuman | Submitting | Failed | Paused) => true,
         (VerifyingQuick, Reviewing | Running | Failed | NeedsHuman | Paused) => true,
         (
             VerifyingFull,
@@ -188,6 +188,10 @@ mod tests {
         assert!(is_transition_allowed(TaskState::Running, TaskState::Paused));
         assert!(is_transition_allowed(
             TaskState::Running,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::RestackConflict,
             TaskState::Submitting
         ));
         assert!(is_transition_allowed(

@@ -403,7 +403,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ("r", "restart"),
             ("q", "quick"),
             ("f", "full"),
-            ("t", "restack"),
+            ("t", "restack/submit"),
             ("n", "human"),
             ("w", "web"),
             ("p", "pause"),
