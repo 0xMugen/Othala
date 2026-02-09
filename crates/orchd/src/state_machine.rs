@@ -60,7 +60,7 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (AwaitingMerge, VerifyingFull | Merged | Running | Failed | Paused) => true,
         (NeedsHuman, Running | Paused | Failed) => true,
         (Paused, Running | Failed) => true,
-        (Failed, Running | Paused) => true,
+        (Failed, Running | Submitting | Paused) => true,
         _ => false,
     }
 }
@@ -192,6 +192,10 @@ mod tests {
         ));
         assert!(is_transition_allowed(
             TaskState::RestackConflict,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Failed,
             TaskState::Submitting
         ));
         assert!(is_transition_allowed(

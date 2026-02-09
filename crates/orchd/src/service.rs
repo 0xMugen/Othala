@@ -2399,6 +2399,44 @@ mod tests {
     }
 
     #[test]
+    fn start_submit_transitions_failed_to_submitting_and_emits_started() {
+        let svc = mk_service();
+        let task = mk_task("TSSTART5", TaskState::Failed, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Single,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART5-STATE".to_string()),
+                    submit_started: EventId("E-SSTART5-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start submit");
+
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "FAILED" && to == "SUBMITTING"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::SubmitStarted {
+                    mode: SubmitMode::Single
+                }
+            )
+        }));
+    }
+
+    #[test]
     fn mark_needs_human_transitions_and_emits_reason_event() {
         let svc = mk_service();
         let task = mk_task("TNH1", TaskState::Running, &[]);

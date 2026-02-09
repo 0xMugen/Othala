@@ -1363,7 +1363,7 @@ fn execute_tui_action(
             }
         }
         UiAction::TriggerRestack => {
-            if task.state == TaskState::RestackConflict {
+            if task.state == TaskState::RestackConflict || task.state == TaskState::Failed {
                 let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
                 let _ = service.start_submit(
                     &selected_task_id,
@@ -1376,8 +1376,10 @@ fn execute_tui_action(
                 )?;
                 TuiActionOutcome {
                     message: format!(
-                        "restack conflict on {}; started graphite submit ({mode:?})",
+                        "task {} in {}; started graphite submit ({mode:?})",
                         selected_task_id.0
+                        ,
+                        orchd::task_state_tag(task.state)
                     ),
                     force_tick: true,
                     events: Vec::new(),
@@ -3865,6 +3867,62 @@ submit_mode = "single"
                 &task,
                 &super::Event {
                     id: EventId("E-TEST-RESTACK-SUBMIT-CREATE".to_string()),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                },
+            )
+            .expect("create task");
+        let repo_configs = HashMap::new();
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
+
+        let outcome = execute_tui_action(
+            UiAction::TriggerRestack,
+            Some(&task.id),
+            None,
+            None,
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
+            Utc::now(),
+        )
+        .expect("trigger restack action");
+
+        assert!(outcome.force_tick);
+        assert!(outcome.message.contains("started graphite submit"));
+
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = service.task_events(&task.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SubmitStarted { .. })));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_tui_action_trigger_restack_submits_when_task_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-failed-submit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let task = mk_task_with_state("T-FAILED-SUBMIT", TaskState::Failed);
+        service
+            .create_task(
+                &task,
+                &super::Event {
+                    id: EventId("E-TEST-FAILED-SUBMIT-CREATE".to_string()),
                     task_id: Some(task.id.clone()),
                     repo_id: Some(task.repo_id.clone()),
                     at: Utc::now(),
