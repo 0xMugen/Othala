@@ -20,8 +20,8 @@ use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_git::{discover_repo, GitCli, GitError, WorktreeManager};
 use orch_graphite::GraphiteClient;
 use orch_tui::{
-    effective_display_state, normalize_pane_line, run_tui_with_hook, AgentPane, AgentPaneStatus,
-    TuiApp, TuiError, TuiEvent, UiAction,
+    normalize_pane_line, run_tui_with_hook, AgentPane, AgentPaneStatus, TuiApp, TuiError, TuiEvent,
+    UiAction,
 };
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -2521,8 +2521,8 @@ fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
         return;
     };
 
-    let task = match service.task(&task_id) {
-        Ok(Some(task)) => task,
+    match service.task(&task_id) {
+        Ok(Some(_)) => {}
         Ok(None) => {
             app.state.selected_task_activity = vec![format!("task {} not found", task_id.0)];
             return;
@@ -2532,7 +2532,7 @@ fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
                 vec![format!("failed to load task {}: {err}", task_id.0)];
             return;
         }
-    };
+    }
 
     let events = match service.task_events(&task_id) {
         Ok(events) => events,
@@ -2543,72 +2543,14 @@ fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
         }
     };
 
-    let approvals = match service.task_approvals(&task_id) {
-        Ok(approvals) => approvals,
-        Err(err) => {
-            app.state.selected_task_activity =
-                vec![format!("failed to load approvals for {}: {err}", task_id.0)];
-            return;
-        }
-    };
-
-    app.state.selected_task_activity = build_task_activity_lines(&task, &events, &approvals);
+    app.state.selected_task_activity = build_task_activity_lines(&events);
 }
 
-fn build_task_activity_lines(
-    task: &Task,
-    events: &[Event],
-    approvals: &[orch_core::types::TaskApproval],
-) -> Vec<String> {
+fn build_task_activity_lines(events: &[Event]) -> Vec<String> {
     let mut lines = Vec::new();
-    let display_state = effective_display_state(task.state, &task.verify_status);
-    lines.push(format!(
-        "task={} state={} repo={}",
-        task.id.0, display_state, task.repo_id.0,
-    ));
-    lines.push(format!("title={}", task.title));
-    lines.push(format!(
-        "branch={}",
-        task.branch_name.as_deref().unwrap_or("-")
-    ));
-    if let Some(pr) = &task.pr {
-        lines.push(format!(
-            "pr=#{} draft={} url={}",
-            pr.number, pr.draft, pr.url
-        ));
-    }
-    lines.push(format!(
-        "verify={} review={}/{} unanimous={} cap={:?}",
-        verify_summary(&task.verify_status),
-        task.review_status.approvals_received,
-        task.review_status.approvals_required,
-        task.review_status.unanimous,
-        task.review_status.capacity_state
-    ));
-    lines.push("".to_string());
-    lines.push("approvals:".to_string());
-    if approvals.is_empty() {
-        lines.push("  - none".to_string());
-    } else {
-        let mut sorted = approvals.to_vec();
-        sorted.sort_by_key(|approval| approval.issued_at);
-        sorted.reverse();
-        for approval in sorted {
-            lines.push(format!(
-                "  - {} {:?} at {}",
-                model_kind_tag(&approval.reviewer),
-                approval.verdict,
-                format_ts(approval.issued_at)
-            ));
-        }
-    }
-
-    lines.push("".to_string());
-    lines.push("events (latest first):".to_string());
     for event in events.iter().rev().take(24) {
         append_event_lines(&mut lines, event);
     }
-
     lines
 }
 
@@ -2666,19 +2608,6 @@ fn append_event_lines(lines: &mut Vec<String>, event: &Event) {
                 output.graphite_hygiene.ok,
                 output.test_assessment.ok
             ));
-            for issue in output.issues.iter().take(3) {
-                let line = issue
-                    .line
-                    .map(|line| line.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                lines.push(format!(
-                    "    issue {:?} {}:{} {}",
-                    issue.severity, issue.file, line, issue.description
-                ));
-            }
-            if !output.risk_flags.is_empty() {
-                lines.push(format!("    risks {}", output.risk_flags.join(",")));
-            }
         }
         EventKind::ReadyReached => {
             lines.push(format!("{ts} ready reached"));
@@ -2694,17 +2623,6 @@ fn append_event_lines(lines: &mut Vec<String>, event: &Event) {
         }
         EventKind::Error { code, message } => {
             lines.push(format!("{ts} error code={code} msg={message}"));
-        }
-    }
-}
-
-fn verify_summary(status: &VerifyStatus) -> String {
-    match status {
-        VerifyStatus::NotRun => "not_run".to_string(),
-        VerifyStatus::Running { tier } => format!("running:{tier:?}").to_ascii_lowercase(),
-        VerifyStatus::Passed { tier } => format!("passed:{tier:?}").to_ascii_lowercase(),
-        VerifyStatus::Failed { tier, summary } => {
-            format!("failed:{tier:?}:{}", summary.replace('\n', " ")).to_ascii_lowercase()
         }
     }
 }
@@ -5248,7 +5166,7 @@ Fix flaky task scheduling by debouncing tick updates";
     }
 
     #[test]
-    fn build_task_activity_lines_contains_review_details_from_events() {
+    fn build_task_activity_lines_keeps_compact_event_lines() {
         let task = mk_reviewing_task("T-LINES");
         let event = Event {
             id: EventId("E-LINES".to_string()),
@@ -5278,20 +5196,11 @@ Fix flaky task scheduling by debouncing tick updates";
                 },
             },
         };
-        let approval = orch_core::types::TaskApproval {
-            task_id: task.id.clone(),
-            reviewer: ModelKind::Codex,
-            verdict: ReviewVerdict::RequestChanges,
-            issued_at: Utc::now(),
-        };
-
-        let lines = build_task_activity_lines(&task, &[event], &[approval]);
+        let lines = build_task_activity_lines(&[event]);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("approvals:"));
-        assert!(rendered.contains("events (latest first):"));
         assert!(rendered.contains("review codex verdict=RequestChanges"));
-        assert!(rendered.contains("issue High src/lib.rs:42 fix logic"));
-        assert!(rendered.contains("risks API_BREAK"));
+        assert!(!rendered.contains("issue High src/lib.rs:42 fix logic"));
+        assert!(!rendered.contains("risks API_BREAK"));
     }
 
     #[test]
