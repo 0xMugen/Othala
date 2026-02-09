@@ -8,6 +8,7 @@ use crate::error::GraphiteError;
 pub enum AllowedAutoCommand {
     Create,
     Restack,
+    Sync,
     AddAllForConflict,
     ContinueConflict,
     LogShort,
@@ -113,7 +114,16 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
                     !branch.trim().is_empty() && !branch.starts_with('-')
                 }
         }
-        AllowedAutoCommand::Restack => args.len() == 1 && arg_eq(args, 0, "restack"),
+        AllowedAutoCommand::Restack => {
+            args.len() == 2 && arg_eq(args, 0, "restack") && arg_eq(args, 1, "--no-interactive")
+        }
+        AllowedAutoCommand::Sync => {
+            args.len() == 4
+                && arg_eq(args, 0, "sync")
+                && arg_eq(args, 1, "--no-restack")
+                && arg_eq(args, 2, "--force")
+                && arg_eq(args, 3, "--no-interactive")
+        }
         AllowedAutoCommand::AddAllForConflict => {
             args.len() == 2 && arg_eq(args, 0, "add") && arg_eq(args, 1, "-A")
         }
@@ -136,15 +146,14 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
                 && arg_eq(args, 3, "--no-interactive")
         }
         AllowedAutoCommand::RepoInit => {
-            args.len() == 5
-                && arg_eq(args, 0, "repo")
-                && arg_eq(args, 1, "init")
-                && arg_eq(args, 2, "--trunk")
+            args.len() == 4
+                && arg_eq(args, 0, "init")
+                && arg_eq(args, 1, "--trunk")
                 && {
-                    let trunk = arg_at(args, 3);
+                    let trunk = arg_at(args, 2);
                     !trunk.trim().is_empty() && !trunk.starts_with('-')
                 }
-                && arg_eq(args, 4, "--no-interactive")
+                && arg_eq(args, 3, "--no-interactive")
         }
     };
 
@@ -195,7 +204,11 @@ mod tests {
             &os(&["create", "-m", "my message", "--no-interactive", "task/T1"])
         )
         .is_ok());
-        assert!(validate_contract(AllowedAutoCommand::Restack, &os(&["restack"])).is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Restack,
+            &os(&["restack", "--no-interactive"])
+        )
+        .is_ok());
         assert!(
             validate_contract(AllowedAutoCommand::AddAllForConflict, &os(&["add", "-A"])).is_ok()
         );
@@ -216,7 +229,12 @@ mod tests {
         .is_ok());
         assert!(validate_contract(
             AllowedAutoCommand::RepoInit,
-            &os(&["repo", "init", "--trunk", "main", "--no-interactive"])
+            &os(&["init", "--trunk", "main", "--no-interactive"])
+        )
+        .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Sync,
+            &os(&["sync", "--no-restack", "--force", "--no-interactive"])
         )
         .is_ok());
     }
@@ -242,8 +260,16 @@ mod tests {
         .expect_err("create branch must not be flag-like");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
-        let err = validate_contract(AllowedAutoCommand::Restack, &os(&["restack", "--stack"]))
-            .expect_err("restack extra args should fail");
+        // Old-style restack (missing --no-interactive) must fail
+        let err = validate_contract(AllowedAutoCommand::Restack, &os(&["restack"]))
+            .expect_err("old-style restack without --no-interactive should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(
+            AllowedAutoCommand::Restack,
+            &os(&["restack", "--no-interactive", "--stack"]),
+        )
+        .expect_err("restack extra args should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
         // Old-style submit (missing --no-edit --no-interactive) must fail
@@ -258,7 +284,7 @@ mod tests {
         // RepoInit rejects empty trunk
         let err = validate_contract(
             AllowedAutoCommand::RepoInit,
-            &os(&["repo", "init", "--trunk", "", "--no-interactive"]),
+            &os(&["init", "--trunk", "", "--no-interactive"]),
         )
         .expect_err("empty trunk should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));

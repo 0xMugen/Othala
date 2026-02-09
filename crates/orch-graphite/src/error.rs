@@ -8,7 +8,7 @@ pub enum GraphiteError {
         #[source]
         source: std::io::Error,
     },
-    #[error("graphite command returned non-zero exit ({command}) status={status:?}")]
+    #[error("{}", format_command_failed(.command, .status, .stdout, .stderr))]
     CommandFailed {
         command: String,
         status: Option<i32>,
@@ -26,6 +26,27 @@ pub enum GraphiteError {
     ContractViolation { message: String },
     #[error("unable to parse graphite output: {message}")]
     Parse { message: String },
+}
+
+fn format_command_failed(
+    command: &str,
+    status: &Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let base = format!("graphite command returned non-zero exit ({command}) status={status:?}");
+    let combined = [stderr.trim(), stdout.trim()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if combined.is_empty() {
+        base
+    } else {
+        let snippet: String = combined.chars().take(400).collect();
+        format!("{base}: {snippet}")
+    }
 }
 
 impl GraphiteError {

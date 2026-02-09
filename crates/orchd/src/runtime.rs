@@ -498,6 +498,10 @@ impl RuntimeEngine {
             }
         };
 
+        // Sync trunk from remote before submitting so gt submit sees an up-to-date trunk.
+        let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
+        let _ = repo_client.sync_trunk();
+
         let runtime_path = task_runtime_path(task, repo_config);
         let mode = repo_config.graphite.submit_mode.unwrap_or(task.submit_mode);
         let client = GraphiteClient::new(runtime_path);
