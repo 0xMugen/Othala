@@ -1,12 +1,76 @@
 use chrono::{DateTime, Local, Utc};
+use orch_core::state::TaskState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, TaskOverviewRow};
+use crate::model::{AgentPane, AgentPaneStatus, TaskOverviewRow};
+
+// -- Color palette ----------------------------------------------------------
+
+const ACCENT: Color = Color::Cyan;
+const HEADER_FG: Color = Color::White;
+const HEADER_TITLE: Color = Color::Cyan;
+const DIM: Color = Color::DarkGray;
+const SELECTED_BG: Color = Color::Indexed(236); // dark gray background
+const BORDER_NORMAL: Color = Color::DarkGray;
+const BORDER_FOCUSED: Color = Color::Cyan;
+const KEY_FG: Color = Color::Yellow;
+const MUTED: Color = Color::Gray;
+
+fn state_color(state: TaskState) -> Color {
+    match state {
+        TaskState::Running | TaskState::VerifyingQuick | TaskState::VerifyingFull => Color::Green,
+        TaskState::Ready | TaskState::Merged => Color::Cyan,
+        TaskState::Submitting | TaskState::AwaitingMerge => Color::Blue,
+        TaskState::Reviewing | TaskState::DraftPrOpen => Color::Magenta,
+        TaskState::NeedsHuman | TaskState::RestackConflict => Color::Yellow,
+        TaskState::Failed => Color::Red,
+        TaskState::Paused => Color::DarkGray,
+        TaskState::Queued | TaskState::Initializing | TaskState::Restacking => Color::White,
+    }
+}
+
+fn pane_status_color(status: AgentPaneStatus) -> Color {
+    match status {
+        AgentPaneStatus::Starting => Color::Yellow,
+        AgentPaneStatus::Running => Color::Green,
+        AgentPaneStatus::Waiting => Color::Magenta,
+        AgentPaneStatus::Exited => Color::DarkGray,
+        AgentPaneStatus::Failed => Color::Red,
+    }
+}
+
+fn normal_block(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER_NORMAL))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn focused_block(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(BORDER_FOCUSED)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+}
+
+// -- Layout -----------------------------------------------------------------
 
 pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     let root = Layout::default()
@@ -36,6 +100,8 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     render_footer(frame, root[2], app);
 }
 
+// -- Header -----------------------------------------------------------------
+
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let selected_task = app
         .state
@@ -48,46 +114,71 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .map(|pane| pane.instance_id.as_str())
         .unwrap_or("-");
 
-    let line = format!(
-        "Othala Command Center | tasks={} panes={} selected_task={} selected_pane={}",
-        app.state.tasks.len(),
-        app.state.panes.len(),
-        selected_task,
-        selected_pane
-    );
+    let line = Line::from(vec![
+        Span::styled(
+            " Othala ",
+            Style::default()
+                .fg(HEADER_TITLE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" tasks:", Style::default().fg(DIM)),
+        Span::styled(
+            format!("{}", app.state.tasks.len()),
+            Style::default().fg(HEADER_FG),
+        ),
+        Span::styled("  panes:", Style::default().fg(DIM)),
+        Span::styled(
+            format!("{}", app.state.panes.len()),
+            Style::default().fg(HEADER_FG),
+        ),
+        Span::styled("  task:", Style::default().fg(DIM)),
+        Span::styled(selected_task, Style::default().fg(ACCENT)),
+        Span::styled("  pane:", Style::default().fg(DIM)),
+        Span::styled(selected_pane, Style::default().fg(ACCENT)),
+    ]);
+
     let widget = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title("Overview"))
+        .block(normal_block("Overview"))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
 
+// -- Task list --------------------------------------------------------------
+
 fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
-    lines.push(Line::from(
-        "repo | task | branch | state | verify | review | last_activity",
-    ));
-    lines.push(Line::from(
-        "----------------------------------------------------------------",
-    ));
+
+    let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+    lines.push(Line::from(Span::styled(
+        " repo | task | branch | state | verify | review | activity",
+        header_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        String::from_utf8(vec![b'\xe2', b'\x94', b'\x80'])
+            .unwrap_or_else(|_| "-".to_string())
+            .repeat(area.width.saturating_sub(2) as usize),
+        Style::default().fg(DIM),
+    )));
 
     for (idx, task) in app.state.tasks.iter().enumerate() {
-        let prefix = if idx == app.state.selected_task_idx {
-            ">"
-        } else {
-            " "
-        };
-        lines.push(Line::from(format_task_row(prefix, task)));
+        let is_selected = idx == app.state.selected_task_idx;
+        lines.push(format_task_row(is_selected, task));
     }
 
     if app.state.tasks.is_empty() {
-        lines.push(Line::from("no tasks"));
+        lines.push(Line::from(Span::styled(
+            " no tasks",
+            Style::default().fg(DIM),
+        )));
     }
 
     let widget = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Tasks"))
+        .block(normal_block("Tasks"))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
+
+// -- Pane summary -----------------------------------------------------------
 
 fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let panes = Layout::default()
@@ -97,7 +188,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let pane_tabs = format_pane_tabs(app);
     let tabs = Paragraph::new(pane_tabs)
-        .block(Block::default().borders(Borders::ALL).title("Agent Panes"))
+        .block(normal_block("Agent Panes"))
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
@@ -109,7 +200,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ),
             pane.tail(20)
                 .into_iter()
-                .map(Line::from)
+                .map(|s| Line::from(Span::styled(s, Style::default().fg(MUTED))))
                 .collect::<Vec<_>>(),
         )
     } else {
@@ -119,23 +210,28 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .map(|task| task.task_id.0.clone())
             .unwrap_or_else(|| "-".to_string());
         let lines = if app.state.selected_task_activity.is_empty() {
-            vec![Line::from("no task activity yet")]
+            vec![Line::from(Span::styled(
+                "no task activity yet",
+                Style::default().fg(DIM),
+            ))]
         } else {
             app.state
                 .selected_task_activity
                 .iter()
                 .cloned()
-                .map(Line::from)
+                .map(|s| Line::from(Span::styled(s, Style::default().fg(MUTED))))
                 .collect::<Vec<_>>()
         };
         (format!("Task Activity ({selected_task})"), lines)
     };
 
     let output = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(normal_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(output, panes[1]);
 }
+
+// -- Focused views ----------------------------------------------------------
 
 fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let pane = app
@@ -162,12 +258,7 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
 
     let widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().add_modifier(Modifier::BOLD)),
-        )
+        .block(focused_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -190,105 +281,169 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .collect()
     };
 
+    let title = format!("Task Detail ({selected_task})");
     let widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Task Detail ({selected_task})"))
-                .border_style(Style::default().add_modifier(Modifier::BOLD)),
-        )
+        .block(focused_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
 
+// -- Footer -----------------------------------------------------------------
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let (title, line) = if let Some((models, selected)) = app.model_select_display() {
-        let picker = models
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                if i == selected {
-                    format!("[{m:?}]")
-                } else {
-                    format!(" {m:?} ")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        (
-            "Select Model",
-            format!(
-                "model: {}  (Up/Down=cycle Enter=confirm Esc=cancel)",
-                picker
-            ),
-        )
+    let line = if let Some((models, selected)) = app.model_select_display() {
+        let mut spans = vec![Span::styled(" model: ", Style::default().fg(DIM))];
+        for (i, m) in models.iter().enumerate() {
+            if i == selected {
+                spans.push(Span::styled(
+                    format!(" {m:?} "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(format!(" {m:?} "), Style::default().fg(MUTED)));
+            }
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            " Up/Down=cycle Enter=confirm Esc=cancel",
+            Style::default().fg(DIM),
+        ));
+        Line::from(spans)
     } else if let Some(prompt) = app.input_prompt() {
-        (
-            "New Chat",
-            format!("prompt: {}_ (Enter=submit Esc=cancel)", prompt),
-        )
-    } else {
-        (
-            "Actions",
-            format!(
-                "c=new-chat a=approve s=start x=stop r=restart q=quick f=full t=restack n=needs-human w=web p=pause u=resume | arrows=select tab=focus enter=detail esc/ctrl-c=quit | {}",
-                app.state.status_line
+        Line::from(vec![
+            Span::styled(" prompt: ", Style::default().fg(DIM)),
+            Span::styled(prompt, Style::default().fg(HEADER_FG)),
+            Span::styled("_", Style::default().fg(ACCENT)),
+            Span::styled(
+                "  Enter=submit Esc=cancel",
+                Style::default().fg(DIM),
             ),
-        )
+        ])
+    } else {
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        spans.push(Span::raw(" "));
+        let keys: &[(&str, &str)] = &[
+            ("c", "chat"),
+            ("a", "approve"),
+            ("s", "start"),
+            ("x", "stop"),
+            ("r", "restart"),
+            ("q", "quick"),
+            ("f", "full"),
+            ("t", "restack"),
+            ("n", "human"),
+            ("w", "web"),
+            ("p", "pause"),
+            ("u", "resume"),
+        ];
+        for (key, label) in keys {
+            spans.push(Span::styled(*key, Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!("={label} "), Style::default().fg(MUTED)));
+        }
+        spans.push(Span::styled(
+            "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
+            Style::default().fg(DIM),
+        ));
+        if !app.state.status_line.is_empty() {
+            spans.push(Span::styled(
+                format!(" | {}", app.state.status_line),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        Line::from(spans)
     };
+
+    let title = if app.model_select_display().is_some() {
+        "Select Model"
+    } else if app.input_prompt().is_some() {
+        "New Chat"
+    } else {
+        "Actions"
+    };
+
     let widget = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(normal_block(title))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
 
-fn format_task_row(prefix: &str, task: &TaskOverviewRow) -> String {
+// -- Formatting helpers -----------------------------------------------------
+
+fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
-    format!(
-        "{} {} | {} | {} | {:?} | {} | {} | {}",
-        prefix,
-        task.repo_id.0,
-        task.task_id.0,
-        task.branch,
-        task.state,
-        task.verify_summary,
-        task.review_summary,
-        ts
-    )
+    let state_label = format!("{:?}", task.state);
+    let sc = state_color(task.state);
+
+    let base_style = if is_selected {
+        Style::default().bg(SELECTED_BG).fg(Color::White)
+    } else {
+        Style::default().fg(MUTED)
+    };
+
+    let prefix = if is_selected { "\u{25B6} " } else { "  " };
+
+    Line::from(vec![
+        Span::styled(prefix, if is_selected { Style::default().fg(ACCENT) } else { Style::default().fg(DIM) }),
+        Span::styled(&task.repo_id.0, base_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(&task.task_id.0, if is_selected { Style::default().fg(Color::White).add_modifier(Modifier::BOLD).bg(SELECTED_BG) } else { Style::default().fg(Color::White) }),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(&task.branch, base_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(state_label, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(&task.verify_summary, base_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(&task.review_summary, base_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(ts, Style::default().fg(DIM)),
+    ])
 }
 
-fn format_pane_tabs(app: &TuiApp) -> String {
+fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
     if app.state.panes.is_empty() {
-        return "none".to_string();
+        return Line::from(Span::styled(" none", Style::default().fg(DIM)));
     }
 
-    let mut out = String::new();
+    let mut spans = Vec::new();
+    spans.push(Span::raw(" "));
     for (idx, pane) in app.state.panes.iter().enumerate() {
         if idx > 0 {
-            out.push_str(" | ");
+            spans.push(Span::styled(" | ", Style::default().fg(DIM)));
         }
-        if idx == app.state.selected_pane_idx {
-            out.push('*');
+        let is_selected = idx == app.state.selected_pane_idx;
+        let tag = pane_status_tag(pane);
+        let sc = pane_status_color(pane.status);
+
+        let label = format!("{}:{}", idx + 1, pane.instance_id);
+        if is_selected {
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
         } else {
-            out.push(' ');
+            spans.push(Span::styled(label, Style::default().fg(MUTED)));
         }
-        out.push_str(&format!(
-            "{}:{}:{}",
-            idx + 1,
-            pane.instance_id,
-            pane_status_tag(pane)
+        spans.push(Span::styled(
+            format!(":{tag}"),
+            Style::default().fg(sc),
         ));
     }
-    out
+    Line::from(spans)
 }
 
 fn pane_status_tag(pane: &AgentPane) -> &'static str {
     match pane.status {
-        crate::model::AgentPaneStatus::Starting => "starting",
-        crate::model::AgentPaneStatus::Running => "running",
-        crate::model::AgentPaneStatus::Waiting => "waiting",
-        crate::model::AgentPaneStatus::Exited => "exited",
-        crate::model::AgentPaneStatus::Failed => "failed",
+        AgentPaneStatus::Starting => "starting",
+        AgentPaneStatus::Running => "running",
+        AgentPaneStatus::Waiting => "waiting",
+        AgentPaneStatus::Exited => "exited",
+        AgentPaneStatus::Failed => "failed",
     }
 }
 
@@ -347,7 +502,9 @@ mod tests {
     #[test]
     fn format_pane_tabs_handles_empty_and_selected_pane() {
         let mut app = TuiApp::default();
-        assert_eq!(format_pane_tabs(&app), "none");
+        let tabs = format_pane_tabs(&app);
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.trim(), "none");
 
         app.state.panes = vec![
             AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex),
@@ -358,18 +515,27 @@ mod tests {
         app.state.selected_pane_idx = 1;
 
         let tabs = format_pane_tabs(&app);
-        assert_eq!(tabs, " 1:A1:running | *2:A2:waiting");
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1:A1"));
+        assert!(text.contains(":running"));
+        assert!(text.contains("2:A2"));
+        assert!(text.contains(":waiting"));
     }
 
     #[test]
     fn format_task_row_includes_expected_columns() {
         let row = mk_row("T9");
-        let output = format_task_row(">", &row);
+        let line = format_task_row(true, &row);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         let expected_ts = to_local_time(row.last_activity);
 
-        assert!(output.contains("> example | T9 | task/T9 | Running"));
-        assert!(output.contains("| not_run | 0/0 unanimous=false cap=ok |"));
-        assert!(output.ends_with(&expected_ts));
+        assert!(text.contains("example"));
+        assert!(text.contains("T9"));
+        assert!(text.contains("task/T9"));
+        assert!(text.contains("Running"));
+        assert!(text.contains("not_run"));
+        assert!(text.contains("0/0 unanimous=false cap=ok"));
+        assert!(text.contains(&expected_ts));
     }
 
     #[test]
@@ -401,6 +567,9 @@ mod tests {
             state,
             ..TuiApp::default()
         };
-        assert_eq!(format_pane_tabs(&app), "*1:A1:starting");
+        let tabs = format_pane_tabs(&app);
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1:A1"));
+        assert!(text.contains(":starting"));
     }
 }
