@@ -341,6 +341,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 action.task_id.as_ref(),
                 action.prompt.as_deref(),
                 action.model,
+                app.mayhem_mode,
                 &service,
                 &org,
                 &enabled_models,
@@ -459,18 +460,62 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
                 apply_stopped_agent_session_event(app, stopped, "patch_ready");
             }
-            let _ = service.mark_patch_ready(&task_id);
-            match try_auto_submit(&service, &task_id, &repo_config_by_id, "SIG", at) {
-                Ok(true) => {
-                    signal_tick_requested = true;
-                    app.state.status_line = format!("pushing {} to graphite...", task_id.0);
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    // If we can't go directly to Submitting, try routing through Running first.
+                    if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
+                        if orchd::is_transition_allowed(task.state, TaskState::Running)
+                            && orchd::is_transition_allowed(
+                                TaskState::Running,
+                                TaskState::Submitting,
+                            )
+                        {
+                            if let Err(err) = service.transition_task_state(
+                                &task_id,
+                                TaskState::Running,
+                                tui_event_id(&task_id, "SIG-PR-RUNNING", at),
+                                at,
+                            ) {
+                                app.state.status_line = format!(
+                                    "patch-ready: failed to transition {} to running: {err}",
+                                    task_id.0,
+                                );
+                                continue;
+                            }
+                        } else {
+                            app.state.status_line = format!(
+                                "patch-ready signal ignored for {} from state {}",
+                                task_id.0,
+                                orchd::task_state_tag(task.state)
+                            );
+                            continue;
+                        }
+                    }
+                    let mode =
+                        resolve_submit_mode_for_task(&task, &repo_config_by_id, app.mayhem_mode);
+                    match service.start_submit(
+                        &task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&task_id, "SIG-SUBMIT-S", at),
+                            submit_started: tui_event_id(&task_id, "SIG-SUBMIT-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            signal_tick_requested = true;
+                            app.state.status_line = format!("pushing {} to graphite...", task_id.0);
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("failed to start submit for {}: {err}", task_id.0);
+                        }
+                    }
                 }
-                Ok(false) => {
-                    // Task not found — nothing to do.
-                }
-                Err(reason) => {
+                Ok(None) => {}
+                Err(err) => {
                     app.state.status_line =
-                        format!("patch-ready auto-submit failed for {}: {reason}", task_id.0);
+                        format!("failed to load task {} for submit signal: {err}", task_id.0);
                 }
             }
         }
@@ -478,19 +523,64 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         // Bridge: clean agent exit (without explicit signal) -> submit for speed.
         for task_id in agent_supervisor.drain_completed_tasks() {
             let at = Utc::now();
-            let _ = service.mark_patch_ready(&task_id);
-            match try_auto_submit(&service, &task_id, &repo_config_by_id, "EXIT", at) {
-                Ok(true) => {
-                    signal_tick_requested = true;
-                    app.state.status_line =
-                        format!("agent completed for {}; pushing to graphite...", task_id.0);
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
+                        if orchd::is_transition_allowed(task.state, TaskState::Running)
+                            && orchd::is_transition_allowed(
+                                TaskState::Running,
+                                TaskState::Submitting,
+                            )
+                        {
+                            if let Err(err) = service.transition_task_state(
+                                &task_id,
+                                TaskState::Running,
+                                tui_event_id(&task_id, "EXIT-RUNNING", at),
+                                at,
+                            ) {
+                                app.state.status_line = format!(
+                                    "agent-complete: failed to transition {} to running: {err}",
+                                    task_id.0,
+                                );
+                                continue;
+                            }
+                        } else {
+                            app.state.status_line = format!(
+                                "agent-complete auto-submit ignored for {} from state {}",
+                                task_id.0,
+                                orchd::task_state_tag(task.state)
+                            );
+                            continue;
+                        }
+                    }
+                    let mode =
+                        resolve_submit_mode_for_task(&task, &repo_config_by_id, app.mayhem_mode);
+                    match service.start_submit(
+                        &task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&task_id, "EXIT-SUBMIT-S", at),
+                            submit_started: tui_event_id(&task_id, "EXIT-SUBMIT-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            signal_tick_requested = true;
+                            app.state.status_line = format!(
+                                "agent completed for {}; auto-started graphite submit ({mode:?})",
+                                task_id.0
+                            );
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("agent-complete submit failed for {}: {err}", task_id.0);
+                        }
+                    }
                 }
-                Ok(false) => {
-                    // Task not found — nothing to do.
-                }
-                Err(reason) => {
+                Ok(None) => {}
+                Err(err) => {
                     app.state.status_line =
-                        format!("agent-complete auto-submit failed for {}: {reason}", task_id.0);
+                        format!("failed to load task {} for agent-complete submit: {err}", task_id.0);
                 }
             }
         }
@@ -1326,46 +1416,16 @@ fn conflict_resolution_prompt(task: &Task) -> String {
 fn resolve_submit_mode_for_task(
     task: &Task,
     repo_config_by_id: &HashMap<String, RepoConfig>,
+    mayhem_mode: bool,
 ) -> SubmitMode {
+    if mayhem_mode {
+        return SubmitMode::Single;
+    }
+
     repo_config_by_id
         .get(&task.repo_id.0)
         .and_then(|cfg| cfg.graphite.submit_mode)
         .unwrap_or(task.submit_mode)
-}
-
-/// Try to auto-submit a task.
-/// Returns Ok(true) on success, Ok(false) if the task doesn't exist,
-/// or Err with a reason string on failure.
-fn try_auto_submit(
-    service: &OrchdService,
-    task_id: &TaskId,
-    repo_config_by_id: &HashMap<String, RepoConfig>,
-    event_prefix: &str,
-    at: chrono::DateTime<Utc>,
-) -> Result<bool, String> {
-    let task = match service.task(task_id) {
-        Ok(Some(task)) => task,
-        Ok(None) => return Ok(false),
-        Err(err) => return Err(format!("failed to load task: {err}")),
-    };
-
-    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
-
-    match service.start_submit(
-        task_id,
-        mode,
-        orchd::StartSubmitEventIds {
-            submit_state_changed: tui_event_id(task_id, &format!("{event_prefix}-SUBMIT-S"), at),
-            submit_started: tui_event_id(task_id, &format!("{event_prefix}-SUBMIT-E"), at),
-        },
-        at,
-    ) {
-        Ok(_) => Ok(true),
-        Err(err) => Err(format!(
-            "can't submit from {}: {err}",
-            orchd::task_state_tag(task.state)
-        )),
-    }
 }
 
 fn execute_tui_action(
@@ -1373,6 +1433,7 @@ fn execute_tui_action(
     task_id: Option<&TaskId>,
     prompt: Option<&str>,
     model: Option<ModelKind>,
+    mayhem_mode: bool,
     service: &OrchdService,
     org: &OrgConfig,
     enabled_models: &[ModelKind],
@@ -1415,6 +1476,11 @@ fn execute_tui_action(
 
     let outcome = match action {
         UiAction::CreateTask => unreachable!("handled above"),
+        UiAction::ToggleMayhemMode => TuiActionOutcome {
+            message: "mayhem mode toggled".to_string(),
+            force_tick: false,
+            events: Vec::new(),
+        },
         UiAction::ApproveTask => {
             let review_config = orchd::ReviewGateConfig {
                 enabled_models: org.models.enabled.clone(),
@@ -1740,8 +1806,19 @@ fn execute_tui_action(
                     events: Vec::new(),
                 }
             } else {
-                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
-                service.start_submit(
+                // Route through Running if direct transition to Submitting isn't allowed.
+                if !orchd::is_transition_allowed(task.state, TaskState::Submitting)
+                    && orchd::is_transition_allowed(task.state, TaskState::Running)
+                {
+                    service.transition_task_state(
+                        &selected_task_id,
+                        TaskState::Running,
+                        tui_event_id(&selected_task_id, "SUBMIT-VIA-RUNNING", at),
+                        at,
+                    )?;
+                }
+                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id, mayhem_mode);
+                let _ = service.start_submit(
                     &selected_task_id,
                     mode,
                     orchd::StartSubmitEventIds {
@@ -1784,7 +1861,7 @@ fn execute_tui_action(
                     events: Vec::new(),
                 }
             } else if task.state == TaskState::RestackConflict || task.state == TaskState::Failed {
-                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id, mayhem_mode);
                 let _ = service.start_submit(
                     &selected_task_id,
                     mode,
@@ -1927,7 +2004,7 @@ fn execute_tui_action(
                 }
                 TaskState::Running => {
                     // Running but no agent — work is done, commit + submit.
-                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id, mayhem_mode);
                     let _ = service.start_submit(
                         &selected_task_id,
                         mode,
@@ -1952,7 +2029,7 @@ fn execute_tui_action(
                 }
                 TaskState::AwaitingMerge => {
                     // Re-submit.
-                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id, mayhem_mode);
                     let _ = service.start_submit(
                         &selected_task_id,
                         mode,
@@ -4718,6 +4795,7 @@ submit_mode = "single"
             Some(&task.id),
             None,
             None,
+            false,
             &service,
             &org,
             &org.models.enabled,
@@ -4755,6 +4833,7 @@ submit_mode = "single"
             None,
             Some("Build OAuth login with callback flow"),
             Some(ModelKind::Claude),
+            false,
             &service,
             &org,
             &org.models.enabled,
@@ -4854,6 +4933,7 @@ Fix flaky task scheduling by debouncing tick updates";
             Some(&task.id),
             None,
             None,
+            false,
             &service,
             &org,
             &org.models.enabled,
@@ -4930,6 +5010,7 @@ Fix flaky task scheduling by debouncing tick updates";
             Some(&task.id),
             None,
             None,
+            false,
             &service,
             &org,
             &org.models.enabled,
@@ -4995,6 +5076,7 @@ Fix flaky task scheduling by debouncing tick updates";
             Some(&task.id),
             None,
             None,
+            false,
             &service,
             &org,
             &org.models.enabled,
@@ -5052,6 +5134,7 @@ Fix flaky task scheduling by debouncing tick updates";
             Some(&task.id),
             None,
             None,
+            false,
             &service,
             &org,
             &org.models.enabled,

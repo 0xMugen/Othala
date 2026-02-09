@@ -40,6 +40,7 @@ pub struct TuiApp {
     pub state: DashboardState,
     pub action_queue: VecDeque<QueuedAction>,
     pub input_mode: InputMode,
+    pub mayhem_mode: bool,
     pub should_quit: bool,
 }
 
@@ -49,6 +50,7 @@ impl Default for TuiApp {
             state: DashboardState::default(),
             action_queue: VecDeque::new(),
             input_mode: InputMode::Normal,
+            mayhem_mode: false,
             should_quit: false,
         }
     }
@@ -193,6 +195,7 @@ impl TuiApp {
         match command {
             UiCommand::Dispatch(UiAction::CreateTask) => self.begin_new_chat_prompt(),
             UiCommand::Dispatch(UiAction::DeleteTask) => self.begin_delete_task_confirmation(),
+            UiCommand::Dispatch(UiAction::ToggleMayhemMode) => self.toggle_mayhem_mode(),
             UiCommand::Dispatch(action) => self.push_action(action),
             UiCommand::SelectNextTask => self.state.move_task_selection_next(),
             UiCommand::SelectPreviousTask => self.state.move_task_selection_previous(),
@@ -247,6 +250,15 @@ impl TuiApp {
             }
             UiCommand::Quit => self.should_quit = true,
         }
+    }
+
+    fn toggle_mayhem_mode(&mut self) {
+        self.mayhem_mode = !self.mayhem_mode;
+        self.state.status_line = if self.mayhem_mode {
+            "mayhem mode enabled: forcing submit=single (default-branch merge behavior)".to_string()
+        } else {
+            "mayhem mode disabled: using repo/task submit mode".to_string()
+        };
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -1333,5 +1345,27 @@ mod tests {
 
         assert_eq!(app.state.selected_task_idx, 0); // 1 active task, clamped
         assert_eq!(app.state.ready_tab_selected_idx, 0); // 1 ready task, clamped
+    }
+
+    #[test]
+    fn mayhem_toggle_key_flips_mode_without_queueing_action() {
+        let mut app = TuiApp::default();
+        assert!(!app.mayhem_mode);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.mayhem_mode);
+        assert_eq!(
+            app.state.status_line,
+            "mayhem mode enabled: forcing submit=single (default-branch merge behavior)"
+        );
+        assert!(app.drain_actions().is_empty());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(!app.mayhem_mode);
+        assert_eq!(
+            app.state.status_line,
+            "mayhem mode disabled: using repo/task submit mode"
+        );
+        assert!(app.drain_actions().is_empty());
     }
 }

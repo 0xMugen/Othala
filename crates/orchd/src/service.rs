@@ -824,6 +824,12 @@ impl OrchdService {
             )?;
         }
 
+        if task.submit_mode != mode {
+            task.submit_mode = mode;
+            task.updated_at = at;
+            self.store.upsert_task(&task)?;
+        }
+
         self.record_event(&Event {
             id: event_ids.submit_started,
             task_id: Some(task.id.clone()),
@@ -2507,6 +2513,33 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn start_submit_updates_task_submit_mode_to_requested_mode() {
+        let svc = mk_service();
+        let mut task = mk_task("TSSTART6", TaskState::Ready, &[]);
+        task.submit_mode = SubmitMode::Stack;
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let updated = svc
+            .start_submit(
+                &task.id,
+                SubmitMode::Single,
+                StartSubmitEventIds {
+                    submit_state_changed: EventId("E-SSTART6-STATE".to_string()),
+                    submit_started: EventId("E-SSTART6-STARTED".to_string()),
+                },
+                Utc::now(),
+            )
+            .expect("start submit");
+
+        assert_eq!(updated.state, TaskState::Submitting);
+        assert_eq!(updated.submit_mode, SubmitMode::Single);
+
+        let persisted = svc.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(persisted.submit_mode, SubmitMode::Single);
     }
 
     #[test]

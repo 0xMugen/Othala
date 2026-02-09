@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use orch_core::config::{OrgConfig, RepoConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::{TaskState, VerifyTier};
-use orch_core::types::{EventId, ModelKind, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, SubmitMode, Task, TaskId};
 use orch_git::{current_branch, discover_repo, GitCli, GitError, WorktreeManager, WorktreeSpec};
 use orch_graphite::{GraphiteClient, GraphiteError, RestackOutcome};
 use orch_verify::{commands_for_tier, resolve_verify_commands, VerifyOutcome, VerifyRunner};
@@ -566,7 +566,6 @@ impl RuntimeEngine {
         // Sync trunk so gt submit sees an up-to-date remote.
         let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
         let _ = repo_client.sync_trunk();
-
         // Detach HEAD in sibling worktrees so gt restack can rebase their branches.
         let all_tasks = service.list_tasks()?;
         let detached = detach_sibling_worktrees(&self.git, repo_config, task, &all_tasks);
@@ -628,13 +627,36 @@ impl RuntimeEngine {
             }
         }
 
-        let mode = repo_config.graphite.submit_mode.unwrap_or(task.submit_mode);
+        // The submit mode is chosen when entering SUBMITTING (see start_submit).
+        // Runtime executes that persisted mode so UI-selected overrides are honored.
+        let mode = task.submit_mode;
         let submit_result = client.submit(mode);
 
         // Re-attach HEAD in sibling worktrees now that restack/submit is done.
         reattach_worktrees(&self.git, &detached);
 
         let success = submit_result.is_ok();
+        if success && mode == SubmitMode::Stack {
+            if let Some(anchor_branch) =
+                select_submit_stack_anchor_branch(&service.list_tasks()?, task)
+            {
+                if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
+                    service.record_event(&Event {
+                        id: event_id(&task.id, "SUBMIT-MOVE-ERROR", at),
+                        task_id: Some(task.id.clone()),
+                        repo_id: Some(task.repo_id.clone()),
+                        at,
+                        kind: EventKind::Error {
+                            code: "submit_move_onto_first_failed".to_string(),
+                            message: format!(
+                                "submitted task {} but failed to move onto {}: {err}",
+                                task.id.0, anchor_branch
+                            ),
+                        },
+                    })?;
+                }
+            }
+        }
         let failure_message = submit_result.err().map(|err| err.to_string());
         let _ = service.complete_submit(
             &task.id,
@@ -952,6 +974,29 @@ fn select_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> 
         .map(|(_, _, _, branch)| branch.to_string())
 }
 
+fn select_submit_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> {
+    tasks
+        .iter()
+        .filter(|task| {
+            task.id != current.id
+                && task.repo_id == current.repo_id
+                && matches!(task.state, TaskState::AwaitingMerge | TaskState::Merged)
+        })
+        .filter_map(|task| {
+            let branch = task.branch_name.as_deref()?.trim();
+            if branch.is_empty() {
+                return None;
+            }
+            Some((task.updated_at, task.created_at, task.id.0.as_str(), branch))
+        })
+        .min_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(right.2))
+        })
+        .map(|(_, _, _, branch)| branch.to_string())
+}
 /// Detach HEAD in sibling worktrees so `gt restack` can rebase their branches.
 ///
 /// Returns a list of `(worktree_path, branch)` pairs that were detached so
@@ -1037,7 +1082,6 @@ fn reattach_worktrees(git: &GitCli, detached: &[(PathBuf, String)]) {
         let _ = git.run(path, ["checkout", branch.as_str()]);
     }
 }
-
 fn render_verify_failure_summary(result: &orch_verify::VerifyResult) -> String {
     if result.commands.is_empty() {
         return "verification failed without command output".to_string();

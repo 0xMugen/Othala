@@ -491,7 +491,11 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let panes = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(1),
+        ])
         .split(area);
 
     let pane_tabs = format_pane_tabs(app);
@@ -500,9 +504,11 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
+    render_settings(frame, panes[1], app);
+
     let (title, lines) = if let Some(pane) = app.state.selected_pane() {
         let mut lines = pane_meta_lines(pane, None);
-        lines.push(divider_line(panes[1].width));
+        lines.push(divider_line(panes[2].width));
         let tail = pane.tail(20);
         if tail.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -531,7 +537,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     Style::default().fg(HEADER_FG),
                 ),
             ]),
-            divider_line(panes[1].width),
+            divider_line(panes[2].width),
         ];
         if app.state.selected_task_activity.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -549,7 +555,54 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let output = Paragraph::new(lines)
         .block(normal_block(&title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(output, panes[1]);
+    frame.render_widget(output, panes[2]);
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let widget = Paragraph::new(settings_lines(app.mayhem_mode))
+        .block(normal_block("Settings"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
+}
+
+fn settings_lines(mayhem_mode: bool) -> Vec<Line<'static>> {
+    let (status, status_style, mode_text, mode_style) = if mayhem_mode {
+        (
+            "ON",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            "submit=single (merge off default branch)",
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        (
+            "OFF",
+            Style::default().fg(DIM),
+            "submit uses repo/task mode",
+            Style::default().fg(MUTED),
+        )
+    };
+
+    vec![
+        Line::from(vec![
+            Span::styled(" mayhem mode ", Style::default().fg(DIM)),
+            Span::styled(status, status_style),
+        ]),
+        Line::from(vec![
+            Span::styled(" behavior ", Style::default().fg(DIM)),
+            Span::styled(mode_text, mode_style),
+        ]),
+        Line::from(vec![
+            Span::styled(" toggle ", Style::default().fg(DIM)),
+            Span::styled(
+                "m",
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("=mayhem", Style::default().fg(MUTED)),
+        ]),
+    ]
 }
 
 // -- Graphite panel (Ready tab right side) ----------------------------------
@@ -820,6 +873,7 @@ fn footer_action_keys(focused_task: bool) -> Vec<(&'static str, &'static str)> {
     keys.extend([
         ("a", "approve"),
         ("g", "submit"),
+        ("m", "mayhem"),
         ("s", "start"),
         ("x", "stop"),
         ("r", "restart"),
@@ -1595,7 +1649,7 @@ mod tests {
 
     use super::{
         footer_action_keys, footer_height, format_pane_tabs, format_task_row, output_line_style,
-        pane_status_tag, status_activity, status_line_color, status_sidebar_lines,
+        pane_status_tag, settings_lines, status_activity, status_line_color, status_sidebar_lines,
         task_intervene_bar_height, to_local_time, wrapped_visual_line_count, OutputBlockState,
     };
 
@@ -2164,5 +2218,28 @@ mod tests {
 
         assert!(text.iter().any(|line| line.contains("no stack data")));
         assert!(text.iter().any(|line| line.contains("no status data")));
+    }
+
+    #[test]
+    fn settings_lines_report_mayhem_state_and_behavior() {
+        let off_lines = settings_lines(false);
+        let off_text: Vec<String> = off_lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(off_text.iter().any(|line| line.contains("mayhem mode OFF")));
+        assert!(off_text
+            .iter()
+            .any(|line| line.contains("submit uses repo/task mode")));
+
+        let on_lines = settings_lines(true);
+        let on_text: Vec<String> = on_lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(on_text.iter().any(|line| line.contains("mayhem mode ON")));
+        assert!(on_text
+            .iter()
+            .any(|line| line.contains("submit=single (merge off default branch)")));
     }
 }
