@@ -330,7 +330,10 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(root[1]);
         render_task_list(frame, body[0], app);
-        render_pane_summary(frame, body[1], app);
+        match app.state.active_tab {
+            DashboardTab::Ready => render_graphite_panel(frame, body[1], app),
+            DashboardTab::Tasks => render_pane_summary(frame, body[1], app),
+        }
     }
 
     render_footer(frame, root[2], app);
@@ -545,6 +548,28 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .block(normal_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(output, panes[1]);
+}
+
+// -- Graphite panel (Ready tab right side) ----------------------------------
+
+fn render_graphite_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let selected_task = app.state.selected_task();
+    let task_id_str = selected_task
+        .map(|t| t.task_id.0.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let lines = graphite_sidebar_lines(
+        selected_task,
+        &app.state.graphite_stack_lines,
+        &app.state.graphite_status_lines,
+        &app.state.selected_task_activity,
+    );
+
+    let title = format!("Graphite ({task_id_str})");
+    let widget = Paragraph::new(lines)
+        .block(normal_block(&title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
 }
 
 // -- Focused views ----------------------------------------------------------
