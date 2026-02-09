@@ -792,6 +792,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ("w", "web"),
             ("p", "pause"),
             ("u", "resume"),
+            ("l", "linearize"),
         ];
         for (key, label) in keys {
             spans.push(Span::styled(

@@ -347,6 +347,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 &probe_config,
                 &repo_config_by_id,
                 &mut agent_supervisor,
+                &runtime,
                 at,
             ) {
                 Ok(outcome) => {
@@ -1378,6 +1379,7 @@ fn execute_tui_action(
     probe_config: &SetupProbeConfig,
     repo_config_by_id: &HashMap<String, RepoConfig>,
     agent_supervisor: &mut TuiAgentSupervisor,
+    runtime: &RuntimeEngine,
     at: chrono::DateTime<Utc>,
 ) -> Result<TuiActionOutcome, MainError> {
     if action == UiAction::CreateTask {
@@ -2052,6 +2054,33 @@ fn execute_tui_action(
                         },
                     }
                 }
+            }
+        }
+        UiAction::SyncStack => {
+            let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                MainError::InvalidConfig(format!(
+                    "missing repo config for repo_id={}",
+                    task.repo_id.0
+                ))
+            })?;
+            let repo_client = GraphiteClient::new(&repo_config.repo_path);
+            let _ = repo_client.sync_trunk();
+            match runtime.linearize_stack(service, repo_config, at) {
+                Ok(orchd::LinearizeOutcome::AlreadyLinear) => TuiActionOutcome {
+                    message: "stack already linear".to_string(),
+                    force_tick: false,
+                    events: Vec::new(),
+                },
+                Ok(orchd::LinearizeOutcome::Linearized { moves }) => TuiActionOutcome {
+                    message: format!("stack linearized ({moves} move(s))"),
+                    force_tick: true,
+                    events: Vec::new(),
+                },
+                Err(err) => TuiActionOutcome {
+                    message: format!("linearize failed: {err}"),
+                    force_tick: false,
+                    events: Vec::new(),
+                },
             }
         }
     };
@@ -3959,7 +3988,7 @@ mod tests {
     use orch_core::types::{EventId, RepoId, SubmitMode, Task, TaskRole, TaskType};
     use orch_core::types::{ModelKind, TaskId};
     use orch_tui::UiAction;
-    use orchd::{OrchdService, Scheduler, SchedulerConfig};
+    use orchd::{OrchdService, RuntimeEngine, Scheduler, SchedulerConfig};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4695,6 +4724,7 @@ submit_mode = "single"
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("approve action");
@@ -4731,6 +4761,7 @@ submit_mode = "single"
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("create action");
@@ -4829,6 +4860,7 @@ Fix flaky task scheduling by debouncing tick updates";
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("delete action");
@@ -4904,6 +4936,7 @@ Fix flaky task scheduling by debouncing tick updates";
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("delete action");
@@ -4968,6 +5001,7 @@ Fix flaky task scheduling by debouncing tick updates";
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("trigger restack action");
@@ -5024,6 +5058,7 @@ Fix flaky task scheduling by debouncing tick updates";
             &super::SetupProbeConfig::default(),
             &repo_configs,
             &mut agent_supervisor,
+            &RuntimeEngine::default(),
             Utc::now(),
         )
         .expect("trigger restack action");

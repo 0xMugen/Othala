@@ -18,6 +18,7 @@ pub enum UiAction {
     OpenWebUiForTask,
     PauseTask,
     ResumeTask,
+    SyncStack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,6 +68,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Char('w') => Some(UiCommand::Dispatch(UiAction::OpenWebUiForTask)),
         KeyCode::Char('p') => Some(UiCommand::Dispatch(UiAction::PauseTask)),
         KeyCode::Char('u') => Some(UiCommand::Dispatch(UiAction::ResumeTask)),
+        KeyCode::Char('l') => Some(UiCommand::Dispatch(UiAction::SyncStack)),
         _ => None,
     }
 }
@@ -87,6 +89,7 @@ pub fn action_label(action: UiAction) -> &'static str {
         UiAction::OpenWebUiForTask => "open_web_ui_for_task",
         UiAction::PauseTask => "pause_task",
         UiAction::ResumeTask => "resume_task",
+        UiAction::SyncStack => "sync_stack",
     }
 }
 

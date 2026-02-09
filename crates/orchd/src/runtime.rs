@@ -648,6 +648,26 @@ impl RuntimeEngine {
             },
             at,
         )?;
+
+        // Best-effort linearization after successful submit.
+        if success {
+            if let Err(err) = self.linearize_stack(service, repo_config, at) {
+                service.record_event(&Event {
+                    id: event_id(&task.id, "LINEARIZE-FAIL", at),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at,
+                    kind: EventKind::Error {
+                        code: "linearize_failed".to_string(),
+                        message: format!(
+                            "best-effort linearization failed after submit for {}: {err}",
+                            task.id.0
+                        ),
+                    },
+                })?;
+            }
+        }
+
         Ok(success)
     }
 
@@ -731,6 +751,122 @@ impl RuntimeEngine {
         Ok(())
     }
 
+    pub fn linearize_stack(
+        &self,
+        service: &OrchdService,
+        repo_config: &RepoConfig,
+        at: DateTime<Utc>,
+    ) -> Result<LinearizeOutcome, RuntimeError> {
+        let all_tasks = service.list_tasks()?;
+
+        // Filter to tasks in the same repo with a branch, in terminal-ish states.
+        let mut managed: Vec<&Task> = all_tasks
+            .iter()
+            .filter(|t| {
+                t.repo_id.0 == repo_config.repo_id
+                    && t.branch_name
+                        .as_ref()
+                        .map(|b| !b.trim().is_empty())
+                        .unwrap_or(false)
+                    && matches!(
+                        t.state,
+                        TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged
+                    )
+            })
+            .collect();
+
+        if managed.len() < 2 {
+            return Ok(LinearizeOutcome::AlreadyLinear);
+        }
+
+        // Desired order: sort by (updated_at, created_at, task_id) — same as select_stack_anchor_branch.
+        managed.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
+
+        let desired_branches: Vec<String> = managed
+            .iter()
+            .filter_map(|t| t.branch_name.clone())
+            .collect();
+
+        // Get actual stack order from graphite.
+        let graphite = GraphiteClient::new(&repo_config.repo_path);
+        let snapshot = match graphite.log_short_snapshot() {
+            Ok(snap) => snap,
+            Err(_) => return Ok(LinearizeOutcome::AlreadyLinear),
+        };
+
+        let managed_set: std::collections::HashSet<&str> =
+            desired_branches.iter().map(|b| b.as_str()).collect();
+        let actual_branches: Vec<String> = snapshot
+            .nodes
+            .iter()
+            .filter_map(|node| node.branch.as_ref())
+            .filter(|b| managed_set.contains(b.as_str()))
+            .cloned()
+            .collect();
+
+        if actual_branches == desired_branches {
+            return Ok(LinearizeOutcome::AlreadyLinear);
+        }
+
+        // Detach sibling worktrees so gt move/restack can rebase freely.
+        // Use the first managed task as the "current" task for detach logic.
+        let detached = detach_sibling_worktrees(&self.git, repo_config, managed[0], &all_tasks);
+
+        let mut move_count = 0usize;
+        for (idx, branch) in desired_branches.iter().enumerate() {
+            let onto = if idx == 0 {
+                repo_config.base_branch.clone()
+            } else {
+                desired_branches[idx - 1].clone()
+            };
+
+            // Checkout the branch at repo root, then move it.
+            if self
+                .git
+                .run(&repo_config.repo_path, ["checkout", branch.as_str()])
+                .is_err()
+            {
+                continue;
+            }
+            if graphite
+                .move_current_branch_onto(&onto)
+                .is_ok()
+            {
+                move_count += 1;
+            }
+        }
+
+        // Restack once at the end.
+        let _ = graphite.restack();
+
+        reattach_worktrees(&self.git, &detached);
+
+        service.record_event(&Event {
+            id: event_id(
+                &managed[0].id,
+                "LINEARIZE",
+                at,
+            ),
+            task_id: None,
+            repo_id: Some(managed[0].repo_id.clone()),
+            at,
+            kind: EventKind::Error {
+                code: "stack_linearized".to_string(),
+                message: format!(
+                    "linearized stack for repo {}: {move_count} move(s)",
+                    repo_config.repo_id
+                ),
+            },
+        })?;
+
+        Ok(LinearizeOutcome::Linearized { moves: move_count })
+    }
+
     fn mark_task_failed(
         &self,
         service: &OrchdService,
@@ -757,6 +893,12 @@ impl RuntimeEngine {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearizeOutcome {
+    AlreadyLinear,
+    Linearized { moves: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
