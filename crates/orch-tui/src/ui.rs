@@ -552,14 +552,10 @@ fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a>
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.branch, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
-<<<<<<< HEAD
-        Span::styled(task.display_state.as_str(), Style::default().fg(sc).add_modifier(Modifier::BOLD)),
-=======
         Span::styled(
-            state_label,
+            task.display_state.as_str(),
             Style::default().fg(sc).add_modifier(Modifier::BOLD),
         ),
->>>>>>> 1e93cbb (add the delete feature for tasks this should also delete the branch. But there should be an a...)
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),

@@ -20,8 +20,8 @@ use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_git::{discover_repo, GitCli, GitError, WorktreeManager};
 use orch_graphite::GraphiteClient;
 use orch_tui::{
-    effective_display_state, run_tui_with_hook, AgentPane, AgentPaneStatus, TuiApp, TuiError,
-    TuiEvent, UiAction,
+    effective_display_state, normalize_pane_line, run_tui_with_hook, AgentPane, AgentPaneStatus,
+    TuiApp, TuiError, TuiEvent, UiAction,
 };
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -94,7 +94,8 @@ impl TuiChatHistory {
     }
 
     fn task_log_path(&self, task_id: &TaskId) -> PathBuf {
-        self.root.join(format!("{}.log", sanitize_task_id(&task_id.0)))
+        self.root
+            .join(format!("{}.log", sanitize_task_id(&task_id.0)))
     }
 }
 
@@ -441,8 +442,10 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    app.state.status_line =
-                        format!("failed to load task {} for needs-human signal: {err}", task_id.0);
+                    app.state.status_line = format!(
+                        "failed to load task {} for needs-human signal: {err}",
+                        task_id.0
+                    );
                 }
             }
         }
@@ -454,7 +457,10 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                     // If we can't go directly to Submitting, try routing through Running first.
                     if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
                         if orchd::is_transition_allowed(task.state, TaskState::Running)
-                            && orchd::is_transition_allowed(TaskState::Running, TaskState::Submitting)
+                            && orchd::is_transition_allowed(
+                                TaskState::Running,
+                                TaskState::Submitting,
+                            )
                         {
                             if let Err(err) = service.transition_task_state(
                                 &task_id,
@@ -544,10 +550,8 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                     match resolve_ok {
                         Ok(()) => {
                             signal_tick_requested = true;
-                            app.state.status_line = format!(
-                                "conflict resolved for {}; restack continuing",
-                                task_id.0
-                            );
+                            app.state.status_line =
+                                format!("conflict resolved for {}; restack continuing", task_id.0);
                         }
                         Err(reason) => {
                             app.state.status_line = format!(
@@ -559,9 +563,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                                 &format!("conflict resolution failed: {reason}"),
                                 orchd::MarkNeedsHumanEventIds {
                                     needs_human_state_changed: tui_event_id(
-                                        &task_id,
-                                        "CR-NH-S",
-                                        at,
+                                        &task_id, "CR-NH-S", at,
                                     ),
                                     needs_human_event: tui_event_id(&task_id, "CR-NH-E", at),
                                 },
@@ -593,17 +595,13 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                             &enabled_models,
                         ) {
                             Ok(started) => {
-                                app.state.status_line = format!(
-                                    "auto-started conflict resolution for {}",
-                                    task.id.0
-                                );
+                                app.state.status_line =
+                                    format!("auto-started conflict resolution for {}", task.id.0);
                                 app.apply_event(TuiEvent::AgentPaneOutput {
                                     instance_id: started.instance_id,
                                     task_id: started.task_id,
                                     model: started.model,
-                                    lines: vec![
-                                        "[conflict resolution agent started]".to_string(),
-                                    ],
+                                    lines: vec!["[conflict resolution agent started]".to_string()],
                                 });
                             }
                             Err(err) => {
@@ -749,10 +747,10 @@ impl TuiAgentSupervisor {
 
         let (tx, rx) = mpsc::channel::<String>();
         if let Some(stdout) = child.stdout.take() {
-            spawn_pipe_reader(stdout, tx.clone(), false);
+            spawn_pipe_reader(stdout, tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_pipe_reader(stderr, tx.clone(), true);
+            spawn_pipe_reader(stderr, tx.clone());
         }
         drop(tx);
 
@@ -877,15 +875,18 @@ impl TuiAgentSupervisor {
             while let Ok(line) = session.output_rx.try_recv() {
                 if let Some(signal) = detect_common_signal(&line) {
                     match signal.kind {
-                        AgentSignalKind::PatchReady => {
-                            push_unique_task_id(&mut self.pending_patch_ready_tasks, &session.task_id)
-                        }
-                        AgentSignalKind::NeedHuman => {
-                            push_unique_task_id(&mut self.pending_needs_human_tasks, &session.task_id)
-                        }
-                        AgentSignalKind::ConflictResolved => {
-                            push_unique_task_id(&mut self.pending_conflict_resolved_tasks, &session.task_id)
-                        }
+                        AgentSignalKind::PatchReady => push_unique_task_id(
+                            &mut self.pending_patch_ready_tasks,
+                            &session.task_id,
+                        ),
+                        AgentSignalKind::NeedHuman => push_unique_task_id(
+                            &mut self.pending_needs_human_tasks,
+                            &session.task_id,
+                        ),
+                        AgentSignalKind::ConflictResolved => push_unique_task_id(
+                            &mut self.pending_conflict_resolved_tasks,
+                            &session.task_id,
+                        ),
                         AgentSignalKind::RateLimited | AgentSignalKind::ErrorHint => {}
                     }
                 }
@@ -972,7 +973,11 @@ impl TuiAgentSupervisor {
             if self.conflict_resolution_tasks.remove(&task_key) {
                 let task_id = TaskId(task_key);
                 // If no conflict_resolved signal was pending, the agent couldn't resolve it.
-                if !self.pending_conflict_resolved_tasks.iter().any(|id| *id == task_id) {
+                if !self
+                    .pending_conflict_resolved_tasks
+                    .iter()
+                    .any(|id| *id == task_id)
+                {
                     push_unique_task_id(&mut self.pending_needs_human_tasks, &task_id);
                 }
             }
@@ -1048,10 +1053,10 @@ impl TuiAgentSupervisor {
 
         let (tx, rx) = mpsc::channel::<String>();
         if let Some(stdout) = child.stdout.take() {
-            spawn_pipe_reader(stdout, tx.clone(), false);
+            spawn_pipe_reader(stdout, tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_pipe_reader(stderr, tx.clone(), true);
+            spawn_pipe_reader(stderr, tx.clone());
         }
         drop(tx);
 
@@ -1107,10 +1112,8 @@ fn hydrate_chat_panes_from_history(
         let lines = match chat_history.load_lines(&task.id) {
             Ok(lines) => lines,
             Err(err) => {
-                app.state.status_line = format!(
-                    "failed to load chat history for {}: {err}",
-                    task.id.0
-                );
+                app.state.status_line =
+                    format!("failed to load chat history for {}: {err}", task.id.0);
                 continue;
             }
         };
@@ -1141,7 +1144,7 @@ fn hydrate_chat_panes_from_history(
     restored
 }
 
-fn spawn_pipe_reader<R>(reader: R, tx: mpsc::Sender<String>, is_stderr: bool)
+fn spawn_pipe_reader<R>(reader: R, tx: mpsc::Sender<String>)
 where
     R: std::io::Read + Send + 'static,
 {
@@ -1152,12 +1155,9 @@ where
             match buffered.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let normalized = if is_stderr {
-                        format!("[stderr] {}", line.trim_end_matches('\n'))
-                    } else {
-                        line.trim_end_matches('\n').to_string()
-                    };
-                    let _ = tx.send(normalized);
+                    if let Some(normalized) = normalize_pane_line(&line) {
+                        let _ = tx.send(normalized);
+                    }
                 }
                 Err(err) => {
                     let _ = tx.send(format!("[reader error: {err}]"));
@@ -1235,7 +1235,10 @@ fn conflict_resolution_prompt(task: &Task) -> String {
     )
 }
 
-fn resolve_submit_mode_for_task(task: &Task, repo_config_by_id: &HashMap<String, RepoConfig>) -> SubmitMode {
+fn resolve_submit_mode_for_task(
+    task: &Task,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+) -> SubmitMode {
     repo_config_by_id
         .get(&task.repo_id.0)
         .and_then(|cfg| cfg.graphite.submit_mode)
@@ -1635,7 +1638,10 @@ fn execute_tui_action(
                     at,
                 )?;
                 TuiActionOutcome {
-                    message: format!("started graphite submit for {} ({mode:?})", selected_task_id.0),
+                    message: format!(
+                        "started graphite submit for {} ({mode:?})",
+                        selected_task_id.0
+                    ),
                     force_tick: true,
                     events: Vec::new(),
                 }
@@ -1660,22 +1666,21 @@ fn execute_tui_action(
         UiAction::TriggerRestack => {
             if task.state == TaskState::Merged {
                 TuiActionOutcome {
-                    message: format!(
-                        "task {} already merged; nothing to do",
-                        selected_task_id.0
-                    ),
+                    message: format!("task {} already merged; nothing to do", selected_task_id.0),
                     force_tick: false,
                     events: Vec::new(),
                 }
-            } else if task.state == TaskState::RestackConflict
-                || task.state == TaskState::Failed
-            {
+            } else if task.state == TaskState::RestackConflict || task.state == TaskState::Failed {
                 let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
                 let _ = service.start_submit(
                     &selected_task_id,
                     mode,
                     orchd::StartSubmitEventIds {
-                        submit_state_changed: tui_event_id(&selected_task_id, "RESTACK-SUBMIT-S", at),
+                        submit_state_changed: tui_event_id(
+                            &selected_task_id,
+                            "RESTACK-SUBMIT-S",
+                            at,
+                        ),
                         submit_started: tui_event_id(&selected_task_id, "RESTACK-SUBMIT-E", at),
                     },
                     at,
@@ -1746,13 +1751,11 @@ fn execute_tui_action(
         }
         UiAction::ResumeTask => {
             match task.state {
-                TaskState::Merged => {
-                    TuiActionOutcome {
-                        message: format!("task {} already merged; nothing to do", selected_task_id.0),
-                        force_tick: false,
-                        events: Vec::new(),
-                    }
-                }
+                TaskState::Merged => TuiActionOutcome {
+                    message: format!("task {} already merged; nothing to do", selected_task_id.0),
+                    force_tick: false,
+                    events: Vec::new(),
+                },
                 TaskState::Running if agent_supervisor.has_task_session(&selected_task_id) => {
                     TuiActionOutcome {
                         message: format!("agent already running for {}", selected_task_id.0),
@@ -1766,7 +1769,11 @@ fn execute_tui_action(
                         task = service.resume_task(
                             &selected_task_id,
                             orchd::ResumeTaskEventIds {
-                                resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                                resume_state_changed: tui_event_id(
+                                    &selected_task_id,
+                                    "RESUME-S",
+                                    at,
+                                ),
                             },
                             at,
                         )?;
@@ -1812,7 +1819,11 @@ fn execute_tui_action(
                         &selected_task_id,
                         mode,
                         orchd::StartSubmitEventIds {
-                            submit_state_changed: tui_event_id(&selected_task_id, "RESUME-SUBMIT-S", at),
+                            submit_state_changed: tui_event_id(
+                                &selected_task_id,
+                                "RESUME-SUBMIT-S",
+                                at,
+                            ),
                             submit_started: tui_event_id(&selected_task_id, "RESUME-SUBMIT-E", at),
                         },
                         at,
@@ -1833,16 +1844,21 @@ fn execute_tui_action(
                         &selected_task_id,
                         mode,
                         orchd::StartSubmitEventIds {
-                            submit_state_changed: tui_event_id(&selected_task_id, "RESUME-RESUBMIT-S", at),
-                            submit_started: tui_event_id(&selected_task_id, "RESUME-RESUBMIT-E", at),
+                            submit_state_changed: tui_event_id(
+                                &selected_task_id,
+                                "RESUME-RESUBMIT-S",
+                                at,
+                            ),
+                            submit_started: tui_event_id(
+                                &selected_task_id,
+                                "RESUME-RESUBMIT-E",
+                                at,
+                            ),
                         },
                         at,
                     )?;
                     TuiActionOutcome {
-                        message: format!(
-                            "re-submitted {} ({mode:?})",
-                            selected_task_id.0,
-                        ),
+                        message: format!("re-submitted {} ({mode:?})", selected_task_id.0,),
                         force_tick: true,
                         events: Vec::new(),
                     }
@@ -1861,10 +1877,7 @@ fn execute_tui_action(
                         enabled_models,
                     )?;
                     TuiActionOutcome {
-                        message: format!(
-                            "started conflict resolution for {}",
-                            selected_task_id.0,
-                        ),
+                        message: format!("started conflict resolution for {}", selected_task_id.0,),
                         force_tick: true,
                         events: vec![TuiEvent::AgentPaneOutput {
                             instance_id: started.instance_id,
@@ -1880,7 +1893,11 @@ fn execute_tui_action(
                         task = service.resume_task(
                             &selected_task_id,
                             orchd::ResumeTaskEventIds {
-                                resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                                resume_state_changed: tui_event_id(
+                                    &selected_task_id,
+                                    "RESUME-S",
+                                    at,
+                                ),
                             },
                             at,
                         )?;
@@ -4827,20 +4844,14 @@ submit_mode = "single"
         history
             .append_lines(
                 &task_id,
-                &[
-                    "first line".to_string(),
-                    "[stderr] second line".to_string(),
-                ],
+                &["first line".to_string(), "[stderr] second line".to_string()],
             )
             .expect("append lines");
 
         let loaded = history.load_lines(&task_id).expect("load lines");
         assert_eq!(
             loaded,
-            vec![
-                "first line".to_string(),
-                "[stderr] second line".to_string()
-            ]
+            vec!["first line".to_string(), "[stderr] second line".to_string()]
         );
 
         let _ = fs::remove_dir_all(root);

@@ -65,10 +65,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = vec![
-            "exec".to_string(),
-            "--full-auto".to_string(),
-        ];
+        let mut args = vec!["exec".to_string(), "--full-auto".to_string()];
         args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {
@@ -98,10 +95,7 @@ impl AgentAdapter for GeminiAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = vec![
-            "-p".to_string(),
-            "--yolo".to_string(),
-        ];
+        let mut args = vec!["-p".to_string(), "--yolo".to_string()];
         args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {

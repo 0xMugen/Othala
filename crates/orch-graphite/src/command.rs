@@ -219,7 +219,14 @@ mod tests {
         .is_ok());
         assert!(validate_contract(
             AllowedAutoCommand::Modify,
-            &os(&["modify", "--all", "--commit", "-m", "agent changes", "--no-interactive"])
+            &os(&[
+                "modify",
+                "--all",
+                "--commit",
+                "-m",
+                "agent changes",
+                "--no-interactive"
+            ])
         )
         .is_ok());
         assert!(validate_contract(
