@@ -60,30 +60,91 @@ if [[ "$method" != "auto" && "$method" != "nix" && "$method" != "cargo" ]]; then
   exit 1
 fi
 
+is_valid_tag() {
+  local value="${1:-}"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" != "null" ]] || return 1
+  [[ "$value" != \{* ]] || return 1
+  [[ "$value" != \[* ]] || return 1
+  [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+}
+
+extract_tag_name() {
+  local payload="${1:-}"
+  if [[ -z "$payload" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$payload" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
+extract_name() {
+  local payload="${1:-}"
+  if [[ -z "$payload" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$payload" \
+    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
 resolve_latest_tag() {
+  local candidate payload
+
   if command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1; then
-    gh api "repos/${repo}/releases/latest" --jq .tag_name 2>/dev/null || true
-    return
+    candidate="$(gh api "repos/${repo}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+
+    candidate="$(gh api "repos/${repo}/releases?per_page=20" --jq 'map(select(.draft == false)) | .[0].tag_name // empty' 2>/dev/null || true)"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+
+    candidate="$(gh api "repos/${repo}/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
   fi
 
   if command -v curl >/dev/null 2>&1; then
-    local latest_json
-    latest_json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || true
-    if [[ -n "$latest_json" ]]; then
-      printf '%s\n' "$latest_json" \
-        | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | head -n 1
+    payload="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+    candidate="$(extract_tag_name "$payload")"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+
+    payload="$(curl -fsSL "https://api.github.com/repos/${repo}/releases?per_page=20" 2>/dev/null || true)"
+    candidate="$(extract_tag_name "$payload")"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+
+    payload="$(curl -fsSL "https://api.github.com/repos/${repo}/tags?per_page=1" 2>/dev/null || true)"
+    candidate="$(extract_name "$payload")"
+    if is_valid_tag "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
   fi
+
+  return 1
 }
 
 if [[ -z "$tag" ]]; then
-  tag="$(resolve_latest_tag)"
+  tag="$(resolve_latest_tag || true)"
 fi
 
-if [[ -z "$tag" || "$tag" == "null" ]]; then
+if ! is_valid_tag "$tag"; then
   echo "failed to resolve release tag for ${repo}" >&2
-  echo "hint: pass --tag <release-tag> or authenticate gh with 'gh auth login'" >&2
+  echo "hint: pass --tag <release-tag> (example: --tag v0.1.0-alpha.3) or authenticate gh with 'gh auth login'" >&2
   exit 1
 fi
 
@@ -101,6 +162,9 @@ fi
 echo "installing othala from ${repo} release ${tag} using ${method}"
 
 if [[ "$method" == "nix" ]]; then
+  if nix profile install "github:${repo}/${tag}#othala"; then
+    exit 0
+  fi
   nix profile install "git+ssh://git@github.com/${repo}.git?ref=${tag}#othala"
   exit 0
 fi
@@ -112,7 +176,7 @@ fi
 
 cargo_args=(
   install
-  --git "ssh://git@github.com/${repo}.git"
+  --git "https://github.com/${repo}.git"
   --tag "${tag}"
   --locked
   --package orchd
@@ -123,4 +187,21 @@ if [[ "$force" -eq 1 ]]; then
   cargo_args+=(--force)
 fi
 
-cargo "${cargo_args[@]}"
+if cargo "${cargo_args[@]}"; then
+  exit 0
+fi
+
+fallback_args=(
+  install
+  --git "ssh://git@github.com/${repo}.git"
+  --tag "${tag}"
+  --locked
+  --package orchd
+  --bin othala
+)
+
+if [[ "$force" -eq 1 ]]; then
+  fallback_args+=(--force)
+fi
+
+cargo "${fallback_args[@]}"
