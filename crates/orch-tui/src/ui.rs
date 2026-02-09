@@ -298,13 +298,20 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    let viewport_height = cols[0].height.saturating_sub(2) as usize;
+    let viewport_height = cols[1].height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
 
-    // Left: agent PTY output
+    // Left: task status checklist
+    let status_title = format!("Status ({task_id_str})");
+    let status_widget = Paragraph::new(status_sidebar_lines(selected_task))
+        .block(focused_block(&status_title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(status_widget, cols[0]);
+
+    // Right: agent PTY output
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
         let scroll_hint = if scroll_back > 0 {
             format!(" [+{}]", scroll_back)
@@ -336,25 +343,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .border_style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(pty_widget, cols[0]);
-
-    // Right: task metadata (state, verify, review, events)
-    let activity_lines: Vec<Line<'_>> = if app.state.selected_task_activity.is_empty() {
-        vec![Line::from("no task activity yet")]
-    } else {
-        app.state
-            .selected_task_activity
-            .iter()
-            .cloned()
-            .map(Line::from)
-            .collect()
-    };
-
-    let title = format!("Task Detail ({task_id_str})");
-    let activity_widget = Paragraph::new(activity_lines)
-        .block(focused_block(&title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(activity_widget, cols[1]);
+    frame.render_widget(pty_widget, cols[1]);
 }
 
 // -- Footer -----------------------------------------------------------------
@@ -606,6 +595,109 @@ fn pane_status_tag(pane: &AgentPane) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChecklistState {
+    Done,
+    Pending,
+    Skipped,
+    Active,
+    Blocked,
+}
+
+fn checklist_line(label: &str, state: ChecklistState) -> Line<'static> {
+    let (marker, marker_color, label_color) = match state {
+        ChecklistState::Done => ("x", Color::Green, Color::White),
+        ChecklistState::Pending => (" ", DIM, MUTED),
+        ChecklistState::Skipped => ("-", Color::Yellow, DIM),
+        ChecklistState::Active => ("~", Color::Cyan, Color::White),
+        ChecklistState::Blocked => ("!", Color::Red, Color::White),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("[{marker}] "),
+            Style::default()
+                .fg(marker_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label.to_string(), Style::default().fg(label_color)),
+    ])
+}
+
+fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
+    let Some(task) = task else {
+        return vec![Line::from(Span::styled(
+            "no task selected",
+            Style::default().fg(DIM),
+        ))];
+    };
+
+    let thinking = if matches!(task.state, TaskState::Queued | TaskState::Initializing) {
+        ChecklistState::Pending
+    } else {
+        ChecklistState::Done
+    };
+    let pushing = if matches!(task.state, TaskState::Queued | TaskState::Initializing) {
+        ChecklistState::Pending
+    } else {
+        ChecklistState::Done
+    };
+    let reviewing = ChecklistState::Skipped;
+    let restacking = match task.state {
+        TaskState::Restacking => ChecklistState::Active,
+        TaskState::RestackConflict => ChecklistState::Blocked,
+        _ => ChecklistState::Skipped,
+    };
+    let ready_to_merge = if matches!(
+        task.state,
+        TaskState::Ready | TaskState::AwaitingMerge | TaskState::Merged
+    ) {
+        ChecklistState::Done
+    } else {
+        ChecklistState::Pending
+    };
+
+    let plan_complete = if ready_to_merge == ChecklistState::Done {
+        "yes"
+    } else {
+        "no"
+    };
+
+    vec![
+        Line::from(vec![
+            Span::styled("plan complete: ", Style::default().fg(DIM)),
+            Span::styled(
+                plan_complete.to_string(),
+                Style::default()
+                    .fg(if plan_complete == "yes" {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("status: ", Style::default().fg(DIM)),
+            Span::styled(
+                task.display_state.clone(),
+                Style::default()
+                    .fg(display_state_color(task.state, &task.display_state))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "checklist",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        checklist_line("thinking", thinking),
+        checklist_line("pushing", pushing),
+        checklist_line("reviewing (skipped for now)", reviewing),
+        checklist_line("restacking (if needed)", restacking),
+        checklist_line("ready to merge", ready_to_merge),
+    ]
+}
+
 fn to_local_time(value: DateTime<Utc>) -> String {
     value
         .with_timezone(&Local)
@@ -622,7 +714,9 @@ mod tests {
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
 
-    use super::{format_pane_tabs, format_task_row, pane_status_tag, to_local_time};
+    use super::{
+        format_pane_tabs, format_task_row, pane_status_tag, status_sidebar_lines, to_local_time,
+    };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
         TaskOverviewRow {
@@ -731,5 +825,46 @@ mod tests {
         let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1:A1"));
         assert!(text.contains(":starting"));
+    }
+
+    #[test]
+    fn status_sidebar_lines_compactly_reports_plan_and_status() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::Running;
+        row.display_state = "Running".to_string();
+
+        let rendered = status_sidebar_lines(Some(&row));
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("plan complete: no")));
+        assert!(text.iter().any(|line| line.contains("status: Running")));
+        assert!(text.iter().any(|line| line.contains("[x] thinking")));
+        assert!(text.iter().any(|line| line.contains("[x] pushing")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("reviewing (skipped for now)")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("restacking (if needed)")));
+        assert!(text.iter().any(|line| line.contains("[ ] ready to merge")));
+    }
+
+    #[test]
+    fn status_sidebar_lines_marks_ready_plan_complete() {
+        let mut row = mk_row("T2");
+        row.state = TaskState::Ready;
+        row.display_state = "Ready".to_string();
+
+        let rendered = status_sidebar_lines(Some(&row));
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("plan complete: yes")));
+        assert!(text.iter().any(|line| line.contains("[x] ready to merge")));
     }
 }
