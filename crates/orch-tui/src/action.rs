@@ -10,6 +10,7 @@ pub enum UiAction {
     StartAgent,
     StopAgent,
     RestartAgent,
+    DeleteTask,
     RunVerifyQuick,
     RunVerifyFull,
     TriggerRestack,
@@ -56,6 +57,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Char('s') => Some(UiCommand::Dispatch(UiAction::StartAgent)),
         KeyCode::Char('x') => Some(UiCommand::Dispatch(UiAction::StopAgent)),
         KeyCode::Char('r') => Some(UiCommand::Dispatch(UiAction::RestartAgent)),
+        KeyCode::Char('d') => Some(UiCommand::Dispatch(UiAction::DeleteTask)),
         KeyCode::Char('q') => Some(UiCommand::Dispatch(UiAction::RunVerifyQuick)),
         KeyCode::Char('f') => Some(UiCommand::Dispatch(UiAction::RunVerifyFull)),
         KeyCode::Char('t') => Some(UiCommand::Dispatch(UiAction::TriggerRestack)),
@@ -75,6 +77,7 @@ pub fn action_label(action: UiAction) -> &'static str {
         UiAction::StartAgent => "start_agent",
         UiAction::StopAgent => "stop_agent",
         UiAction::RestartAgent => "restart_agent",
+        UiAction::DeleteTask => "delete_task",
         UiAction::RunVerifyQuick => "run_verify_quick",
         UiAction::RunVerifyFull => "run_verify_full",
         UiAction::TriggerRestack => "trigger_restack",
@@ -126,6 +129,10 @@ mod tests {
             Some(UiCommand::Dispatch(UiAction::RunVerifyQuick))
         );
         assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::DeleteTask))
+        );
+        assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
             Some(UiCommand::Dispatch(UiAction::RunVerifyFull))
         );
@@ -167,6 +174,7 @@ mod tests {
         assert_eq!(action_label(UiAction::StartAgent), "start_agent");
         assert_eq!(action_label(UiAction::StopAgent), "stop_agent");
         assert_eq!(action_label(UiAction::RestartAgent), "restart_agent");
+        assert_eq!(action_label(UiAction::DeleteTask), "delete_task");
         assert_eq!(action_label(UiAction::RunVerifyQuick), "run_verify_quick");
         assert_eq!(action_label(UiAction::RunVerifyFull), "run_verify_full");
         assert_eq!(action_label(UiAction::TriggerRestack), "trigger_restack");

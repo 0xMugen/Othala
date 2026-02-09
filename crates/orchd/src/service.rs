@@ -236,6 +236,10 @@ impl OrchdService {
         Ok(self.store.load_task(task_id)?)
     }
 
+    pub fn delete_task(&self, task_id: &TaskId) -> Result<bool, ServiceError> {
+        Ok(self.store.delete_task(task_id)?)
+    }
+
     pub fn record_event(&self, event: &Event) -> Result<(), ServiceError> {
         self.store.append_event(event)?;
         self.event_log.append_both(event)?;
@@ -1254,6 +1258,7 @@ mod tests {
         BlockReason, ModelAvailability, QueuedTask, RunningTask, Scheduler, SchedulerConfig,
         SchedulingInput,
     };
+    use crate::types::TaskRunRecord;
 
     use super::{
         CompleteFullVerifyEventIds, CompleteQuickVerifyEventIds, CompleteRestackEventIds,
@@ -1567,6 +1572,52 @@ mod tests {
             .task(&TaskId("MISSING-TASK".to_string()))
             .expect("query task");
         assert_eq!(task, None);
+    }
+
+    #[test]
+    fn delete_task_removes_task_and_related_records() {
+        let svc = mk_service();
+        let now = Utc::now();
+        let task = mk_task("TDEL-SVC", TaskState::Running, &[]);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+        svc.record_event(&orch_core::events::Event {
+            id: EventId("E-DEL-SVC".to_string()),
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at: now,
+            kind: EventKind::RestackStarted,
+        })
+        .expect("record event");
+        svc.record_approval(&TaskApproval {
+            task_id: task.id.clone(),
+            reviewer: ModelKind::Codex,
+            verdict: ReviewVerdict::Approve,
+            issued_at: now,
+        })
+        .expect("record approval");
+        svc.store
+            .insert_run(&TaskRunRecord {
+                run_id: "R-DEL-SVC".to_string(),
+                task_id: task.id.clone(),
+                repo_id: task.repo_id.clone(),
+                model: ModelKind::Codex,
+                started_at: now,
+                finished_at: None,
+                stop_reason: None,
+                exit_code: None,
+            })
+            .expect("insert run");
+
+        assert!(svc.delete_task(&task.id).expect("delete task"));
+        assert_eq!(svc.delete_task(&task.id).expect("delete task again"), false);
+        assert!(svc.task(&task.id).expect("load task").is_none());
+        assert!(svc.task_events(&task.id).expect("task events").is_empty());
+        assert!(svc
+            .task_approvals(&task.id)
+            .expect("task approvals")
+            .is_empty());
+        assert!(svc.store.list_open_runs().expect("list runs").is_empty());
     }
 
     #[test]

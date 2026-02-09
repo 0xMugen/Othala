@@ -162,6 +162,30 @@ ON CONFLICT(task_id) DO UPDATE SET
         Ok(tasks)
     }
 
+    pub fn delete_task(&self, task_id: &TaskId) -> Result<bool, PersistenceError> {
+        self.conn.execute(
+            "DELETE FROM approvals WHERE task_id = ?1",
+            params![task_id.0.as_str()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM runs WHERE task_id = ?1",
+            params![task_id.0.as_str()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM artifacts WHERE task_id = ?1",
+            params![task_id.0.as_str()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM events WHERE task_id = ?1",
+            params![task_id.0.as_str()],
+        )?;
+        let deleted = self.conn.execute(
+            "DELETE FROM tasks WHERE task_id = ?1",
+            params![task_id.0.as_str()],
+        )?;
+        Ok(deleted > 0)
+    }
+
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<Task>, PersistenceError> {
         let mut stmt = self.conn.prepare(
             "SELECT payload_json FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
@@ -719,5 +743,80 @@ mod tests {
             .map(|run| run.run_id.clone())
             .collect::<Vec<_>>();
         assert_eq!(open_ids, vec!["R-OTHER-OPEN".to_string()]);
+    }
+
+    #[test]
+    fn delete_task_removes_task_and_related_rows() {
+        let store = mk_store();
+        let now = Utc::now();
+        let task = mk_task("T-DEL", TaskState::Running, now);
+        store.upsert_task(&task).expect("upsert task");
+        store
+            .append_event(&mk_event("E-DEL-1", "T-DEL", now))
+            .expect("append event");
+        store
+            .upsert_approval(&TaskApproval {
+                task_id: TaskId("T-DEL".to_string()),
+                reviewer: ModelKind::Claude,
+                verdict: ReviewVerdict::Approve,
+                issued_at: now,
+            })
+            .expect("upsert approval");
+        store
+            .insert_run(&TaskRunRecord {
+                run_id: "R-DEL".to_string(),
+                task_id: TaskId("T-DEL".to_string()),
+                repo_id: RepoId("example".to_string()),
+                model: ModelKind::Claude,
+                started_at: now,
+                finished_at: None,
+                stop_reason: None,
+                exit_code: None,
+            })
+            .expect("insert run");
+        store
+            .insert_artifact(&ArtifactRecord {
+                artifact_id: "A-DEL".to_string(),
+                task_id: TaskId("T-DEL".to_string()),
+                kind: "patch".to_string(),
+                path: "/tmp/patch.diff".to_string(),
+                created_at: now,
+                metadata_json: None,
+            })
+            .expect("insert artifact");
+
+        assert!(store
+            .delete_task(&TaskId("T-DEL".to_string()))
+            .expect("delete task"));
+        assert_eq!(
+            store
+                .delete_task(&TaskId("T-DEL".to_string()))
+                .expect("delete task second pass"),
+            false
+        );
+
+        assert!(store
+            .load_task(&TaskId("T-DEL".to_string()))
+            .expect("load task")
+            .is_none());
+        assert!(store
+            .list_events_for_task(&TaskId("T-DEL".to_string()))
+            .expect("list events")
+            .is_empty());
+        assert!(store
+            .list_approvals_for_task(&TaskId("T-DEL".to_string()))
+            .expect("list approvals")
+            .is_empty());
+        assert!(store.list_open_runs().expect("list runs").is_empty());
+
+        let artifact_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE task_id = ?1",
+                params!["T-DEL"],
+                |row| row.get(0),
+            )
+            .expect("count artifacts");
+        assert_eq!(artifact_count, 0);
     }
 }

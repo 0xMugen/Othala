@@ -17,7 +17,7 @@ use orch_core::state::{
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
-use orch_git::{discover_repo, GitCli};
+use orch_git::{discover_repo, GitCli, GitError, WorktreeManager};
 use orch_graphite::GraphiteClient;
 use orch_tui::{
     effective_display_state, run_tui_with_hook, AgentPane, AgentPaneStatus, TuiApp, TuiError,
@@ -29,6 +29,7 @@ use orchd::{
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1559,6 +1560,35 @@ fn execute_tui_action(
                 }
             }
         }
+        UiAction::DeleteTask => {
+            let mut events = Vec::new();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&selected_task_id) {
+                events.push(TuiEvent::AgentPaneOutput {
+                    instance_id: stopped.instance_id.clone(),
+                    task_id: stopped.task_id.clone(),
+                    model: stopped.model,
+                    lines: vec!["[agent session stopped for task deletion]".to_string()],
+                });
+                events.push(TuiEvent::AgentPaneStatusChanged {
+                    instance_id: stopped.instance_id,
+                    status: AgentPaneStatus::Exited,
+                });
+            }
+
+            let cleanup_summary = cleanup_task_git_resources(&task, repo_config_by_id)?;
+            let deleted = service.delete_task(&selected_task_id)?;
+            if !deleted {
+                return Err(MainError::Service(ServiceError::TaskNotFound {
+                    task_id: selected_task_id.0.clone(),
+                }));
+            }
+
+            TuiActionOutcome {
+                message: format!("deleted task {} ({cleanup_summary})", selected_task_id.0),
+                force_tick: false,
+                events,
+            }
+        }
         UiAction::RunVerifyQuick => {
             let _ = service.start_verify(
                 &selected_task_id,
@@ -1889,6 +1919,145 @@ fn execute_tui_action(
     };
 
     Ok(outcome)
+}
+
+fn cleanup_task_git_resources(
+    task: &Task,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+) -> Result<String, MainError> {
+    let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+        MainError::InvalidConfig(format!(
+            "missing repo config for repo_id={}",
+            task.repo_id.0
+        ))
+    })?;
+
+    let git = GitCli::default();
+    let repo = discover_repo(&repo_config.repo_path, &git).map_err(|err| {
+        MainError::InvalidConfig(format!(
+            "failed to open git repo {} for task {}: {err}",
+            repo_config.repo_path.display(),
+            task.id.0
+        ))
+    })?;
+
+    let branch_name = cleanup_branch_name(task);
+    let mut removed_worktrees = 0usize;
+    let mut removed_paths: Vec<PathBuf> = Vec::new();
+
+    if let Some(branch_name) = branch_name.as_deref() {
+        let listed = WorktreeManager::default().list(&repo).map_err(|err| {
+            MainError::InvalidConfig(format!(
+                "failed to list worktrees for task {}: {err}",
+                task.id.0
+            ))
+        })?;
+
+        for entry in listed {
+            if entry.path == repo.root {
+                continue;
+            }
+            if entry.branch.as_deref() != Some(branch_name) {
+                continue;
+            }
+            if removed_paths.iter().any(|path| path == &entry.path) {
+                continue;
+            }
+            run_git_worktree_remove_force(&git, &repo.root, &entry.path).map_err(|err| {
+                MainError::InvalidConfig(format!(
+                    "failed to remove worktree {} for task {}: {err}",
+                    entry.path.display(),
+                    task.id.0
+                ))
+            })?;
+            removed_paths.push(entry.path);
+            removed_worktrees += 1;
+        }
+    }
+
+    let configured_worktree = if task.worktree_path.is_absolute() {
+        task.worktree_path.clone()
+    } else {
+        repo.root.join(&task.worktree_path)
+    };
+    if configured_worktree != repo.root
+        && configured_worktree.exists()
+        && !removed_paths
+            .iter()
+            .any(|path| path == &configured_worktree)
+    {
+        run_git_worktree_remove_force(&git, &repo.root, &configured_worktree).map_err(|err| {
+            MainError::InvalidConfig(format!(
+                "failed to remove configured worktree {} for task {}: {err}",
+                configured_worktree.display(),
+                task.id.0
+            ))
+        })?;
+        removed_worktrees += 1;
+    }
+
+    let branch_status = if let Some(branch_name) = branch_name.as_deref() {
+        match git.run(&repo.root, ["branch", "-D", branch_name]) {
+            Ok(_) => format!("branch={branch_name} deleted"),
+            Err(err) if is_git_branch_missing(&err) => {
+                format!("branch={branch_name} already_missing")
+            }
+            Err(err) => {
+                return Err(MainError::InvalidConfig(format!(
+                    "failed to delete branch {branch_name} for task {}: {err}",
+                    task.id.0
+                )))
+            }
+        }
+    } else {
+        "branch=(none)".to_string()
+    };
+
+    Ok(format!(
+        "worktrees_removed={} {branch_status}",
+        removed_worktrees
+    ))
+}
+
+fn cleanup_branch_name(task: &Task) -> Option<String> {
+    task.branch_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let task_id = task.id.0.trim();
+            if task_id.is_empty() {
+                None
+            } else {
+                Some(format!("task/{task_id}"))
+            }
+        })
+}
+
+fn run_git_worktree_remove_force(
+    git: &GitCli,
+    repo_root: &Path,
+    worktree: &Path,
+) -> Result<(), GitError> {
+    let args = vec![
+        OsString::from("worktree"),
+        OsString::from("remove"),
+        OsString::from("--force"),
+        worktree.as_os_str().to_os_string(),
+    ];
+    git.run(repo_root, args)?;
+    Ok(())
+}
+
+fn is_git_branch_missing(err: &GitError) -> bool {
+    match err {
+        GitError::CommandFailed { stdout, stderr, .. } => {
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            combined.contains("branch") && combined.contains("not found")
+        }
+        _ => false,
+    }
 }
 
 fn create_tui_task(
@@ -3668,6 +3837,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn parse_cli_args_uses_defaults_when_no_flags_are_passed() {
@@ -4207,6 +4377,38 @@ submit_mode = "single"
         }
     }
 
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git_repo(root: &Path) {
+        run_git(root, &["init"]);
+        fs::write(root.join("README.md"), "init\n").expect("write readme");
+        run_git(root, &["add", "README.md"]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+    }
+
     #[test]
     fn execute_tui_action_approve_task_records_manual_approvals() {
         let root = std::env::temp_dir().join(format!(
@@ -4291,7 +4493,155 @@ submit_mode = "single"
         assert_eq!(tasks[0].title, "Build OAuth login with callback flow");
         assert_eq!(tasks[0].preferred_model, Some(ModelKind::Claude));
         assert_eq!(agent_supervisor.pending_start_by_task.len(), 1);
-        assert!(agent_supervisor.pending_start_by_task.contains_key(&tasks[0].id.0));
+        assert!(agent_supervisor
+            .pending_start_by_task
+            .contains_key(&tasks[0].id.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_tui_action_delete_task_removes_task_branch_and_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-delete-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        init_git_repo(&root);
+        run_git(&root, &["branch", "task/T-DEL"]);
+        fs::create_dir_all(root.join(".orch/wt")).expect("create worktree root");
+        run_git(&root, &["worktree", "add", ".orch/wt/T-DEL", "task/T-DEL"]);
+
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let task = mk_reviewing_task("T-DEL");
+        service
+            .create_task(
+                &task,
+                &super::Event {
+                    id: EventId("E-TEST-CREATE-DEL".to_string()),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                },
+            )
+            .expect("create task");
+
+        let mut repo_configs = HashMap::new();
+        repo_configs.insert("example".to_string(), mk_repo_config("example", &root));
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
+
+        let outcome = execute_tui_action(
+            UiAction::DeleteTask,
+            Some(&task.id),
+            None,
+            None,
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
+            Utc::now(),
+        )
+        .expect("delete action");
+
+        assert!(outcome.message.contains("deleted task T-DEL"));
+        assert!(service.task(&task.id).expect("load task").is_none());
+        assert!(!root.join(".orch/wt/T-DEL").exists());
+
+        let branch_list = Command::new("git")
+            .args(["branch", "--list", "task/T-DEL"])
+            .current_dir(&root)
+            .output()
+            .expect("list branch");
+        assert!(
+            branch_list.status.success(),
+            "git branch --list failed: {}",
+            String::from_utf8_lossy(&branch_list.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_list.stdout)
+                .trim()
+                .is_empty(),
+            "branch should be removed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_tui_action_delete_task_infers_default_branch_when_branch_name_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-delete-missing-branch-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        init_git_repo(&root);
+        run_git(&root, &["branch", "task/T-MISSING"]);
+        fs::create_dir_all(root.join(".orch/wt")).expect("create worktree root");
+        run_git(
+            &root,
+            &["worktree", "add", ".orch/wt/T-MISSING", "task/T-MISSING"],
+        );
+
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let mut task = mk_reviewing_task("T-MISSING");
+        task.branch_name = None;
+        service
+            .create_task(
+                &task,
+                &super::Event {
+                    id: EventId("E-TEST-CREATE-DEL-MISSING".to_string()),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                },
+            )
+            .expect("create task");
+
+        let mut repo_configs = HashMap::new();
+        repo_configs.insert("example".to_string(), mk_repo_config("example", &root));
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
+
+        let outcome = execute_tui_action(
+            UiAction::DeleteTask,
+            Some(&task.id),
+            None,
+            None,
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
+            Utc::now(),
+        )
+        .expect("delete action");
+
+        assert!(outcome.message.contains("deleted task T-MISSING"));
+        assert!(service.task(&task.id).expect("load task").is_none());
+        assert!(!root.join(".orch/wt/T-MISSING").exists());
+
+        let branch_list = Command::new("git")
+            .args(["branch", "--list", "task/T-MISSING"])
+            .current_dir(&root)
+            .output()
+            .expect("list branch");
+        assert!(
+            branch_list.status.success(),
+            "git branch --list failed: {}",
+            String::from_utf8_lossy(&branch_list.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_list.stdout)
+                .trim()
+                .is_empty(),
+            "branch should be removed"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
