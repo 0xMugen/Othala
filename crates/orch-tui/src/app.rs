@@ -518,6 +518,7 @@ mod tests {
             TaskOverviewRow {
                 task_id: TaskId("T1".to_string()),
                 repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
                 branch: "task/T1".to_string(),
                 stack_position: None,
                 state: TaskState::Running,
@@ -529,6 +530,7 @@ mod tests {
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
                 repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
                 branch: "task/T2".to_string(),
                 stack_position: None,
                 state: TaskState::Running,
@@ -586,6 +588,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,
@@ -631,6 +634,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,
@@ -715,6 +719,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,
@@ -767,6 +772,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,
@@ -804,6 +810,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,
@@ -863,6 +870,7 @@ mod tests {
         app.state.tasks = vec![TaskOverviewRow {
             task_id: TaskId("T1".to_string()),
             repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
             state: TaskState::Running,

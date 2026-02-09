@@ -207,7 +207,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
-        " repo | task | branch | state | verify | review | activity",
+        " repo | task | title | state | verify | review | activity",
         header_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -597,7 +597,7 @@ fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a>
             },
         ),
         Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(&task.branch, base_style),
+        Span::styled(&task.title, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(
             task.display_state.as_str(),
@@ -787,10 +787,9 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
     let reviewing = match task.state {
         TaskState::Reviewing => ChecklistState::Active,
         TaskState::NeedsHuman => ChecklistState::Blocked,
-        TaskState::Ready
-        | TaskState::Submitting
-        | TaskState::AwaitingMerge
-        | TaskState::Merged => ChecklistState::Done,
+        TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged => {
+            ChecklistState::Done
+        }
         _ => ChecklistState::Pending,
     };
 
@@ -851,9 +850,7 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             Span::styled(plan_label, Style::default().fg(DIM)),
             Span::styled(
                 plan_value.to_string(),
-                Style::default()
-                    .fg(plan_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(plan_color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -912,10 +909,7 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
     if let Some(detail) = push_detail {
         lines.push(Line::from(vec![
             Span::styled("push: ", Style::default().fg(DIM)),
-            Span::styled(
-                detail.to_string(),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(detail.to_string(), Style::default().fg(Color::White)),
         ]));
     }
 
@@ -948,6 +942,7 @@ mod tests {
         TaskOverviewRow {
             task_id: TaskId(task_id.to_string()),
             repo_id: RepoId("example".to_string()),
+            title: format!("Title for {task_id}"),
             branch: format!("task/{task_id}"),
             stack_position: None,
             state: TaskState::Running,
@@ -1012,7 +1007,7 @@ mod tests {
 
         assert!(text.contains("example"));
         assert!(text.contains("T9"));
-        assert!(text.contains("task/T9"));
+        assert!(text.contains("Title for T9"));
         assert!(text.contains("Running"));
         assert!(text.contains("not_run"));
         assert!(text.contains("0/0 unanimous=false cap=ok"));

@@ -501,8 +501,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                     ) {
                         Ok(_) => {
                             signal_tick_requested = true;
-                            app.state.status_line =
-                                format!("pushing {} to graphite...", task_id.0);
+                            app.state.status_line = format!("pushing {} to graphite...", task_id.0);
                         }
                         Err(err) => {
                             app.state.status_line =
@@ -2368,12 +2367,104 @@ fn create_tui_task(
 }
 
 fn summarize_prompt_as_title(prompt: &str) -> String {
-    let first = prompt
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
+    let lines = prompt.lines().map(str::trim).collect::<Vec<_>>();
+    let chosen = extract_requested_work_title(&lines)
+        .or_else(|| first_actionable_prompt_line(&lines))
+        .or_else(|| lines.iter().copied().find(|line| !line.is_empty()))
         .unwrap_or("TUI task");
-    let mut title = first.to_string();
+    truncate_title(chosen)
+}
+
+fn extract_requested_work_title<'a>(lines: &'a [&'a str]) -> Option<&'a str> {
+    for (idx, line) in lines.iter().copied().enumerate() {
+        let Some(rest) = strip_prefix_ignore_ascii_case(line, "requested work:") else {
+            continue;
+        };
+        let inline = strip_common_list_prefix(rest.trim());
+        if !inline.is_empty() {
+            return Some(inline);
+        }
+        for candidate in lines.iter().copied().skip(idx + 1) {
+            let normalized = strip_common_list_prefix(candidate);
+            if normalized.is_empty() || title_is_boilerplate(normalized) {
+                continue;
+            }
+            if line_looks_like_section_header(normalized) {
+                break;
+            }
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn first_actionable_prompt_line<'a>(lines: &'a [&'a str]) -> Option<&'a str> {
+    lines.iter().copied().find_map(|line| {
+        let normalized = strip_common_list_prefix(line);
+        if normalized.is_empty() || title_is_boilerplate(normalized) {
+            return None;
+        }
+        Some(normalized)
+    })
+}
+
+fn strip_common_list_prefix(line: &str) -> &str {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return rest.trim_start();
+    }
+
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count > 0 {
+        let suffix = &trimmed[digit_count..];
+        if let Some(rest) = suffix
+            .strip_prefix(". ")
+            .or_else(|| suffix.strip_prefix(") "))
+        {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+fn title_is_boilerplate(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("you are working on task ")
+        || lower.starts_with("you are resolving git merge/rebase conflicts")
+        || lower.starts_with("state:")
+        || lower.starts_with("role:")
+        || lower.starts_with("type:")
+        || lower.starts_with("requested work:")
+        || lower.starts_with("work in this task worktree")
+        || lower.starts_with("when implementation is complete")
+        || lower.starts_with("if blocked and human input is required")
+        || lower.starts_with("requested work")
+}
+
+fn line_looks_like_section_header(line: &str) -> bool {
+    let Some(prefix) = line.strip_suffix(':') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.len() <= 48
+        && prefix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '-' || ch == '_')
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    value.get(prefix.len()..)
+}
+
+fn truncate_title(value: &str) -> String {
+    let mut title = value.trim().to_string();
     if title.len() > 96 {
         title.truncate(93);
         title.push_str("...");
@@ -2403,10 +2494,7 @@ fn run_single_orchestrator_tick(
     let message = if runtime_tick.submitted > 0 {
         format!("pushed {} task(s) to graphite", runtime_tick.submitted)
     } else if runtime_tick.submit_failed > 0 {
-        format!(
-            "push failed for {} task(s)",
-            runtime_tick.submit_failed
-        )
+        format!("push failed for {} task(s)", runtime_tick.submit_failed)
     } else {
         format!(
             "tick: scheduled={} blocked={} init={} verify_start={} restacked={} conflicts={} verify_pass={} verify_fail={} submitted={} submit_fail={} errors={}",
@@ -2478,6 +2566,7 @@ fn build_task_activity_lines(
         "task={} state={} repo={}",
         task.id.0, display_state, task.repo_id.0,
     ));
+    lines.push(format!("title={}", task.title));
     lines.push(format!(
         "branch={}",
         task.branch_name.as_deref().unwrap_or("-")
@@ -4056,9 +4145,10 @@ fn review_approve_usage(program: &str) -> String {
 mod tests {
     use super::{
         build_task_activity_lines, create_task_usage, execute_tui_action, list_tasks_usage,
-        load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage, tui_usage, usage,
-        wizard_usage, CliCommand, CreateTaskCliArgs, ListTasksCliArgs, ReviewApproveCliArgs,
-        RunCliArgs, SetupCliArgs, TuiCliArgs, WizardCliArgs,
+        load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage,
+        summarize_prompt_as_title, tui_usage, usage, wizard_usage, CliCommand, CreateTaskCliArgs,
+        ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs, TuiCliArgs,
+        WizardCliArgs,
     };
     use chrono::Utc;
     use orch_core::config::{
@@ -4861,6 +4951,42 @@ submit_mode = "single"
             .contains_key(&tasks[0].id.0));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summarize_prompt_as_title_prefers_requested_work_section() {
+        let prompt = "You are working on task T1770623151487: better naming in the task display based on the prompt so we know what it's working on
+State: Running
+Role: General
+Type: Feature
+Requested work:
+better naming in the task display based on the prompt so we know what it's working on
+Work in this task worktree, make focused changes, and report progress.";
+        let title = summarize_prompt_as_title(prompt);
+        assert_eq!(
+            title,
+            "better naming in the task display based on the prompt so we know what it's working on"
+        );
+    }
+
+    #[test]
+    fn summarize_prompt_as_title_supports_inline_requested_work() {
+        let prompt = "Requested work: tighten retry behavior when Graphite returns 429";
+        let title = summarize_prompt_as_title(prompt);
+        assert_eq!(title, "tighten retry behavior when Graphite returns 429");
+    }
+
+    #[test]
+    fn summarize_prompt_as_title_skips_structured_metadata_lines() {
+        let prompt = "State: Queued
+Role: General
+Type: Feature
+Fix flaky task scheduling by debouncing tick updates";
+        let title = summarize_prompt_as_title(prompt);
+        assert_eq!(
+            title,
+            "Fix flaky task scheduling by debouncing tick updates"
+        );
     }
 
     #[test]
