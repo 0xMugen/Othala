@@ -1361,4 +1361,39 @@ mod tests {
         );
         assert!(anchor.is_none());
     }
+
+    #[test]
+    fn select_submit_stack_anchor_branch_prefers_oldest_submitting_or_awaiting_peer() {
+        let now = Utc::now();
+        let current = task_with_state_and_times(
+            "T3",
+            "example",
+            TaskState::Submitting,
+            Some("task/T3"),
+            now,
+            now,
+        );
+        let first_submitting = task_with_state_and_times(
+            "T1",
+            "example",
+            TaskState::Submitting,
+            Some("task/T1"),
+            now - Duration::minutes(6),
+            now - Duration::minutes(5),
+        );
+        let newer_awaiting = task_with_state_and_times(
+            "T2",
+            "example",
+            TaskState::AwaitingMerge,
+            Some("task/T2"),
+            now - Duration::minutes(4),
+            now - Duration::minutes(3),
+        );
+
+        let anchor = select_submit_stack_anchor_branch(
+            &[current.clone(), newer_awaiting, first_submitting],
+            &current,
+        );
+        assert_eq!(anchor.as_deref(), Some("task/T1"));
+    }
 }
