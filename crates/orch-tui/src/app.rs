@@ -204,6 +204,13 @@ impl TuiApp {
         }
     }
 
+    pub fn handle_paste(&mut self, text: &str) {
+        let InputMode::NewChatPrompt { buffer } = &mut self.input_mode else {
+            return;
+        };
+        buffer.push_str(&normalize_paste_text(text));
+    }
+
     fn begin_new_chat_prompt(&mut self) {
         self.input_mode = InputMode::NewChatPrompt {
             buffer: String::new(),
@@ -419,6 +426,10 @@ impl TuiApp {
         }
         self.state.panes.len() - 1
     }
+}
+
+fn normalize_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
@@ -764,6 +775,21 @@ mod tests {
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
         assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
         assert_eq!(drained[0].model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn handle_paste_appends_multiline_text_while_in_prompt_mode() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.handle_paste("line 1\r\nline 2\nline 3\rline 4");
+        assert_eq!(app.input_prompt(), Some("line 1\nline 2\nline 3\nline 4"));
+    }
+
+    #[test]
+    fn handle_paste_is_ignored_outside_prompt_mode() {
+        let mut app = TuiApp::default();
+        app.handle_paste("should not be captured");
+        assert!(app.input_prompt().is_none());
     }
 
     #[test]
