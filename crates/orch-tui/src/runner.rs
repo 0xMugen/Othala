@@ -1,7 +1,7 @@
 use crate::app::TuiApp;
 use crate::error::TuiError;
 use crate::ui::render_dashboard;
-use crossterm::event::{self, Event as CEvent};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event as CEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -25,14 +25,18 @@ where
 {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let run_result = run_loop(&mut terminal, app, tick_rate, &mut on_tick);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
 
     run_result
@@ -57,6 +61,7 @@ fn run_loop(
 fn handle_terminal_event(app: &mut TuiApp, event: CEvent) {
     match event {
         CEvent::Key(key) => app.handle_key_event(key),
+        CEvent::Paste(text) => app.handle_paste(&text),
         CEvent::Resize(_, _) => {}
         _ => {}
     }
@@ -84,5 +89,16 @@ mod tests {
         let mut app = TuiApp::default();
         handle_terminal_event(&mut app, CEvent::Resize(120, 40));
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn handle_terminal_event_routes_paste_events_to_prompt_buffer() {
+        let mut app = TuiApp::default();
+        handle_terminal_event(
+            &mut app,
+            CEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+        );
+        handle_terminal_event(&mut app, CEvent::Paste("fn main() {}".to_string()));
+        assert_eq!(app.input_prompt(), Some("fn main() {}"));
     }
 }

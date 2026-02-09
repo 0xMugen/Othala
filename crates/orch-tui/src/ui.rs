@@ -21,6 +21,9 @@ const BORDER_FOCUSED: Color = Color::Cyan;
 const KEY_FG: Color = Color::Yellow;
 const MUTED: Color = Color::Gray;
 const OUTPUT_FG: Color = Color::White;
+const FOOTER_DEFAULT_HEIGHT: u16 = 3;
+const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
+const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
 
 fn state_color(state: TaskState) -> Color {
     match state {
@@ -126,12 +129,13 @@ fn focused_block(title: &str) -> Block<'_> {
 // -- Layout -----------------------------------------------------------------
 
 pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
+    let footer_height = footer_height(app, frame.area().width);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
 
@@ -403,16 +407,54 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 // -- Footer -----------------------------------------------------------------
 
+fn footer_height(app: &TuiApp, width: u16) -> u16 {
+    let Some(prompt) = app.input_prompt() else {
+        return FOOTER_DEFAULT_HEIGHT;
+    };
+    let content_width = width.saturating_sub(2).max(1);
+    let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width.saturating_sub(1));
+    let controls_visual_lines = wrapped_visual_line_count(
+        " Enter=submit Esc=cancel (multiline paste supported)",
+        content_width,
+    );
+    let total_height = prompt_visual_lines
+        .saturating_add(controls_visual_lines)
+        .saturating_add(3); // prompt label + borders
+    u16::try_from(total_height)
+        .unwrap_or(FOOTER_PROMPT_MAX_HEIGHT)
+        .clamp(FOOTER_PROMPT_MIN_HEIGHT, FOOTER_PROMPT_MAX_HEIGHT)
+}
+
+fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    if text.is_empty() {
+        return 1;
+    }
+    text.split('\n')
+        .map(|line| {
+            let len = line.chars().count();
+            if len == 0 {
+                1
+            } else {
+                (len - 1) / width + 1
+            }
+        })
+        .sum()
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let line = if let Some((task_id, branch)) = app.delete_confirm_display() {
+    let (lines, wrap_trim) = if let Some((task_id, branch)) = app.delete_confirm_display() {
         let branch_label = branch.unwrap_or("-");
-        Line::from(vec![
-            Span::styled(" delete: ", Style::default().fg(DIM)),
-            Span::styled(task_id.0.clone(), Style::default().fg(HEADER_FG)),
-            Span::styled(" branch=", Style::default().fg(DIM)),
-            Span::styled(branch_label, Style::default().fg(HEADER_FG)),
-            Span::styled("  Enter=confirm Esc=cancel", Style::default().fg(DIM)),
-        ])
+        (
+            vec![Line::from(vec![
+                Span::styled(" delete: ", Style::default().fg(DIM)),
+                Span::styled(task_id.0.clone(), Style::default().fg(HEADER_FG)),
+                Span::styled(" branch=", Style::default().fg(DIM)),
+                Span::styled(branch_label, Style::default().fg(HEADER_FG)),
+                Span::styled("  Enter=confirm Esc=cancel", Style::default().fg(DIM)),
+            ])],
+            true,
+        )
     } else if let Some((models, selected)) = app.model_select_display() {
         let mut spans = vec![Span::styled(" model: ", Style::default().fg(DIM))];
         for (i, m) in models.iter().enumerate() {
@@ -433,14 +475,28 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             " Up/Down=cycle Enter=confirm Esc=cancel",
             Style::default().fg(DIM),
         ));
-        Line::from(spans)
+        (vec![Line::from(spans)], true)
     } else if let Some(prompt) = app.input_prompt() {
-        Line::from(vec![
-            Span::styled(" prompt: ", Style::default().fg(DIM)),
-            Span::styled(prompt, Style::default().fg(HEADER_FG)),
-            Span::styled("_", Style::default().fg(ACCENT)),
-            Span::styled("  Enter=submit Esc=cancel", Style::default().fg(DIM)),
-        ])
+        let mut lines = vec![Line::from(Span::styled(
+            " prompt:",
+            Style::default().fg(DIM),
+        ))];
+        let prompt_lines: Vec<&str> = prompt.split('\n').collect();
+        for (idx, prompt_line) in prompt_lines.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(" ", Style::default().fg(DIM)),
+                Span::styled(*prompt_line, Style::default().fg(HEADER_FG)),
+            ];
+            if idx + 1 == prompt_lines.len() {
+                spans.push(Span::styled("_", Style::default().fg(ACCENT)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled(
+            " Enter=submit Esc=cancel (multiline paste supported)",
+            Style::default().fg(DIM),
+        )));
+        (lines, false)
     } else {
         let mut spans: Vec<Span<'_>> = Vec::new();
         spans.push(Span::raw(" "));
@@ -490,7 +546,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        Line::from(spans)
+        (vec![Line::from(spans)], true)
     };
 
     let title = if app.delete_confirm_display().is_some() {
@@ -503,9 +559,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         "Actions"
     };
 
-    let widget = Paragraph::new(line)
+    let widget = Paragraph::new(lines)
         .block(normal_block(title))
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: wrap_trim });
     frame.render_widget(widget, area);
 }
 
@@ -934,8 +990,8 @@ mod tests {
     use crate::TuiApp;
 
     use super::{
-        format_pane_tabs, format_task_row, output_line_style, pane_status_tag, status_line_color,
-        status_sidebar_lines, to_local_time,
+        footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
+        status_line_color, status_sidebar_lines, to_local_time, wrapped_visual_line_count,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1027,6 +1083,32 @@ mod tests {
         assert_eq!(formatted.chars().nth(10), Some(' '));
         assert_eq!(formatted.chars().nth(13), Some(':'));
         assert_eq!(formatted.chars().nth(16), Some(':'));
+    }
+
+    #[test]
+    fn wrapped_visual_line_count_handles_wrapping_and_newlines() {
+        assert_eq!(wrapped_visual_line_count("", 10), 1);
+        assert_eq!(wrapped_visual_line_count("abcd", 2), 2);
+        assert_eq!(wrapped_visual_line_count("abcd\nef", 2), 3);
+        assert_eq!(wrapped_visual_line_count("a\n\nb", 10), 3);
+    }
+
+    #[test]
+    fn footer_height_expands_for_large_prompt_and_clamps() {
+        use crate::app::InputMode;
+
+        let mut app = TuiApp::default();
+        assert_eq!(footer_height(&app, 120), 3);
+
+        app.input_mode = InputMode::NewChatPrompt {
+            buffer: "line 1\nline 2".to_string(),
+        };
+        assert!(footer_height(&app, 120) > 3);
+
+        app.input_mode = InputMode::NewChatPrompt {
+            buffer: "x".repeat(4000),
+        };
+        assert_eq!(footer_height(&app, 40), 12);
     }
 
     #[test]
