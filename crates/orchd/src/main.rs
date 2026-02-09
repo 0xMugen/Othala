@@ -20,8 +20,8 @@ use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_git::{discover_repo, GitCli};
 use orch_graphite::GraphiteClient;
 use orch_tui::{
-    effective_display_state, run_tui_with_hook, AgentPaneStatus, TuiApp, TuiError, TuiEvent,
-    UiAction,
+    effective_display_state, run_tui_with_hook, AgentPane, AgentPaneStatus, TuiApp, TuiError,
+    TuiEvent, UiAction,
 };
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -46,6 +46,72 @@ const DEFAULT_TUI_TICK_MS: u64 = 250;
 const TUI_ORCH_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const TUI_AGENT_TIMEOUT_SECS: u64 = 3600;
 static TUI_EVENT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiChatHistory {
+    root: PathBuf,
+}
+
+impl TuiChatHistory {
+    fn from_event_log_root(event_log_root: &Path) -> Self {
+        let root = event_log_root
+            .parent()
+            .map(|parent| parent.join("chats"))
+            .unwrap_or_else(|| PathBuf::from(".orch/chats"));
+        Self { root }
+    }
+
+    fn ensure_layout(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.root)
+    }
+
+    fn load_lines(&self, task_id: &TaskId) -> io::Result<Vec<String>> {
+        let path = self.task_log_path(task_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        reader.lines().collect()
+    }
+
+    fn append_lines(&self, task_id: &TaskId, lines: &[String]) -> io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        self.ensure_layout()?;
+        let path = self.task_log_path(task_id);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    }
+
+    fn task_log_path(&self, task_id: &TaskId) -> PathBuf {
+        self.root.join(format!("{}.log", sanitize_task_id(&task_id.0)))
+    }
+}
+
+fn sanitize_task_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "task".to_string()
+    } else {
+        out
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunCliArgs {
@@ -219,6 +285,13 @@ fn run() -> Result<(), MainError> {
 fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
     ensure_parent_dir(&args.sqlite_path)?;
     ensure_dir(&args.event_log_root)?;
+    let chat_history = TuiChatHistory::from_event_log_root(&args.event_log_root);
+    if let Err(source) = chat_history.ensure_layout() {
+        return Err(MainError::CreateDir {
+            path: chat_history.root.clone(),
+            source,
+        });
+    }
 
     let org = load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
         path: args.org_config_path.clone(),
@@ -242,9 +315,11 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
 
     let tasks = service.list_tasks()?;
     let mut app = TuiApp::from_tasks(&tasks);
+    let restored_chat_count = hydrate_chat_panes_from_history(&mut app, &tasks, &chat_history);
     app.state.status_line = format!(
-        "tui ready tasks={} tick_ms={} (daemon tick every {}s)",
+        "tui ready tasks={} chats={} tick_ms={} (daemon tick every {}s)",
         tasks.len(),
+        restored_chat_count,
         args.tick_ms,
         TUI_ORCH_TICK_INTERVAL.as_secs()
     );
@@ -324,7 +399,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             app.apply_event(event);
         }
 
-        for event in agent_supervisor.poll_events() {
+        for event in agent_supervisor.poll_events(&chat_history) {
             app.apply_event(event);
         }
 
@@ -661,7 +736,7 @@ impl TuiAgentSupervisor {
         events
     }
 
-    fn poll_events(&mut self) -> Vec<TuiEvent> {
+    fn poll_events(&mut self, chat_history: &TuiChatHistory) -> Vec<TuiEvent> {
         let mut events = Vec::new();
         let mut finished_task_keys = Vec::new();
 
@@ -682,6 +757,14 @@ impl TuiAgentSupervisor {
                 lines.push(line);
             }
             if !lines.is_empty() {
+                if let Err(err) = chat_history.append_lines(&session.task_id, &lines) {
+                    events.push(TuiEvent::StatusLine {
+                        message: format!(
+                            "failed to persist chat history for {}: {err}",
+                            session.task_id.0
+                        ),
+                    });
+                }
                 events.push(TuiEvent::AgentPaneOutput {
                     instance_id: session.instance_id.clone(),
                     task_id: session.task_id.clone(),
@@ -694,11 +777,22 @@ impl TuiAgentSupervisor {
                 Ok(Some(status)) => {
                     let exit_code = status.code().unwrap_or(-1);
                     let success = status.success();
+                    let exit_line = format!("[agent exited code={exit_code}]");
+                    if let Err(err) = chat_history
+                        .append_lines(&session.task_id, std::slice::from_ref(&exit_line))
+                    {
+                        events.push(TuiEvent::StatusLine {
+                            message: format!(
+                                "failed to persist chat history for {}: {err}",
+                                session.task_id.0
+                            ),
+                        });
+                    }
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
                         model: session.model,
-                        lines: vec![format!("[agent exited code={exit_code}]")],
+                        lines: vec![exit_line],
                     });
                     events.push(TuiEvent::AgentPaneStatusChanged {
                         instance_id: session.instance_id.clone(),
@@ -712,11 +806,22 @@ impl TuiAgentSupervisor {
                 }
                 Ok(None) => {}
                 Err(err) => {
+                    let error_line = format!("[agent status error: {err}]");
+                    if let Err(write_err) = chat_history
+                        .append_lines(&session.task_id, std::slice::from_ref(&error_line))
+                    {
+                        events.push(TuiEvent::StatusLine {
+                            message: format!(
+                                "failed to persist chat history for {}: {write_err}",
+                                session.task_id.0
+                            ),
+                        });
+                    }
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
                         model: session.model,
-                        lines: vec![format!("[agent status error: {err}]")],
+                        lines: vec![error_line],
                     });
                     events.push(TuiEvent::AgentPaneStatusChanged {
                         instance_id: session.instance_id.clone(),
@@ -760,6 +865,50 @@ fn push_unique_task_id(tasks: &mut Vec<TaskId>, task_id: &TaskId) {
     if !tasks.iter().any(|existing| existing == task_id) {
         tasks.push(task_id.clone());
     }
+}
+
+fn hydrate_chat_panes_from_history(
+    app: &mut TuiApp,
+    tasks: &[Task],
+    chat_history: &TuiChatHistory,
+) -> usize {
+    let mut restored = 0usize;
+    for task in tasks {
+        let lines = match chat_history.load_lines(&task.id) {
+            Ok(lines) => lines,
+            Err(err) => {
+                app.state.status_line = format!(
+                    "failed to load chat history for {}: {err}",
+                    task.id.0
+                );
+                continue;
+            }
+        };
+        if lines.is_empty() {
+            continue;
+        }
+
+        let mut pane = AgentPane::new(
+            format!("H-{}", task.id.0),
+            task.id.clone(),
+            task.preferred_model.unwrap_or(ModelKind::Codex),
+        );
+        pane.status = AgentPaneStatus::Exited;
+        for line in lines {
+            pane.append_line(line);
+        }
+        app.state.panes.push(pane);
+        restored += 1;
+    }
+
+    if restored > 0 {
+        app.state.selected_pane_idx = app
+            .state
+            .selected_pane_idx
+            .min(app.state.panes.len().saturating_sub(1));
+    }
+
+    restored
 }
 
 fn spawn_pipe_reader<R>(reader: R, tx: mpsc::Sender<String>, is_stderr: bool)
@@ -3719,5 +3868,36 @@ submit_mode = "single"
         assert!(rendered.contains("review codex verdict=RequestChanges"));
         assert!(rendered.contains("issue High src/lib.rs:42 fix logic"));
         assert!(rendered.contains("risks API_BREAK"));
+    }
+
+    #[test]
+    fn tui_chat_history_roundtrips_lines_per_task() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-chat-history-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let history = super::TuiChatHistory { root: root.clone() };
+        history.ensure_layout().expect("create history dir");
+        let task_id = TaskId("T-HISTORY-1".to_string());
+        history
+            .append_lines(
+                &task_id,
+                &[
+                    "first line".to_string(),
+                    "[stderr] second line".to_string(),
+                ],
+            )
+            .expect("append lines");
+
+        let loaded = history.load_lines(&task_id).expect("load lines");
+        assert_eq!(
+            loaded,
+            vec![
+                "first line".to_string(),
+                "[stderr] second line".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

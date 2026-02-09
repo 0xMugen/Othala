@@ -346,6 +346,19 @@ impl TuiApp {
             return idx;
         }
 
+        if let Some(idx) = self
+            .state
+            .panes
+            .iter()
+            .position(|pane| pane.task_id == task_id && pane.status != AgentPaneStatus::Running)
+        {
+            let pane = &mut self.state.panes[idx];
+            pane.instance_id = instance_id.to_string();
+            pane.model = model;
+            pane.status = AgentPaneStatus::Running;
+            return idx;
+        }
+
         let mut pane = AgentPane::new(instance_id.to_string(), task_id, model);
         pane.status = AgentPaneStatus::Running;
         self.state.panes.push(pane);
@@ -404,6 +417,36 @@ mod tests {
 
         assert_eq!(app.state.panes[0].status, AgentPaneStatus::Waiting);
         assert_eq!(app.state.status_line, "pane status updated: A1");
+    }
+
+    #[test]
+    fn apply_event_agent_output_reuses_existing_non_running_task_pane() {
+        let mut app = TuiApp::default();
+        app.state.panes.push(AgentPane {
+            instance_id: "H-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            status: AgentPaneStatus::Exited,
+            updated_at: Utc::now(),
+            lines: std::collections::VecDeque::from(vec!["history".to_string()]),
+        });
+
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A-T1-0".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["new line".to_string()],
+        });
+
+        assert_eq!(app.state.panes.len(), 1);
+        let pane = &app.state.panes[0];
+        assert_eq!(pane.instance_id, "A-T1-0");
+        assert_eq!(pane.model, ModelKind::Codex);
+        assert_eq!(pane.status, AgentPaneStatus::Running);
+        assert_eq!(
+            pane.tail(10),
+            vec!["history".to_string(), "new line".to_string()]
+        );
     }
 
     #[test]
