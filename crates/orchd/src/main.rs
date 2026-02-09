@@ -410,6 +410,9 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         // Bridge: agent signals -> task lifecycle actions.
         for task_id in agent_supervisor.drain_need_human_tasks() {
             let at = Utc::now();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(&mut app, stopped, "needs_human");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     if !orchd::is_transition_allowed(task.state, TaskState::NeedsHuman) {
@@ -452,6 +455,9 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
 
         for task_id in agent_supervisor.drain_patch_ready_tasks() {
             let at = Utc::now();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(&mut app, stopped, "patch_ready");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     // If we can't go directly to Submitting, try routing through Running first.
@@ -512,10 +518,78 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             }
         }
 
+        // Bridge: clean agent exit (without explicit signal) -> submit for speed.
+        for task_id in agent_supervisor.drain_completed_tasks() {
+            let at = Utc::now();
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
+                        if orchd::is_transition_allowed(task.state, TaskState::Running)
+                            && orchd::is_transition_allowed(
+                                TaskState::Running,
+                                TaskState::Submitting,
+                            )
+                        {
+                            if let Err(err) = service.transition_task_state(
+                                &task_id,
+                                TaskState::Running,
+                                tui_event_id(&task_id, "EXIT-RUNNING", at),
+                                at,
+                            ) {
+                                app.state.status_line = format!(
+                                    "agent-complete: failed to transition {} to running: {err}",
+                                    task_id.0,
+                                );
+                                continue;
+                            }
+                        } else {
+                            app.state.status_line = format!(
+                                "agent-complete auto-submit ignored for {} from state {}",
+                                task_id.0,
+                                orchd::task_state_tag(task.state)
+                            );
+                            continue;
+                        }
+                    }
+                    let mode = resolve_submit_mode_for_task(&task, &repo_config_by_id);
+                    match service.start_submit(
+                        &task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&task_id, "EXIT-SUBMIT-S", at),
+                            submit_started: tui_event_id(&task_id, "EXIT-SUBMIT-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            signal_tick_requested = true;
+                            app.state.status_line = format!(
+                                "agent completed for {}; auto-started graphite submit ({mode:?})",
+                                task_id.0
+                            );
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("agent-complete submit failed for {}: {err}", task_id.0);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    app.state.status_line = format!(
+                        "failed to load task {} for agent-complete submit: {err}",
+                        task_id.0
+                    );
+                }
+            }
+        }
+
         // Bridge: conflict_resolved agent signal -> gt add -A + gt continue + resolve restack.
         for task_id in agent_supervisor.drain_conflict_resolved_tasks() {
             let at = Utc::now();
-            agent_supervisor.stop_task_session(&task_id);
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(&mut app, stopped, "conflict_resolved");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     let repo_config = repo_config_by_id.get(&task.repo_id.0);
