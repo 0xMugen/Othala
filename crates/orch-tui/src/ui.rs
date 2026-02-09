@@ -477,6 +477,7 @@ fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Opt
         )),
         Line::from(""),
         Line::from("This permanently removes task state from local storage."),
+        Line::from("It also removes the task worktree and local branch."),
         Line::from(branch_line),
         Line::from(""),
         Line::from(Span::styled(
