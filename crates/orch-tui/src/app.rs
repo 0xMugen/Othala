@@ -12,12 +12,18 @@ pub struct QueuedAction {
     pub action: UiAction,
     pub task_id: Option<TaskId>,
     pub prompt: Option<String>,
+    pub model: Option<ModelKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     NewChatPrompt { buffer: String },
+    ModelSelect {
+        prompt: String,
+        models: Vec<ModelKind>,
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +80,7 @@ impl TuiApp {
             action,
             task_id,
             prompt: None,
+            model: None,
         });
     }
 
@@ -112,10 +119,26 @@ impl TuiApp {
                     self.state.status_line = "pane focus cleared".to_string();
                 } else if !self.state.panes.is_empty() {
                     self.state.focused_pane_idx = Some(self.state.selected_pane_idx);
+                    self.state.focused_task = false;
                     self.state.status_line = format!(
                         "focused pane {}",
                         self.state.selected_pane_idx.saturating_add(1)
                     );
+                }
+            }
+            UiCommand::ToggleFocusedTask => {
+                if self.state.focused_task {
+                    self.state.focused_task = false;
+                    self.state.status_line = "task detail closed".to_string();
+                } else if !self.state.tasks.is_empty() {
+                    self.state.focused_task = true;
+                    self.state.focused_pane_idx = None;
+                    let task_id = self
+                        .state
+                        .selected_task()
+                        .map(|t| t.task_id.0.clone())
+                        .unwrap_or_default();
+                    self.state.status_line = format!("task detail: {task_id}");
                 }
             }
             UiCommand::Quit => self.should_quit = true,
@@ -134,49 +157,90 @@ impl TuiApp {
         match &self.input_mode {
             InputMode::Normal => None,
             InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
+            InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
+        }
+    }
+
+    pub fn model_select_display(&self) -> Option<(&[ModelKind], usize)> {
+        match &self.input_mode {
+            InputMode::ModelSelect {
+                models, selected, ..
+            } => Some((models, *selected)),
+            _ => None,
         }
     }
 
     fn handle_input_mode_key(&mut self, key: KeyEvent) -> bool {
-        let InputMode::NewChatPrompt { buffer } = &mut self.input_mode else {
-            return false;
-        };
-
-        match key.code {
-            KeyCode::Esc => {
-                self.input_mode = InputMode::Normal;
-                self.state.status_line = "new chat prompt canceled".to_string();
-                true
-            }
-            KeyCode::Enter => {
-                let prompt = buffer.trim().to_string();
-                if prompt.is_empty() {
-                    self.state.status_line = "new chat prompt cannot be empty".to_string();
-                    return true;
+        match &mut self.input_mode {
+            InputMode::Normal => return false,
+            InputMode::NewChatPrompt { buffer } => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = "new chat prompt canceled".to_string();
                 }
-                let task_id = self.state.selected_task().map(|task| task.task_id.clone());
-                self.action_queue.push_back(QueuedAction {
-                    action: UiAction::CreateTask,
-                    task_id,
-                    prompt: Some(prompt),
-                });
-                self.input_mode = InputMode::Normal;
-                self.state.status_line = "queued action=create_task (chat)".to_string();
-                true
-            }
-            KeyCode::Backspace => {
-                buffer.pop();
-                true
-            }
-            KeyCode::Char(ch) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return true;
+                KeyCode::Enter => {
+                    let prompt = buffer.trim().to_string();
+                    if prompt.is_empty() {
+                        self.state.status_line = "new chat prompt cannot be empty".to_string();
+                        return true;
+                    }
+                    self.input_mode = InputMode::ModelSelect {
+                        prompt,
+                        models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                        selected: 0,
+                    };
+                    self.state.status_line =
+                        "select model: Up/Down=cycle Enter=confirm Esc=cancel".to_string();
                 }
-                buffer.push(ch);
-                true
-            }
-            _ => true,
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(ch) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        buffer.push(ch);
+                    }
+                }
+                _ => {}
+            },
+            InputMode::ModelSelect {
+                prompt,
+                models,
+                selected,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = "model selection canceled".to_string();
+                }
+                KeyCode::Up => {
+                    if *selected == 0 {
+                        *selected = models.len().saturating_sub(1);
+                    } else {
+                        *selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    *selected = (*selected + 1) % models.len();
+                }
+                KeyCode::Enter => {
+                    let chosen_model = models[*selected];
+                    let prompt_value = prompt.clone();
+                    let task_id = self.state.selected_task().map(|task| task.task_id.clone());
+                    self.action_queue.push_back(QueuedAction {
+                        action: UiAction::CreateTask,
+                        task_id,
+                        prompt: Some(prompt_value),
+                        model: Some(chosen_model),
+                    });
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = format!(
+                        "queued action=create_task (chat) model={:?}",
+                        chosen_model
+                    );
+                }
+                _ => {}
+            },
         }
+        true
     }
 
     pub fn apply_event(&mut self, event: TuiEvent) {
@@ -475,11 +539,120 @@ mod tests {
         }
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
+        // After pressing Enter on the prompt, we should be in ModelSelect mode
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::ModelSelect { .. }
+        ));
+        assert_eq!(
+            app.state.status_line,
+            "select model: Up/Down=cycle Enter=confirm Esc=cancel"
+        );
+
+        // Confirm model selection (default is Claude at index 0)
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
         assert!(matches!(app.input_mode, super::InputMode::Normal));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].action, UiAction::CreateTask);
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
         assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
+        assert_eq!(drained[0].model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn model_select_arrow_keys_cycle_through_models() {
+        let mut app = TuiApp::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        for ch in "test prompt".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Default selected is 0 (Claude)
+        assert_eq!(app.model_select_display().unwrap().1, 0);
+
+        // Down -> Codex (index 1)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.model_select_display().unwrap().1, 1);
+
+        // Down -> Gemini (index 2)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.model_select_display().unwrap().1, 2);
+
+        // Down wraps -> Claude (index 0)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.model_select_display().unwrap().1, 0);
+
+        // Up wraps -> Gemini (index 2)
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.model_select_display().unwrap().1, 2);
+
+        // Confirm Gemini
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].model, Some(ModelKind::Gemini));
+    }
+
+    #[test]
+    fn handle_key_event_enter_toggles_focused_task_and_clears_focused_pane() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+
+        // Set a focused pane to verify it gets cleared
+        app.state.focused_pane_idx = Some(0);
+
+        // Enter opens task detail
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.state.focused_task);
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.status_line, "task detail: T1");
+
+        // Enter again closes task detail
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.state.focused_task);
+        assert_eq!(app.state.status_line, "task detail closed");
+    }
+
+    #[test]
+    fn handle_key_event_enter_does_nothing_when_no_tasks() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.state.focused_task);
+    }
+
+    #[test]
+    fn model_select_esc_cancels_and_returns_to_normal() {
+        let mut app = TuiApp::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        for ch in "test".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::ModelSelect { .. }
+        ));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "model selection canceled");
+        let drained = app.drain_actions();
+        assert!(drained.is_empty());
     }
 }

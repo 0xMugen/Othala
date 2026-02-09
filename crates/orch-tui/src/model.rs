@@ -107,6 +107,7 @@ pub struct DashboardState {
     pub selected_task_idx: usize,
     pub selected_pane_idx: usize,
     pub focused_pane_idx: Option<usize>,
+    pub focused_task: bool,
     pub status_line: String,
 }
 
@@ -119,6 +120,7 @@ impl Default for DashboardState {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             focused_pane_idx: None,
+            focused_task: false,
             status_line: "ready".to_string(),
         }
     }

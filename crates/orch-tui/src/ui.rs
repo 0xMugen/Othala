@@ -20,7 +20,9 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
 
     render_header(frame, root[0], app);
 
-    if app.state.focused_pane_idx.is_some() {
+    if app.state.focused_task {
+        render_focused_task(frame, root[1], app);
+    } else if app.state.focused_pane_idx.is_some() {
         render_focused_pane(frame, root[1], app);
     } else {
         let body = Layout::default()
@@ -170,18 +172,72 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(widget, area);
 }
 
+fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let selected_task = app
+        .state
+        .selected_task()
+        .map(|t| t.task_id.0.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let lines: Vec<Line<'_>> = if app.state.selected_task_activity.is_empty() {
+        vec![Line::from("no task activity yet")]
+    } else {
+        app.state
+            .selected_task_activity
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect()
+    };
+
+    let widget = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Task Detail ({selected_task})"))
+                .border_style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = "keys: c=new-chat a=approve s=start x=stop r=restart q=quick f=full t=restack n=needs-human w=web p=pause u=resume | arrows=select tab=focus esc/ctrl-c=quit";
-    let line = if let Some(prompt) = app.input_prompt() {
-        format!(
-            "{} | compose: {}_ | status: {}",
-            help, prompt, app.state.status_line
+    let (title, line) = if let Some((models, selected)) = app.model_select_display() {
+        let picker = models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if i == selected {
+                    format!("[{m:?}]")
+                } else {
+                    format!(" {m:?} ")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        (
+            "Select Model",
+            format!(
+                "model: {}  (Up/Down=cycle Enter=confirm Esc=cancel)",
+                picker
+            ),
+        )
+    } else if let Some(prompt) = app.input_prompt() {
+        (
+            "New Chat",
+            format!("prompt: {}_ (Enter=submit Esc=cancel)", prompt),
         )
     } else {
-        format!("{} | status: {}", help, app.state.status_line)
+        (
+            "Actions",
+            format!(
+                "c=new-chat a=approve s=start x=stop r=restart q=quick f=full t=restack n=needs-human w=web p=pause u=resume | arrows=select tab=focus enter=detail esc/ctrl-c=quit | {}",
+                app.state.status_line
+            ),
+        )
     };
     let widget = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title("Actions"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }

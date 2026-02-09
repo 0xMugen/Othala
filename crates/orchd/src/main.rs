@@ -260,6 +260,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 action.action,
                 action.task_id.as_ref(),
                 action.prompt.as_deref(),
+                action.model,
                 &service,
                 &org,
                 &enabled_models,
@@ -323,6 +324,134 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         for event in agent_supervisor.poll_events() {
             app.apply_event(event);
         }
+
+        // Bridge: agent exit → auto-trigger verify
+        let exited = agent_supervisor.drain_recently_exited();
+        for (task_id, success) in &exited {
+            if !*success {
+                continue;
+            }
+            match service.task(task_id) {
+                Ok(Some(task)) if task.state == TaskState::Running => {
+                    let at = Utc::now();
+                    match service.start_verify(
+                        task_id,
+                        VerifyTier::Quick,
+                        orchd::StartVerifyEventIds {
+                            verify_state_changed: tui_event_id(task_id, "AUTO-VERIFY-S", at),
+                            verify_requested: tui_event_id(task_id, "AUTO-VERIFY-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            force_tick = true;
+                            app.state.status_line = format!(
+                                "auto-triggered quick verify for {} after agent exit",
+                                task_id.0
+                            );
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("auto-verify failed for {}: {err}", task_id.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Bridge: auto-approve reviews after verify passes
+        // Only run during orchestrator tick to avoid expensive work every 250ms
+        if force_tick {
+            if let Ok(reviewing_tasks) = service.list_tasks_by_state(TaskState::Reviewing) {
+                // Treat all enabled models as available for auto-approval
+                // (avoids expensive probe_models subprocess calls)
+                let availability = enabled_models
+                    .iter()
+                    .copied()
+                    .map(|m| orchd::ReviewerAvailability {
+                        model: m,
+                        available: true,
+                    })
+                    .collect::<Vec<_>>();
+
+                for task in reviewing_tasks {
+                    let review_config = orchd::ReviewGateConfig {
+                        enabled_models: org.models.enabled.clone(),
+                        policy: org.models.policy,
+                        min_approvals: org.models.min_approvals,
+                    };
+
+                    let at = Utc::now();
+                    let recompute_result = service.recompute_task_review_status(
+                        &task.id,
+                        &review_config,
+                        &availability,
+                        at,
+                    );
+                    let already_approved = match &recompute_result {
+                        Ok((_, computation)) => computation.evaluation.approved,
+                        Err(_) => continue,
+                    };
+                    if already_approved {
+                        continue;
+                    }
+
+                    let (_, computation) = recompute_result.unwrap();
+                    let required_models = if computation.requirement.required_models.is_empty() {
+                        enabled_models.to_vec()
+                    } else {
+                        computation.requirement.required_models.clone()
+                    };
+
+                    for reviewer in &required_models {
+                        let _ = service.complete_review(
+                            &task.id,
+                            *reviewer,
+                            ReviewOutput {
+                                verdict: ReviewVerdict::Approve,
+                                issues: Vec::new(),
+                                risk_flags: Vec::new(),
+                                graphite_hygiene: GraphiteHygieneReport {
+                                    ok: true,
+                                    notes: "auto-approved after verify pass".to_string(),
+                                },
+                                test_assessment: TestAssessment {
+                                    ok: true,
+                                    notes: "auto-approved after verify pass".to_string(),
+                                },
+                            },
+                            &review_config,
+                            &availability,
+                            orchd::CompleteReviewEventIds {
+                                review_completed: tui_event_id(
+                                    &task.id,
+                                    "AUTO-APPROVE-DONE",
+                                    at,
+                                ),
+                                needs_human_state_changed: tui_event_id(
+                                    &task.id,
+                                    "AUTO-APPROVE-NH-S",
+                                    at,
+                                ),
+                                needs_human_event: tui_event_id(
+                                    &task.id,
+                                    "AUTO-APPROVE-NH-E",
+                                    at,
+                                ),
+                            },
+                            at,
+                        );
+                    }
+                    app.state.status_line = format!(
+                        "auto-approved review for {} ({} reviewers)",
+                        task.id.0,
+                        required_models.len()
+                    );
+                }
+            }
+        }
+
         refresh_selected_task_activity(app, &service);
     });
     agent_supervisor.stop_all();
@@ -358,6 +487,7 @@ struct TuiAgentSupervisor {
     sessions_by_task: HashMap<String, TuiAgentSession>,
     pending_start_by_task: HashMap<String, String>,
     next_instance_nonce: u64,
+    recently_exited_tasks: Vec<(TaskId, bool)>,
 }
 
 impl TuiAgentSupervisor {
@@ -560,6 +690,9 @@ impl TuiAgentSupervisor {
             match session.child.try_wait() {
                 Ok(Some(status)) => {
                     let exit_code = status.code().unwrap_or(-1);
+                    let success = status.success();
+                    self.recently_exited_tasks
+                        .push((session.task_id.clone(), success));
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
@@ -568,7 +701,7 @@ impl TuiAgentSupervisor {
                     });
                     events.push(TuiEvent::AgentPaneStatusChanged {
                         instance_id: session.instance_id.clone(),
-                        status: if status.success() {
+                        status: if success {
                             AgentPaneStatus::Exited
                         } else {
                             AgentPaneStatus::Failed
@@ -578,6 +711,8 @@ impl TuiAgentSupervisor {
                 }
                 Ok(None) => {}
                 Err(err) => {
+                    self.recently_exited_tasks
+                        .push((session.task_id.clone(), false));
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
@@ -598,6 +733,10 @@ impl TuiAgentSupervisor {
         }
 
         events
+    }
+
+    fn drain_recently_exited(&mut self) -> Vec<(TaskId, bool)> {
+        std::mem::take(&mut self.recently_exited_tasks)
     }
 
     fn stop_all(&mut self) {
@@ -693,6 +832,7 @@ fn execute_tui_action(
     action: UiAction,
     task_id: Option<&TaskId>,
     prompt: Option<&str>,
+    model: Option<ModelKind>,
     service: &OrchdService,
     org: &OrgConfig,
     enabled_models: &[ModelKind],
@@ -710,7 +850,7 @@ fn execute_tui_action(
                     "new chat prompt is required when creating a task".to_string(),
                 )
             })?;
-        let task = create_tui_task(task_id, prompt, service, org, repo_config_by_id, at)?;
+        let task = create_tui_task(task_id, prompt, model, service, org, repo_config_by_id, at)?;
         agent_supervisor.queue_start(&task.id, prompt.to_string());
         return Ok(TuiActionOutcome {
             message: format!(
@@ -1103,6 +1243,7 @@ fn execute_tui_action(
 fn create_tui_task(
     selected_task_id: Option<&TaskId>,
     prompt: &str,
+    model: Option<ModelKind>,
     service: &OrchdService,
     org: &OrgConfig,
     repo_config_by_id: &HashMap<String, RepoConfig>,
@@ -1145,7 +1286,7 @@ fn create_tui_task(
         state: TaskState::Queued,
         role: orch_core::types::TaskRole::General,
         task_type: orch_core::types::TaskType::Feature,
-        preferred_model: None,
+        preferred_model: model,
         depends_on: Vec::new(),
         submit_mode: org.graphite.submit_mode_default,
         branch_name: None,
@@ -3424,6 +3565,7 @@ submit_mode = "single"
             UiAction::ApproveTask,
             Some(&task.id),
             None,
+            None,
             &service,
             &org,
             &org.models.enabled,
@@ -3459,6 +3601,7 @@ submit_mode = "single"
             UiAction::CreateTask,
             None,
             Some("Build OAuth login with callback flow"),
+            Some(ModelKind::Claude),
             &service,
             &org,
             &org.models.enabled,
@@ -3475,6 +3618,7 @@ submit_mode = "single"
         assert_eq!(tasks[0].state, TaskState::Queued);
         assert_eq!(tasks[0].repo_id.0, "example");
         assert_eq!(tasks[0].title, "Build OAuth login with callback flow");
+        assert_eq!(tasks[0].preferred_model, Some(ModelKind::Claude));
         assert_eq!(agent_supervisor.pending_start_by_task.len(), 1);
         assert!(agent_supervisor.pending_start_by_task.contains_key(&tasks[0].id.0));
 

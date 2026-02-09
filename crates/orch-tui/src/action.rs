@@ -26,6 +26,7 @@ pub enum UiCommand {
     SelectNextPane,
     SelectPreviousPane,
     ToggleFocusedPane,
+    ToggleFocusedTask,
     Quit,
 }
 
@@ -47,6 +48,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Right => Some(UiCommand::SelectNextPane),
         KeyCode::Left => Some(UiCommand::SelectPreviousPane),
         KeyCode::Tab => Some(UiCommand::ToggleFocusedPane),
+        KeyCode::Enter => Some(UiCommand::ToggleFocusedTask),
         KeyCode::Char('c') => Some(UiCommand::Dispatch(UiAction::CreateTask)),
         KeyCode::Char('a') => Some(UiCommand::Dispatch(UiAction::ApproveTask)),
         KeyCode::Char('s') => Some(UiCommand::Dispatch(UiAction::StartAgent)),
@@ -127,6 +129,10 @@ mod tests {
         assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
             Some(UiCommand::Dispatch(UiAction::ResumeTask))
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::ToggleFocusedTask)
         );
     }
 
