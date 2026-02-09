@@ -397,6 +397,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let keys: &[(&str, &str)] = &[
             ("c", "chat"),
             ("a", "approve"),
+            ("g", "submit"),
             ("s", "start"),
             ("x", "stop"),
             ("r", "restart"),

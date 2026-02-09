@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum UiAction {
     CreateTask,
     ApproveTask,
+    SubmitTask,
     StartAgent,
     StopAgent,
     RestartAgent,
@@ -51,6 +52,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Enter => Some(UiCommand::ToggleFocusedTask),
         KeyCode::Char('c') => Some(UiCommand::Dispatch(UiAction::CreateTask)),
         KeyCode::Char('a') => Some(UiCommand::Dispatch(UiAction::ApproveTask)),
+        KeyCode::Char('g') => Some(UiCommand::Dispatch(UiAction::SubmitTask)),
         KeyCode::Char('s') => Some(UiCommand::Dispatch(UiAction::StartAgent)),
         KeyCode::Char('x') => Some(UiCommand::Dispatch(UiAction::StopAgent)),
         KeyCode::Char('r') => Some(UiCommand::Dispatch(UiAction::RestartAgent)),
@@ -69,6 +71,7 @@ pub fn action_label(action: UiAction) -> &'static str {
     match action {
         UiAction::CreateTask => "create_task",
         UiAction::ApproveTask => "approve_task",
+        UiAction::SubmitTask => "submit_task",
         UiAction::StartAgent => "start_agent",
         UiAction::StopAgent => "stop_agent",
         UiAction::RestartAgent => "restart_agent",
@@ -115,6 +118,10 @@ mod tests {
             Some(UiCommand::Dispatch(UiAction::ApproveTask))
         );
         assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::SubmitTask))
+        );
+        assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(UiCommand::Dispatch(UiAction::RunVerifyQuick))
         );
@@ -156,6 +163,7 @@ mod tests {
     fn action_label_matches_expected_snake_case_values() {
         assert_eq!(action_label(UiAction::CreateTask), "create_task");
         assert_eq!(action_label(UiAction::ApproveTask), "approve_task");
+        assert_eq!(action_label(UiAction::SubmitTask), "submit_task");
         assert_eq!(action_label(UiAction::StartAgent), "start_agent");
         assert_eq!(action_label(UiAction::StopAgent), "stop_agent");
         assert_eq!(action_label(UiAction::RestartAgent), "restart_agent");

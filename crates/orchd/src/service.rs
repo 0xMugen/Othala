@@ -2323,13 +2323,13 @@ mod tests {
     }
 
     #[test]
-    fn start_submit_rejects_invalid_transition() {
+    fn start_submit_transitions_running_to_submitting_and_emits_started() {
         let svc = mk_service();
         let task = mk_task("TSSTART3", TaskState::Running, &[]);
         svc.create_task(&task, &mk_created_event(&task))
             .expect("create task");
 
-        let err = svc
+        let updated = svc
             .start_submit(
                 &task.id,
                 SubmitMode::Single,
@@ -2339,17 +2339,25 @@ mod tests {
                 },
                 Utc::now(),
             )
-            .expect_err("submit from running should be invalid");
+            .expect("start submit");
 
-        assert!(matches!(
-            err,
-            crate::service::ServiceError::StateMachine(
-                crate::state_machine::StateMachineError::InvalidTransition {
-                    from: TaskState::Running,
-                    to: TaskState::Submitting
+        assert_eq!(updated.state, TaskState::Submitting);
+        let events = svc.task_events(&task.id).expect("events");
+        assert!(events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStateChanged { from, to }
+                    if from == "RUNNING" && to == "SUBMITTING"
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::SubmitStarted {
+                    mode: SubmitMode::Single
                 }
             )
-        ));
+        }));
     }
 
     #[test]

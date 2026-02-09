@@ -1,8 +1,8 @@
 use chrono::{Local, Utc};
 use orch_agents::{
-    default_adapter_for, probe_models, summarize_setup, validate_setup_selection, EpochRequest,
-    ModelSetupSelection, SetupError, SetupProbeConfig, SetupProbeReport, SetupSummary,
-    ValidatedSetupSelection,
+    default_adapter_for, detect_common_signal, probe_models, summarize_setup,
+    validate_setup_selection, AgentSignalKind, EpochRequest, ModelSetupSelection, SetupError,
+    SetupProbeConfig, SetupProbeReport, SetupSummary, ValidatedSetupSelection,
 };
 use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
@@ -328,129 +328,117 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             app.apply_event(event);
         }
 
-        // Bridge: agent exit → auto-trigger verify
-        let exited = agent_supervisor.drain_recently_exited();
-        for (task_id, success) in &exited {
-            if !*success {
-                continue;
-            }
-            match service.task(task_id) {
-                Ok(Some(task)) if task.state == TaskState::Running => {
-                    let at = Utc::now();
-                    match service.start_verify(
-                        task_id,
-                        VerifyTier::Quick,
-                        orchd::StartVerifyEventIds {
-                            verify_state_changed: tui_event_id(task_id, "AUTO-VERIFY-S", at),
-                            verify_requested: tui_event_id(task_id, "AUTO-VERIFY-E", at),
+        let mut signal_tick_requested = false;
+
+        // Bridge: agent signals -> task lifecycle actions.
+        for task_id in agent_supervisor.drain_need_human_tasks() {
+            let at = Utc::now();
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    if !orchd::is_transition_allowed(task.state, TaskState::NeedsHuman) {
+                        app.state.status_line = format!(
+                            "needs-human signal ignored for {} from state {}",
+                            task_id.0,
+                            orchd::task_state_tag(task.state)
+                        );
+                        continue;
+                    }
+                    match service.mark_needs_human(
+                        &task_id,
+                        "agent requested human input",
+                        orchd::MarkNeedsHumanEventIds {
+                            needs_human_state_changed: tui_event_id(&task_id, "SIG-NH-S", at),
+                            needs_human_event: tui_event_id(&task_id, "SIG-NH-E", at),
                         },
                         at,
                     ) {
                         Ok(_) => {
-                            force_tick = true;
+                            signal_tick_requested = true;
+                            app.state.status_line =
+                                format!("marked {} as NEEDS_HUMAN from agent signal", task_id.0);
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("failed to mark {} needs-human: {err}", task_id.0);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    app.state.status_line =
+                        format!("failed to load task {} for needs-human signal: {err}", task_id.0);
+                }
+            }
+        }
+
+        for task_id in agent_supervisor.drain_patch_ready_tasks() {
+            let at = Utc::now();
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
+                        app.state.status_line = format!(
+                            "patch-ready signal ignored for {} from state {}",
+                            task_id.0,
+                            orchd::task_state_tag(task.state)
+                        );
+                        continue;
+                    }
+                    let mode = resolve_submit_mode_for_task(&task, &repo_config_by_id);
+                    match service.start_submit(
+                        &task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&task_id, "SIG-SUBMIT-S", at),
+                            submit_started: tui_event_id(&task_id, "SIG-SUBMIT-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            signal_tick_requested = true;
                             app.state.status_line = format!(
-                                "auto-triggered quick verify for {} after agent exit",
+                                "patch-ready detected for {}; started graphite submit ({mode:?})",
                                 task_id.0
                             );
                         }
                         Err(err) => {
                             app.state.status_line =
-                                format!("auto-verify failed for {}: {err}", task_id.0);
+                                format!("failed to start submit for {}: {err}", task_id.0);
                         }
                     }
                 }
-                _ => {}
+                Ok(None) => {}
+                Err(err) => {
+                    app.state.status_line =
+                        format!("failed to load task {} for submit signal: {err}", task_id.0);
+                }
             }
         }
 
-        // Bridge: auto-approve reviews after verify passes
-        // Only run during orchestrator tick to avoid expensive work every 250ms
-        if force_tick {
-            if let Ok(reviewing_tasks) = service.list_tasks_by_state(TaskState::Reviewing) {
-                // Treat all enabled models as available for auto-approval
-                // (avoids expensive probe_models subprocess calls)
-                let availability = enabled_models
-                    .iter()
-                    .copied()
-                    .map(|m| orchd::ReviewerAvailability {
-                        model: m,
-                        available: true,
-                    })
-                    .collect::<Vec<_>>();
-
-                for task in reviewing_tasks {
-                    let review_config = orchd::ReviewGateConfig {
-                        enabled_models: org.models.enabled.clone(),
-                        policy: org.models.policy,
-                        min_approvals: org.models.min_approvals,
-                    };
-
-                    let at = Utc::now();
-                    let recompute_result = service.recompute_task_review_status(
-                        &task.id,
-                        &review_config,
-                        &availability,
-                        at,
-                    );
-                    let already_approved = match &recompute_result {
-                        Ok((_, computation)) => computation.evaluation.approved,
-                        Err(_) => continue,
-                    };
-                    if already_approved {
-                        continue;
+        if signal_tick_requested {
+            let at = Utc::now();
+            match run_single_orchestrator_tick(
+                &service,
+                &runtime,
+                &org,
+                &repo_config_by_id,
+                &enabled_models,
+                &probe_config,
+                at,
+            ) {
+                Ok(status) => {
+                    if let Some(status) = status {
+                        app.state.status_line = status;
                     }
-
-                    let (_, computation) = recompute_result.unwrap();
-                    let required_models = if computation.requirement.required_models.is_empty() {
-                        enabled_models.to_vec()
-                    } else {
-                        computation.requirement.required_models.clone()
-                    };
-
-                    for reviewer in &required_models {
-                        let _ = service.complete_review(
-                            &task.id,
-                            *reviewer,
-                            ReviewOutput {
-                                verdict: ReviewVerdict::Approve,
-                                issues: Vec::new(),
-                                risk_flags: Vec::new(),
-                                graphite_hygiene: GraphiteHygieneReport {
-                                    ok: true,
-                                    notes: "auto-approved after verify pass".to_string(),
-                                },
-                                test_assessment: TestAssessment {
-                                    ok: true,
-                                    notes: "auto-approved after verify pass".to_string(),
-                                },
-                            },
-                            &review_config,
-                            &availability,
-                            orchd::CompleteReviewEventIds {
-                                review_completed: tui_event_id(
-                                    &task.id,
-                                    "AUTO-APPROVE-DONE",
-                                    at,
-                                ),
-                                needs_human_state_changed: tui_event_id(
-                                    &task.id,
-                                    "AUTO-APPROVE-NH-S",
-                                    at,
-                                ),
-                                needs_human_event: tui_event_id(
-                                    &task.id,
-                                    "AUTO-APPROVE-NH-E",
-                                    at,
-                                ),
-                            },
-                            at,
-                        );
-                    }
-                    app.state.status_line = format!(
-                        "auto-approved review for {} ({} reviewers)",
-                        task.id.0,
-                        required_models.len()
-                    );
+                }
+                Err(err) => {
+                    app.state.status_line = format!("daemon tick failed: {err}");
+                }
+            }
+            last_orch_tick = Instant::now();
+            match service.list_tasks() {
+                Ok(tasks) => app.set_tasks(&tasks),
+                Err(err) => {
+                    app.state.status_line = format!("failed to refresh tasks: {err}");
                 }
             }
         }
@@ -490,7 +478,8 @@ struct TuiAgentSupervisor {
     sessions_by_task: HashMap<String, TuiAgentSession>,
     pending_start_by_task: HashMap<String, String>,
     next_instance_nonce: u64,
-    recently_exited_tasks: Vec<(TaskId, bool)>,
+    pending_patch_ready_tasks: Vec<TaskId>,
+    pending_needs_human_tasks: Vec<TaskId>,
 }
 
 impl TuiAgentSupervisor {
@@ -679,6 +668,17 @@ impl TuiAgentSupervisor {
         for (task_key, session) in &mut self.sessions_by_task {
             let mut lines = Vec::new();
             while let Ok(line) = session.output_rx.try_recv() {
+                if let Some(signal) = detect_common_signal(&line) {
+                    match signal.kind {
+                        AgentSignalKind::PatchReady => {
+                            push_unique_task_id(&mut self.pending_patch_ready_tasks, &session.task_id)
+                        }
+                        AgentSignalKind::NeedHuman => {
+                            push_unique_task_id(&mut self.pending_needs_human_tasks, &session.task_id)
+                        }
+                        AgentSignalKind::RateLimited | AgentSignalKind::ErrorHint => {}
+                    }
+                }
                 lines.push(line);
             }
             if !lines.is_empty() {
@@ -694,8 +694,6 @@ impl TuiAgentSupervisor {
                 Ok(Some(status)) => {
                     let exit_code = status.code().unwrap_or(-1);
                     let success = status.success();
-                    self.recently_exited_tasks
-                        .push((session.task_id.clone(), success));
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
@@ -714,8 +712,6 @@ impl TuiAgentSupervisor {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    self.recently_exited_tasks
-                        .push((session.task_id.clone(), false));
                     events.push(TuiEvent::AgentPaneOutput {
                         instance_id: session.instance_id.clone(),
                         task_id: session.task_id.clone(),
@@ -738,8 +734,12 @@ impl TuiAgentSupervisor {
         events
     }
 
-    fn drain_recently_exited(&mut self) -> Vec<(TaskId, bool)> {
-        std::mem::take(&mut self.recently_exited_tasks)
+    fn drain_patch_ready_tasks(&mut self) -> Vec<TaskId> {
+        std::mem::take(&mut self.pending_patch_ready_tasks)
+    }
+
+    fn drain_need_human_tasks(&mut self) -> Vec<TaskId> {
+        std::mem::take(&mut self.pending_needs_human_tasks)
     }
 
     fn stop_all(&mut self) {
@@ -753,6 +753,12 @@ impl TuiAgentSupervisor {
             let _ = self.stop_task_session(&task_id);
         }
         self.pending_start_by_task.clear();
+    }
+}
+
+fn push_unique_task_id(tasks: &mut Vec<TaskId>, task_id: &TaskId) {
+    if !tasks.iter().any(|existing| existing == task_id) {
+        tasks.push(task_id.clone());
     }
 }
 
@@ -819,9 +825,11 @@ fn task_agent_prompt(task: &Task, user_prompt: Option<&str>) -> String {
         "You are working on task {id}: {title}\n\
 State: {state:?}\n\
 Role: {role:?}\n\
-Type: {task_type:?}\n\
-Requested work:\n{requested_work}\n\
-Work in this task worktree, make focused changes, and report progress.",
+	Type: {task_type:?}\n\
+	Requested work:\n{requested_work}\n\
+	Work in this task worktree, make focused changes, and report progress.\n\
+	When implementation is complete and ready to submit, print exactly [patch_ready].\n\
+	If blocked and human input is required, print exactly [needs_human] with a short reason.",
         id = task.id.0,
         title = task.title,
         state = task.state,
@@ -829,6 +837,13 @@ Work in this task worktree, make focused changes, and report progress.",
         task_type = task.task_type,
         requested_work = requested_work
     )
+}
+
+fn resolve_submit_mode_for_task(task: &Task, repo_config_by_id: &HashMap<String, RepoConfig>) -> SubmitMode {
+    repo_config_by_id
+        .get(&task.repo_id.0)
+        .and_then(|cfg| cfg.graphite.submit_mode)
+        .unwrap_or(task.submit_mode)
 }
 
 fn execute_tui_action(
@@ -1161,6 +1176,23 @@ fn execute_tui_action(
             )?;
             TuiActionOutcome {
                 message: format!("triggered quick verify for {}", selected_task_id.0),
+                force_tick: true,
+                events: Vec::new(),
+            }
+        }
+        UiAction::SubmitTask => {
+            let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+            let _ = service.start_submit(
+                &selected_task_id,
+                mode,
+                orchd::StartSubmitEventIds {
+                    submit_state_changed: tui_event_id(&selected_task_id, "SUBMIT-S", at),
+                    submit_started: tui_event_id(&selected_task_id, "SUBMIT-E", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("started graphite submit for {} ({mode:?})", selected_task_id.0),
                 force_tick: true,
                 events: Vec::new(),
             }

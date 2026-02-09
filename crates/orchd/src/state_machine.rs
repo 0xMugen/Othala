@@ -42,9 +42,11 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (Queued, Initializing) => true,
         (Initializing, DraftPrOpen | Failed | Paused) => true,
         (DraftPrOpen, Running | Failed | Paused) => true,
-        (Running, Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Failed | Paused) => {
-            true
-        }
+        (
+            Running,
+            Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Submitting | Failed
+                | Paused,
+        ) => true,
         (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
         (RestackConflict, Restacking | NeedsHuman | Failed | Paused) => true,
         (VerifyingQuick, Reviewing | Running | Failed | NeedsHuman | Paused) => true,
@@ -184,6 +186,10 @@ mod tests {
     #[test]
     fn allows_pause_from_active_states_and_resume_from_failed() {
         assert!(is_transition_allowed(TaskState::Running, TaskState::Paused));
+        assert!(is_transition_allowed(
+            TaskState::Running,
+            TaskState::Submitting
+        ));
         assert!(is_transition_allowed(
             TaskState::Reviewing,
             TaskState::Paused
