@@ -616,6 +616,75 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             }
         }
 
+        // Merge detection: check if AwaitingMerge tasks have been merged.
+        if let Ok(tasks) = service.list_tasks() {
+            for task in &tasks {
+                if task.state != TaskState::AwaitingMerge {
+                    continue;
+                }
+                let branch_name = match task.branch_name.as_deref() {
+                    Some(name) if !name.trim().is_empty() => name,
+                    _ => continue,
+                };
+                let repo_config = match repo_config_by_id.get(&task.repo_id.0) {
+                    Some(cfg) => cfg,
+                    None => continue,
+                };
+                if is_branch_merged(
+                    &repo_config.repo_path,
+                    branch_name,
+                    &repo_config.base_branch,
+                ) {
+                    let at = Utc::now();
+                    // Stop any running agent for this task.
+                    if let Some(stopped) = agent_supervisor.stop_task_session(&task.id) {
+                        app.apply_event(TuiEvent::AgentPaneOutput {
+                            instance_id: stopped.instance_id.clone(),
+                            task_id: stopped.task_id.clone(),
+                            model: stopped.model,
+                            lines: vec!["[agent stopped: task merged]".to_string()],
+                        });
+                        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                            instance_id: stopped.instance_id,
+                            status: AgentPaneStatus::Exited,
+                        });
+                    }
+                    // Transition to Merged.
+                    match service.transition_task_state(
+                        &task.id,
+                        TaskState::Merged,
+                        tui_event_id(&task.id, "MERGE-DETECTED", at),
+                        at,
+                    ) {
+                        Ok(_) => {
+                            // Clean up worktree and branch.
+                            match cleanup_task_git_resources(task, &repo_config_by_id) {
+                                Ok(summary) => {
+                                    app.state.status_line = format!(
+                                        "task {} merged and cleaned up ({summary})",
+                                        task.id.0
+                                    );
+                                }
+                                Err(err) => {
+                                    app.state.status_line = format!(
+                                        "task {} merged but cleanup failed: {err}",
+                                        task.id.0
+                                    );
+                                }
+                            }
+                            signal_tick_requested = true;
+                        }
+                        Err(err) => {
+                            app.state.status_line = format!(
+                                "merge detected for {} but transition failed: {err}",
+                                task.id.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if signal_tick_requested {
             let at = Utc::now();
             match run_single_orchestrator_tick(
@@ -1946,6 +2015,18 @@ fn execute_tui_action(
     };
 
     Ok(outcome)
+}
+
+fn is_branch_merged(repo_root: &Path, branch: &str, base_branch: &str) -> bool {
+    let git = GitCli::default();
+    // `git branch --merged <base>` lists branches whose tip is reachable from <base>.
+    match git.run(repo_root, ["branch", "--merged", base_branch]) {
+        Ok(output) => output
+            .stdout
+            .lines()
+            .any(|line| line.trim().trim_start_matches("* ") == branch),
+        Err(_) => false,
+    }
 }
 
 fn cleanup_task_git_resources(
