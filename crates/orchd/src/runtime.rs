@@ -354,11 +354,12 @@ impl RuntimeEngine {
         let _ = client.abort_rebase();
 
         // Detach HEAD in sibling worktrees so gt restack can rebase their branches.
-        let detached = detach_sibling_worktrees(&self.git, repo_config, task);
+        let all_tasks = service.list_tasks()?;
+        let detached = detach_sibling_worktrees(&self.git, repo_config, task, &all_tasks);
 
         // Move onto the stack anchor before restacking so the branch is properly stacked.
         if let Some(anchor_branch) =
-            select_stack_anchor_branch(&service.list_tasks()?, task)
+            select_stack_anchor_branch(&all_tasks, task)
         {
             if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
                 service.record_event(&Event {
@@ -567,7 +568,8 @@ impl RuntimeEngine {
         let _ = repo_client.sync_trunk();
 
         // Detach HEAD in sibling worktrees so gt restack can rebase their branches.
-        let detached = detach_sibling_worktrees(&self.git, repo_config, task);
+        let all_tasks = service.list_tasks()?;
+        let detached = detach_sibling_worktrees(&self.git, repo_config, task, &all_tasks);
 
         // Restack so graphite considers the stack clean before submit.
         // On conflict or error, transition to Restacking so the conflict
@@ -812,10 +814,20 @@ fn select_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> 
 ///
 /// Returns a list of `(worktree_path, branch)` pairs that were detached so
 /// callers can re-attach them later with [`reattach_worktrees`].
+/// Detach HEAD in sibling worktrees so that `gt restack` / `gt move` can
+/// freely rebase branches that are checked out elsewhere.
+///
+/// Returns the list of (path, branch) pairs that were detached so that
+/// callers can re-attach them later with [`reattach_worktrees`].
+///
+/// Before detaching, this function first **reattaches** any worktrees that
+/// are already detached (e.g. from a previous interrupted operation).  This
+/// makes the detach/reattach cycle resilient to crashes.
 fn detach_sibling_worktrees(
     git: &GitCli,
     repo_config: &RepoConfig,
     current_task: &Task,
+    tasks: &[Task],
 ) -> Vec<(PathBuf, String)> {
     let repo = match discover_repo(&repo_config.repo_path, git) {
         Ok(repo) => repo,
@@ -828,14 +840,42 @@ fn detach_sibling_worktrees(
     };
 
     let current_path = task_runtime_path(current_task, repo_config);
-    let mut detached = Vec::new();
 
+    // First pass: reattach any worktrees left detached from a prior crash.
+    // We match worktree paths to task branch names to know which branch
+    // each worktree should be on.
     for wt in &worktrees {
-        // Skip the current task's worktree and the main repo root.
         if wt.path == current_path || wt.path == repo_config.repo_path {
             continue;
         }
-        // Only detach worktrees that have a branch checked out.
+        // Already has a branch — nothing to recover.
+        if wt.branch.is_some() {
+            continue;
+        }
+        // Detached HEAD — try to find the task whose worktree_path matches
+        // and reattach its branch.
+        if let Some(task) = tasks.iter().find(|t| {
+            let tp = task_runtime_path(t, repo_config);
+            tp == wt.path
+        }) {
+            if let Some(branch) = &task.branch_name {
+                let _ = git.run(&wt.path, ["checkout", branch.as_str()]);
+            }
+        }
+    }
+
+    // Re-list after recovery so the branch info is up-to-date.
+    let worktrees = match worktree_mgr.list(&repo) {
+        Ok(wts) => wts,
+        Err(_) => return Vec::new(),
+    };
+
+    // Second pass: detach siblings.
+    let mut detached = Vec::new();
+    for wt in &worktrees {
+        if wt.path == current_path || wt.path == repo_config.repo_path {
+            continue;
+        }
         if let Some(branch) = &wt.branch {
             if git
                 .run(&wt.path, ["checkout", "--detach", "HEAD"])
