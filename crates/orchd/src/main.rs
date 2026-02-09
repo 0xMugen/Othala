@@ -410,6 +410,9 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         // Bridge: agent signals -> task lifecycle actions.
         for task_id in agent_supervisor.drain_need_human_tasks() {
             let at = Utc::now();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(app, stopped, "needs_human");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     if !orchd::is_transition_allowed(task.state, TaskState::NeedsHuman) {
@@ -452,6 +455,9 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
 
         for task_id in agent_supervisor.drain_patch_ready_tasks() {
             let at = Utc::now();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(app, stopped, "patch_ready");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     // If we can't go directly to Submitting, try routing through Running first.
@@ -512,10 +518,78 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             }
         }
 
+        // Bridge: clean agent exit (without explicit signal) -> submit for speed.
+        for task_id in agent_supervisor.drain_completed_tasks() {
+            let at = Utc::now();
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
+                        if orchd::is_transition_allowed(task.state, TaskState::Running)
+                            && orchd::is_transition_allowed(
+                                TaskState::Running,
+                                TaskState::Submitting,
+                            )
+                        {
+                            if let Err(err) = service.transition_task_state(
+                                &task_id,
+                                TaskState::Running,
+                                tui_event_id(&task_id, "EXIT-RUNNING", at),
+                                at,
+                            ) {
+                                app.state.status_line = format!(
+                                    "agent-complete: failed to transition {} to running: {err}",
+                                    task_id.0,
+                                );
+                                continue;
+                            }
+                        } else {
+                            app.state.status_line = format!(
+                                "agent-complete auto-submit ignored for {} from state {}",
+                                task_id.0,
+                                orchd::task_state_tag(task.state)
+                            );
+                            continue;
+                        }
+                    }
+                    let mode = resolve_submit_mode_for_task(&task, &repo_config_by_id);
+                    match service.start_submit(
+                        &task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&task_id, "EXIT-SUBMIT-S", at),
+                            submit_started: tui_event_id(&task_id, "EXIT-SUBMIT-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            signal_tick_requested = true;
+                            app.state.status_line = format!(
+                                "agent completed for {}; auto-started graphite submit ({mode:?})",
+                                task_id.0
+                            );
+                        }
+                        Err(err) => {
+                            app.state.status_line =
+                                format!("agent-complete submit failed for {}: {err}", task_id.0);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    app.state.status_line = format!(
+                        "failed to load task {} for agent-complete submit: {err}",
+                        task_id.0
+                    );
+                }
+            }
+        }
+
         // Bridge: conflict_resolved agent signal -> gt add -A + gt continue + resolve restack.
         for task_id in agent_supervisor.drain_conflict_resolved_tasks() {
             let at = Utc::now();
-            agent_supervisor.stop_task_session(&task_id);
+            if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
+                apply_stopped_agent_session_event(app, stopped, "conflict_resolved");
+            }
             match service.task(&task_id) {
                 Ok(Some(task)) => {
                     let repo_config = repo_config_by_id.get(&task.repo_id.0);
@@ -735,6 +809,23 @@ struct TuiActionOutcome {
     events: Vec<TuiEvent>,
 }
 
+fn apply_stopped_agent_session_event(
+    app: &mut TuiApp,
+    stopped: TuiStartedAgentSession,
+    reason: &str,
+) {
+    app.apply_event(TuiEvent::AgentPaneOutput {
+        instance_id: stopped.instance_id.clone(),
+        task_id: stopped.task_id.clone(),
+        model: stopped.model,
+        lines: vec![format!("[agent session stopped: {reason}]")],
+    });
+    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+        instance_id: stopped.instance_id,
+        status: AgentPaneStatus::Exited,
+    });
+}
+
 #[derive(Debug)]
 struct TuiAgentSession {
     instance_id: String,
@@ -757,6 +848,7 @@ struct TuiAgentSupervisor {
     pending_start_by_task: HashMap<String, String>,
     next_instance_nonce: u64,
     pending_patch_ready_tasks: Vec<TaskId>,
+    pending_completed_tasks: Vec<TaskId>,
     pending_needs_human_tasks: Vec<TaskId>,
     pending_conflict_resolved_tasks: Vec<TaskId>,
     conflict_resolution_tasks: HashSet<String>,
@@ -859,6 +951,8 @@ impl TuiAgentSupervisor {
         let _ = session.child.kill();
         let _ = session.child.wait();
         self.pending_start_by_task.remove(&task_id.0);
+        self.pending_completed_tasks
+            .retain(|existing| *existing != session.task_id);
         self.conflict_resolution_tasks.remove(&task_id.0);
         Some(TuiStartedAgentSession {
             instance_id: session.instance_id,
@@ -947,22 +1041,32 @@ impl TuiAgentSupervisor {
         let mut finished_task_keys = Vec::new();
 
         for (task_key, session) in &mut self.sessions_by_task {
+            let mut saw_terminal_signal = false;
             let mut lines = Vec::new();
             while let Ok(line) = session.output_rx.try_recv() {
                 if let Some(signal) = detect_common_signal(&line) {
                     match signal.kind {
-                        AgentSignalKind::PatchReady => push_unique_task_id(
-                            &mut self.pending_patch_ready_tasks,
-                            &session.task_id,
-                        ),
-                        AgentSignalKind::NeedHuman => push_unique_task_id(
-                            &mut self.pending_needs_human_tasks,
-                            &session.task_id,
-                        ),
-                        AgentSignalKind::ConflictResolved => push_unique_task_id(
-                            &mut self.pending_conflict_resolved_tasks,
-                            &session.task_id,
-                        ),
+                        AgentSignalKind::PatchReady => {
+                            saw_terminal_signal = true;
+                            push_unique_task_id(
+                                &mut self.pending_patch_ready_tasks,
+                                &session.task_id,
+                            );
+                        }
+                        AgentSignalKind::NeedHuman => {
+                            saw_terminal_signal = true;
+                            push_unique_task_id(
+                                &mut self.pending_needs_human_tasks,
+                                &session.task_id,
+                            );
+                        }
+                        AgentSignalKind::ConflictResolved => {
+                            saw_terminal_signal = true;
+                            push_unique_task_id(
+                                &mut self.pending_conflict_resolved_tasks,
+                                &session.task_id,
+                            );
+                        }
                         AgentSignalKind::RateLimited | AgentSignalKind::ErrorHint => {}
                     }
                 }
@@ -985,6 +1089,7 @@ impl TuiAgentSupervisor {
                 });
             }
 
+            let is_conflict_resolution_session = self.conflict_resolution_tasks.contains(task_key);
             match session.child.try_wait() {
                 Ok(Some(status)) => {
                     let exit_code = status.code().unwrap_or(-1);
@@ -1014,6 +1119,9 @@ impl TuiAgentSupervisor {
                             AgentPaneStatus::Failed
                         },
                     });
+                    if success && !saw_terminal_signal && !is_conflict_resolution_session {
+                        push_unique_task_id(&mut self.pending_completed_tasks, &session.task_id);
+                    }
                     finished_task_keys.push(task_key.clone());
                 }
                 Ok(None) => {}
@@ -1064,6 +1172,10 @@ impl TuiAgentSupervisor {
 
     fn drain_patch_ready_tasks(&mut self) -> Vec<TaskId> {
         std::mem::take(&mut self.pending_patch_ready_tasks)
+    }
+
+    fn drain_completed_tasks(&mut self) -> Vec<TaskId> {
+        std::mem::take(&mut self.pending_completed_tasks)
     }
 
     fn drain_need_human_tasks(&mut self) -> Vec<TaskId> {
@@ -1168,6 +1280,7 @@ impl TuiAgentSupervisor {
             let _ = self.stop_task_session(&task_id);
         }
         self.pending_start_by_task.clear();
+        self.pending_completed_tasks.clear();
         self.conflict_resolution_tasks.clear();
     }
 }
@@ -3964,7 +4077,10 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn parse_cli_args_uses_defaults_when_no_flags_are_passed() {
@@ -4534,6 +4650,126 @@ submit_mode = "single"
                 "init",
             ],
         );
+    }
+
+    fn mk_chat_history(root: &Path) -> super::TuiChatHistory {
+        let history = super::TuiChatHistory {
+            root: root.to_path_buf(),
+        };
+        history.ensure_layout().expect("create chat history root");
+        history
+    }
+
+    fn spawn_test_agent_session(task_id: &TaskId, script: &str) -> super::TuiAgentSession {
+        let mut command = Command::new("bash");
+        command
+            .args(["-lc", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn test agent session");
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            super::spawn_pipe_reader(stdout, tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            super::spawn_pipe_reader(stderr, tx.clone());
+        }
+        drop(tx);
+
+        super::TuiAgentSession {
+            instance_id: format!("A-{}", task_id.0),
+            task_id: task_id.clone(),
+            model: ModelKind::Codex,
+            child,
+            output_rx: rx,
+        }
+    }
+
+    fn poll_supervisor_until_session_finishes(
+        supervisor: &mut super::TuiAgentSupervisor,
+        history: &super::TuiChatHistory,
+    ) {
+        for _ in 0..60 {
+            let _ = supervisor.poll_events(history);
+            if supervisor.sessions_by_task.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn poll_events_enqueues_completed_task_for_auto_submit_when_agent_exits_cleanly() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-agent-clean-exit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let history = mk_chat_history(&root);
+        let mut supervisor = super::TuiAgentSupervisor::default();
+        let task_id = TaskId("T-CLEAN-EXIT".to_string());
+        supervisor.sessions_by_task.insert(
+            task_id.0.clone(),
+            spawn_test_agent_session(&task_id, "printf 'done\\n'"),
+        );
+
+        poll_supervisor_until_session_finishes(&mut supervisor, &history);
+
+        assert!(supervisor.sessions_by_task.is_empty());
+        assert_eq!(supervisor.drain_completed_tasks(), vec![task_id.clone()]);
+        assert!(supervisor.drain_patch_ready_tasks().is_empty());
+        assert!(supervisor.drain_need_human_tasks().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn poll_events_uses_patch_ready_signal_without_clean_exit_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-agent-patch-ready-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let history = mk_chat_history(&root);
+        let mut supervisor = super::TuiAgentSupervisor::default();
+        let task_id = TaskId("T-PATCH-READY".to_string());
+        supervisor.sessions_by_task.insert(
+            task_id.0.clone(),
+            spawn_test_agent_session(&task_id, "printf '[patch_ready]\\n'"),
+        );
+
+        poll_supervisor_until_session_finishes(&mut supervisor, &history);
+
+        assert!(supervisor.sessions_by_task.is_empty());
+        assert_eq!(supervisor.drain_patch_ready_tasks(), vec![task_id.clone()]);
+        assert!(supervisor.drain_completed_tasks().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn poll_events_keeps_conflict_sessions_out_of_auto_submit_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-agent-conflict-exit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let history = mk_chat_history(&root);
+        let mut supervisor = super::TuiAgentSupervisor::default();
+        let task_id = TaskId("T-CONFLICT-EXIT".to_string());
+        supervisor.sessions_by_task.insert(
+            task_id.0.clone(),
+            spawn_test_agent_session(&task_id, "printf 'done\\n'"),
+        );
+        supervisor
+            .conflict_resolution_tasks
+            .insert(task_id.0.clone());
+
+        poll_supervisor_until_session_finishes(&mut supervisor, &history);
+
+        assert!(supervisor.sessions_by_task.is_empty());
+        assert!(supervisor.drain_completed_tasks().is_empty());
+        assert_eq!(supervisor.drain_need_human_tasks(), vec![task_id.clone()]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
