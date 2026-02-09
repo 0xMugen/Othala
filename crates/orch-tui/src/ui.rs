@@ -20,6 +20,7 @@ const BORDER_NORMAL: Color = Color::DarkGray;
 const BORDER_FOCUSED: Color = Color::Cyan;
 const KEY_FG: Color = Color::Yellow;
 const MUTED: Color = Color::Gray;
+const OUTPUT_FG: Color = Color::White;
 
 fn state_color(state: TaskState) -> Color {
     match state {
@@ -53,6 +54,47 @@ fn pane_status_color(status: AgentPaneStatus) -> Color {
         AgentPaneStatus::Exited => Color::DarkGray,
         AgentPaneStatus::Failed => Color::Red,
     }
+}
+
+fn status_line_color(message: &str) -> Color {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("[needs_human]") || lower.contains("needs_human") {
+        Color::Yellow
+    } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
+        Color::Green
+    } else if lower.contains("error") || lower.contains("failed") || lower.contains("not found") {
+        Color::Red
+    } else if lower.contains("ready") || lower.contains("updated") || lower.contains("queued") {
+        ACCENT
+    } else {
+        MUTED
+    }
+}
+
+fn output_line_style(line: &str) -> Style {
+    let lower = line.to_ascii_lowercase();
+    if line.trim().is_empty() {
+        Style::default().fg(DIM)
+    } else if lower.contains("[needs_human]") || lower.contains("needs_human") {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if lower.contains("error") || lower.contains("failed") {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("## ") {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OUTPUT_FG)
+    }
+}
+
+fn stylize_output_line(line: String) -> Line<'static> {
+    let style = output_line_style(&line);
+    Line::from(Span::styled(line, style))
 }
 
 fn normal_block(title: &str) -> Block<'_> {
@@ -208,35 +250,52 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(tabs, panes[0]);
 
     let (title, lines) = if let Some(pane) = app.state.selected_pane() {
-        (
-            format!(
-                "PTY {} ({:?}, task={})",
-                pane.instance_id, pane.model, pane.task_id.0
-            ),
-            pane.tail(20)
-                .into_iter()
-                .map(|s| Line::from(Span::styled(s, Style::default().fg(MUTED))))
-                .collect::<Vec<_>>(),
-        )
+        let mut lines = pane_meta_lines(pane, None);
+        lines.push(divider_line(panes[1].width));
+        let tail = pane.tail(20);
+        if tail.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
+        } else {
+            lines.extend(tail.into_iter().map(stylize_output_line));
+        }
+        (format!("Chat {}", pane.instance_id), lines)
     } else {
         let selected_task = app
             .state
             .selected_task()
             .map(|task| task.task_id.0.clone())
             .unwrap_or_else(|| "-".to_string());
-        let lines = if app.state.selected_task_activity.is_empty() {
-            vec![Line::from(Span::styled(
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(" task ", Style::default().fg(DIM)),
+                Span::styled(selected_task.clone(), Style::default().fg(ACCENT)),
+                Span::styled("  source ", Style::default().fg(DIM)),
+                Span::styled("activity log", Style::default().fg(MUTED)),
+                Span::styled("  lines ", Style::default().fg(DIM)),
+                Span::styled(
+                    app.state.selected_task_activity.len().to_string(),
+                    Style::default().fg(HEADER_FG),
+                ),
+            ]),
+            divider_line(panes[1].width),
+        ];
+        if app.state.selected_task_activity.is_empty() {
+            lines.push(Line::from(Span::styled(
                 "no task activity yet",
                 Style::default().fg(DIM),
-            ))]
+            )));
         } else {
-            app.state
-                .selected_task_activity
-                .iter()
-                .cloned()
-                .map(|s| Line::from(Span::styled(s, Style::default().fg(MUTED))))
-                .collect::<Vec<_>>()
-        };
+            lines.extend(
+                app.state
+                    .selected_task_activity
+                    .iter()
+                    .cloned()
+                    .map(stylize_output_line),
+            );
+        }
         (format!("Task Activity ({selected_task})"), lines)
     };
 
@@ -258,24 +317,22 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let scroll_back = app.state.scroll_back;
 
     let (title, lines) = if let Some(pane) = pane {
-        let scroll_hint = if scroll_back > 0 {
-            format!(" [+{}]", scroll_back)
+        let mut lines = pane_meta_lines(pane, Some(scroll_back));
+        lines.push(divider_line(area.width));
+        let output_cap = viewport_height.saturating_sub(lines.len());
+        let window = pane.window(output_cap, scroll_back);
+        if window.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
         } else {
-            String::new()
-        };
-        (
-            format!(
-                "Focused PTY {} ({:?}, task={}){}",
-                pane.instance_id, pane.model, pane.task_id.0, scroll_hint
-            ),
-            pane.window(viewport_height, scroll_back)
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        )
+            lines.extend(window.into_iter().map(stylize_output_line));
+        }
+        (format!("Focused Chat {}", pane.instance_id), lines)
     } else {
         (
-            "Focused PTY".to_string(),
+            "Focused Chat".to_string(),
             vec![Line::from("focused pane no longer exists")],
         )
     };
@@ -313,21 +370,19 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Right: agent PTY output
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
-        let scroll_hint = if scroll_back > 0 {
-            format!(" [+{}]", scroll_back)
+        let mut lines = pane_meta_lines(pane, Some(scroll_back));
+        lines.push(divider_line(cols[1].width));
+        let output_cap = viewport_height.saturating_sub(lines.len());
+        let window = pane.window(output_cap, scroll_back);
+        if window.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
         } else {
-            String::new()
-        };
-        (
-            format!(
-                "Agent {} ({:?}, task={}){}",
-                pane.instance_id, pane.model, pane.task_id.0, scroll_hint
-            ),
-            pane.window(viewport_height, scroll_back)
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        )
+            lines.extend(window.into_iter().map(stylize_output_line));
+        }
+        (format!("Agent {}", pane.instance_id), lines)
     } else {
         (
             format!("Agent (task={task_id_str})"),
@@ -427,9 +482,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ));
         }
         if !app.state.status_line.is_empty() {
+            spans.push(Span::styled(" | status: ", Style::default().fg(DIM)));
             spans.push(Span::styled(
-                format!(" | {}", app.state.status_line),
-                Style::default().fg(ACCENT),
+                app.state.status_line.as_str(),
+                Style::default()
+                    .fg(status_line_color(&app.state.status_line))
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         Line::from(spans)
@@ -563,26 +621,86 @@ fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
     spans.push(Span::raw(" "));
     for (idx, pane) in app.state.panes.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled(" | ", Style::default().fg(DIM)));
+            spans.push(Span::raw("  "));
         }
         let is_selected = idx == app.state.selected_pane_idx;
         let tag = pane_status_tag(pane);
         let sc = pane_status_color(pane.status);
-
-        let label = format!("{}:{}", idx + 1, pane.instance_id);
-        if is_selected {
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let base_style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
-            spans.push(Span::styled(label, Style::default().fg(MUTED)));
-        }
-        spans.push(Span::styled(format!(":{tag}"), Style::default().fg(sc)));
+            Style::default().fg(MUTED)
+        };
+        let meta_style = if is_selected {
+            Style::default().fg(DIM).bg(SELECTED_BG)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let status_style = if is_selected {
+            Style::default()
+                .fg(sc)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(sc).add_modifier(Modifier::BOLD)
+        };
+
+        spans.push(Span::styled(
+            format!(" {}:{} ", idx + 1, pane.instance_id),
+            base_style,
+        ));
+        spans.push(Span::styled(format!("{tag} "), status_style));
+        spans.push(Span::styled(format!("{}l ", pane.lines.len()), meta_style));
     }
     Line::from(spans)
+}
+
+fn pane_meta_lines(pane: &AgentPane, scroll_back: Option<usize>) -> Vec<Line<'static>> {
+    let status = pane_status_tag(pane);
+    let updated = pane.updated_at.with_timezone(&Local).format("%H:%M:%S");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" status ", Style::default().fg(DIM)),
+            Span::styled(
+                status.to_string(),
+                Style::default()
+                    .fg(pane_status_color(pane.status))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  model ", Style::default().fg(DIM)),
+            Span::styled(format!("{:?}", pane.model), Style::default().fg(HEADER_FG)),
+        ]),
+        Line::from(vec![
+            Span::styled(" task ", Style::default().fg(DIM)),
+            Span::styled(pane.task_id.0.clone(), Style::default().fg(ACCENT)),
+            Span::styled("  lines ", Style::default().fg(DIM)),
+            Span::styled(pane.lines.len().to_string(), Style::default().fg(HEADER_FG)),
+            Span::styled("  updated ", Style::default().fg(DIM)),
+            Span::styled(updated.to_string(), Style::default().fg(MUTED)),
+        ]),
+    ];
+    if let Some(scroll_back) = scroll_back {
+        if scroll_back > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(" scroll ", Style::default().fg(DIM)),
+                Span::styled(
+                    format!("+{scroll_back} lines from live tail"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
+    lines
+}
+
+fn divider_line(width: u16) -> Line<'static> {
+    let len = width.saturating_sub(4).max(8) as usize;
+    Line::from(Span::styled("-".repeat(len), Style::default().fg(DIM)))
 }
 
 fn pane_status_tag(pane: &AgentPane) -> &'static str {
@@ -710,12 +828,14 @@ mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
     use orch_core::types::{ModelKind, RepoId, TaskId};
+    use ratatui::style::Color;
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
 
     use super::{
-        format_pane_tabs, format_task_row, pane_status_tag, status_sidebar_lines, to_local_time,
+        format_pane_tabs, format_task_row, output_line_style, pane_status_tag, status_line_color,
+        status_sidebar_lines, to_local_time,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -771,9 +891,10 @@ mod tests {
         let tabs = format_pane_tabs(&app);
         let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1:A1"));
-        assert!(text.contains(":running"));
+        assert!(text.contains("running"));
         assert!(text.contains("2:A2"));
-        assert!(text.contains(":waiting"));
+        assert!(text.contains("waiting"));
+        assert!(text.contains("0l"));
     }
 
     #[test]
@@ -824,7 +945,28 @@ mod tests {
         let tabs = format_pane_tabs(&app);
         let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1:A1"));
-        assert!(text.contains(":starting"));
+        assert!(text.contains("starting"));
+    }
+
+    #[test]
+    fn status_line_color_highlights_attention_levels() {
+        assert_eq!(status_line_color("failed to submit"), Color::Red);
+        assert_eq!(status_line_color("[needs_human] waiting"), Color::Yellow);
+        assert_eq!(status_line_color("[patch_ready]"), Color::Green);
+        assert_eq!(status_line_color("pane updated: A1"), Color::Cyan);
+    }
+
+    #[test]
+    fn output_line_style_marks_special_chat_signals() {
+        assert_eq!(
+            output_line_style("[needs_human] unblock me").fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            output_line_style("[patch_ready] complete").fg,
+            Some(Color::Green)
+        );
+        assert_eq!(output_line_style("fatal error").fg, Some(Color::Red));
     }
 
     #[test]
