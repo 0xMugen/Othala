@@ -7,7 +7,7 @@ use orch_core::config::{OrgConfig, RepoConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::{TaskState, VerifyTier};
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
-use orch_git::{discover_repo, GitCli, GitError, WorktreeManager, WorktreeSpec};
+use orch_git::{current_branch, discover_repo, GitCli, GitError, WorktreeManager, WorktreeSpec};
 use orch_graphite::{GraphiteClient, GraphiteError, RestackOutcome};
 use orch_verify::{commands_for_tier, resolve_verify_commands, VerifyOutcome, VerifyRunner};
 
@@ -175,6 +175,20 @@ impl RuntimeEngine {
             }
         };
 
+        let branch_before_create = match current_branch(&repo, &self.git) {
+            Ok(branch_name) => branch_name,
+            Err(err) => {
+                self.mark_task_failed(
+                    service,
+                    task,
+                    "current_branch_failed",
+                    format!("failed to resolve current branch before gt create: {err}"),
+                    at,
+                )?;
+                return Ok(false);
+            }
+        };
+
         let branch = task
             .branch_name
             .clone()
@@ -190,6 +204,40 @@ impl RuntimeEngine {
                     at,
                 )?;
                 return Ok(false);
+            }
+        }
+
+        if branch_before_create != branch {
+            match current_branch(&repo, &self.git) {
+                Ok(active_branch) if active_branch == branch => {
+                    if let Err(err) = self
+                        .git
+                        .run(&repo.root, ["switch", branch_before_create.as_str()])
+                    {
+                        self.mark_task_failed(
+                            service,
+                            task,
+                            "restore_branch_failed",
+                            format!(
+                                "failed to switch primary worktree back to '{before}': {err}",
+                                before = branch_before_create
+                            ),
+                            at,
+                        )?;
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.mark_task_failed(
+                        service,
+                        task,
+                        "current_branch_failed",
+                        format!("failed to resolve current branch after gt create: {err}"),
+                        at,
+                    )?;
+                    return Ok(false);
+                }
             }
         }
 

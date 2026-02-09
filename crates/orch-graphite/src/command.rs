@@ -98,10 +98,12 @@ impl GraphiteCli {
 
 fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(), GraphiteError> {
     let ok = match allowed {
-        AllowedAutoCommand::Create => args.len() == 2 && arg_eq(args, 0, "create") && {
-            let branch = arg_at(args, 1);
-            !branch.trim().is_empty() && !branch.starts_with('-')
-        },
+        AllowedAutoCommand::Create => {
+            args.len() == 2 && arg_eq(args, 0, "create") && {
+                let branch = arg_at(args, 1);
+                !branch.trim().is_empty() && !branch.starts_with('-')
+            }
+        }
         AllowedAutoCommand::Restack => args.len() == 1 && arg_eq(args, 0, "restack"),
         AllowedAutoCommand::AddAllForConflict => {
             args.len() == 2 && arg_eq(args, 0, "add") && arg_eq(args, 1, "-A")
