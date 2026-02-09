@@ -458,6 +458,7 @@ mod tests {
                 unanimous: false,
                 capacity_state: ReviewCapacityState::Sufficient,
             },
+            patch_ready: false,
             created_at: updated_at,
             updated_at,
         }

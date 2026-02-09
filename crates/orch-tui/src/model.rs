@@ -44,7 +44,8 @@ impl TaskOverviewRow {
             review.approvals_received, review.approvals_required, review.unanimous, review_capacity
         );
 
-        let display_state = effective_display_state(task.state, &task.verify_status);
+        let display_state =
+            effective_display_state(task.state, &task.verify_status, task.patch_ready);
 
         Self {
             task_id: task.id.clone(),
@@ -363,7 +364,11 @@ impl DashboardState {
 /// raw `TaskState` alone is ambiguous.  For example, a task in `Running` whose
 /// verify has failed shows **VerifyFail** so the user doesn't see "Running" for
 /// a task that is effectively stuck.
-pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> String {
+pub fn effective_display_state(
+    state: TaskState,
+    verify: &VerifyStatus,
+    patch_ready: bool,
+) -> String {
     match state {
         TaskState::Running => match verify {
             VerifyStatus::Failed { .. } => "VerifyFail".to_string(),
@@ -374,6 +379,8 @@ pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> Strin
         TaskState::Failed => match verify {
             VerifyStatus::Failed { .. } => "VerifyFail".to_string(),
             VerifyStatus::Passed { .. } => "SubmitFail".to_string(),
+            // patch_ready means coding completed; failure was during submit
+            _ if patch_ready => "SubmitFail".to_string(),
             _ => "Failed".to_string(),
         },
         other => format!("{other:?}"),
@@ -422,6 +429,7 @@ mod tests {
                 unanimous: false,
                 capacity_state: ReviewCapacityState::Sufficient,
             },
+            patch_ready: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -491,7 +499,8 @@ mod tests {
                 TaskState::Failed,
                 &VerifyStatus::Passed {
                     tier: VerifyTier::Quick
-                }
+                },
+                false,
             ),
             "SubmitFail"
         );
@@ -503,20 +512,27 @@ mod tests {
                 &VerifyStatus::Failed {
                     tier: VerifyTier::Quick,
                     summary: "fmt".to_string()
-                }
+                },
+                false,
             ),
             "VerifyFail"
         );
 
-        // Failed + NotRun → "Failed"
+        // Failed + NotRun + patch_ready → "SubmitFail" (coding done, submit failed)
         assert_eq!(
-            effective_display_state(TaskState::Failed, &VerifyStatus::NotRun),
+            effective_display_state(TaskState::Failed, &VerifyStatus::NotRun, true),
+            "SubmitFail"
+        );
+
+        // Failed + NotRun + !patch_ready → "Failed" (coding-phase failure)
+        assert_eq!(
+            effective_display_state(TaskState::Failed, &VerifyStatus::NotRun, false),
             "Failed"
         );
 
         // Non-Running/Failed states use the raw state name
         assert_eq!(
-            effective_display_state(TaskState::Reviewing, &VerifyStatus::NotRun),
+            effective_display_state(TaskState::Reviewing, &VerifyStatus::NotRun, false),
             "Reviewing"
         );
     }

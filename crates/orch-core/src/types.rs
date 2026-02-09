@@ -88,6 +88,10 @@ pub struct Task {
     pub pr: Option<PullRequestRef>,
     pub verify_status: VerifyStatus,
     pub review_status: ReviewStatus,
+    /// Set to `true` when the agent emits `[patch_ready]` or exits cleanly,
+    /// indicating coding completed before any subsequent failure.
+    #[serde(default)]
+    pub patch_ready: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -193,6 +197,7 @@ preferred_model = "codex"
                 unanimous: true,
                 capacity_state: ReviewCapacityState::Sufficient,
             },
+            patch_ready: false,
             created_at: Utc
                 .with_ymd_and_hms(2026, 2, 8, 16, 10, 0)
                 .single()

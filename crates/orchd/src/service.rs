@@ -783,6 +783,24 @@ impl OrchdService {
         Ok(task)
     }
 
+    /// Mark a task as having completed coding (agent emitted `[patch_ready]`
+    /// or exited cleanly).  This flag persists so the TUI can attribute a later
+    /// failure to submit rather than coding.
+    pub fn mark_patch_ready(&self, task_id: &TaskId) -> Result<(), ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+        if !task.patch_ready {
+            task.patch_ready = true;
+            task.updated_at = Utc::now();
+            self.store.upsert_task(&task)?;
+        }
+        Ok(())
+    }
+
     pub fn start_submit(
         &self,
         task_id: &TaskId,
@@ -1327,6 +1345,7 @@ mod tests {
                 unanimous: false,
                 capacity_state: ReviewCapacityState::Sufficient,
             },
+            patch_ready: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

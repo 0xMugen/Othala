@@ -458,6 +458,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
                 apply_stopped_agent_session_event(app, stopped, "patch_ready");
             }
+            let _ = service.mark_patch_ready(&task_id);
             match try_auto_submit(&service, &task_id, &repo_config_by_id, "SIG", at) {
                 Ok(true) => {
                     signal_tick_requested = true;
@@ -476,6 +477,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         // Bridge: clean agent exit (without explicit signal) -> submit for speed.
         for task_id in agent_supervisor.drain_completed_tasks() {
             let at = Utc::now();
+            let _ = service.mark_patch_ready(&task_id);
             match try_auto_submit(&service, &task_id, &repo_config_by_id, "EXIT", at) {
                 Ok(true) => {
                     signal_tick_requested = true;
@@ -2267,6 +2269,7 @@ fn create_tui_task(
             unanimous: false,
             capacity_state: ReviewCapacityState::Sufficient,
         },
+        patch_ready: false,
         created_at: at,
         updated_at: at,
     };
@@ -2907,6 +2910,7 @@ fn run_create_task(args: CreateTaskCliArgs) -> Result<(), MainError> {
             unanimous: false,
             capacity_state: ReviewCapacityState::Sufficient,
         },
+        patch_ready: false,
         created_at: now,
         updated_at: now,
     };
@@ -4404,6 +4408,7 @@ submit_mode = "single"
                 unanimous: false,
                 capacity_state: ReviewCapacityState::Sufficient,
             },
+            patch_ready: false,
             created_at: now,
             updated_at: now,
         }
