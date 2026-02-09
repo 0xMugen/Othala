@@ -4,6 +4,12 @@ use crate::types::{AgentSignal, AgentSignalKind};
 
 pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
     let lower = line.to_ascii_lowercase();
+
+    // Skip prompt echo lines — agent startup echoes instructions containing signal markers.
+    if lower.contains("print exactly") || lower.contains("print [") {
+        return None;
+    }
+
     let kind = if lower.contains("needs_human")
         || lower.contains("need_human")
         || lower.contains("[need_human]")
@@ -85,6 +91,22 @@ mod tests {
     fn returns_none_for_non_signal_output() {
         let signal = detect_common_signal("progress: compiling crates");
         assert!(signal.is_none());
+    }
+
+    #[test]
+    fn ignores_prompt_echo_lines_containing_signal_markers() {
+        assert!(detect_common_signal(
+            "print exactly [conflict_resolved]"
+        ).is_none());
+        assert!(detect_common_signal(
+            "print exactly [needs_human] with a short reason."
+        ).is_none());
+        assert!(detect_common_signal(
+            "When implementation is complete, print exactly [patch_ready]."
+        ).is_none());
+        assert!(detect_common_signal(
+            "[stderr] print [conflict_resolved]"
+        ).is_none());
     }
 
     #[test]

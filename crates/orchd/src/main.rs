@@ -1669,7 +1669,6 @@ fn execute_tui_action(
                 }
             } else if task.state == TaskState::RestackConflict
                 || task.state == TaskState::Failed
-                || task.state == TaskState::AwaitingMerge
             {
                 let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
                 let _ = service.start_submit(
@@ -1691,6 +1690,17 @@ fn execute_tui_action(
                     events: Vec::new(),
                 }
             } else {
+                // Route through Running if needed (e.g. AwaitingMerge → Running → Restacking).
+                if !orchd::is_transition_allowed(task.state, TaskState::Restacking)
+                    && orchd::is_transition_allowed(task.state, TaskState::Running)
+                {
+                    service.transition_task_state(
+                        &selected_task_id,
+                        TaskState::Running,
+                        tui_event_id(&selected_task_id, "RESTACK-VIA-RUNNING", at),
+                        at,
+                    )?;
+                }
                 let _ = service.start_restack(
                     &selected_task_id,
                     orchd::StartRestackEventIds {
