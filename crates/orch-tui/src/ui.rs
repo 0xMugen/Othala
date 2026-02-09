@@ -34,6 +34,17 @@ fn state_color(state: TaskState) -> Color {
     }
 }
 
+/// Pick a color for the composite display state label.  Falls back to
+/// `state_color` for states that are not overridden by verify status.
+fn display_state_color(state: TaskState, display_state: &str) -> Color {
+    match display_state {
+        "VerifyFail" => Color::Red,
+        "Verified" => Color::Cyan,
+        "Verifying" => Color::Yellow,
+        _ => state_color(state),
+    }
+}
+
 fn pane_status_color(status: AgentPaneStatus) -> Color {
     match status {
         AgentPaneStatus::Starting => Color::Yellow,
@@ -439,8 +450,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
-    let state_label = format!("{:?}", task.state);
-    let sc = state_color(task.state);
+    let sc = display_state_color(task.state, &task.display_state);
 
     let base_style = if is_selected {
         Style::default().bg(SELECTED_BG).fg(Color::White)
@@ -458,7 +468,7 @@ fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a>
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.branch, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(state_label, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
+        Span::styled(task.display_state.as_str(), Style::default().fg(sc).add_modifier(Modifier::BOLD)),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
@@ -537,6 +547,7 @@ mod tests {
             branch: format!("task/{task_id}"),
             stack_position: None,
             state: TaskState::Running,
+            display_state: "Running".to_string(),
             verify_summary: "not_run".to_string(),
             review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),

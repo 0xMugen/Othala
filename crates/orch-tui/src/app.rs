@@ -426,6 +426,7 @@ mod tests {
                 branch: "task/T1".to_string(),
                 stack_position: None,
                 state: TaskState::Running,
+                display_state: "Running".to_string(),
                 verify_summary: "not_run".to_string(),
                 review_summary: "0/0 unanimous=false cap=ok".to_string(),
                 last_activity: Utc::now(),
@@ -436,6 +437,7 @@ mod tests {
                 branch: "task/T2".to_string(),
                 stack_position: None,
                 state: TaskState::Running,
+                display_state: "Running".to_string(),
                 verify_summary: "not_run".to_string(),
                 review_summary: "0/0 unanimous=false cap=ok".to_string(),
                 last_activity: Utc::now(),
@@ -495,6 +497,7 @@ mod tests {
             verify_summary: "not_run".to_string(),
             review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
+            display_state: "Running".to_string(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -539,6 +542,7 @@ mod tests {
             verify_summary: "not_run".to_string(),
             review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
+            display_state: "Running".to_string(),
         }];
         app.state.focused_task = true;
 
@@ -622,6 +626,7 @@ mod tests {
             verify_summary: "not_run".to_string(),
             review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
+            display_state: "Running".to_string(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -709,6 +714,7 @@ mod tests {
             verify_summary: "not_run".to_string(),
             review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
+            display_state: "Running".to_string(),
         }];
 
         // Set a focused pane to verify it gets cleared

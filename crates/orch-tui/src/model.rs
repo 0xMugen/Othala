@@ -11,6 +11,9 @@ pub struct TaskOverviewRow {
     pub branch: String,
     pub stack_position: Option<String>,
     pub state: TaskState,
+    /// Composite label that accounts for verify status when state alone is
+    /// ambiguous (e.g. "Running" with a failed verify → "VerifyFail").
+    pub display_state: String,
     pub verify_summary: String,
     pub review_summary: String,
     pub last_activity: DateTime<Utc>,
@@ -39,12 +42,15 @@ impl TaskOverviewRow {
             review.approvals_received, review.approvals_required, review.unanimous, review_capacity
         );
 
+        let display_state = effective_display_state(task.state, &task.verify_status);
+
         Self {
             task_id: task.id.clone(),
             repo_id: task.repo_id.clone(),
             branch: task.branch_name.clone().unwrap_or_else(|| "-".to_string()),
             stack_position: None,
             state: task.state,
+            display_state,
             verify_summary,
             review_summary,
             last_activity: task.updated_at,
@@ -234,6 +240,22 @@ impl DashboardState {
     }
 }
 
+/// Produce a user-facing state label that incorporates verify status when the
+/// raw `TaskState` alone is ambiguous.  For example, a task in `Running` whose
+/// verify has failed shows **VerifyFail** so the user doesn't see "Running" for
+/// a task that is effectively stuck.
+pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> String {
+    match state {
+        TaskState::Running => match verify {
+            VerifyStatus::Failed { .. } => "VerifyFail".to_string(),
+            VerifyStatus::Passed { .. } => "Verified".to_string(),
+            VerifyStatus::Running { .. } => "Verifying".to_string(),
+            VerifyStatus::NotRun => "Running".to_string(),
+        },
+        other => format!("{other:?}"),
+    }
+}
+
 fn summarize(value: &str, max_len: usize) -> String {
     let mut s = value.trim().replace('\n', " ");
     if s.len() <= max_len {
@@ -294,6 +316,7 @@ mod tests {
         task.review_status.capacity_state = ReviewCapacityState::WaitingForReviewCapacity;
 
         let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.display_state, "VerifyFail");
         assert_eq!(row.verify_summary, "failed:quick:line one line two wit...");
         assert_eq!(row.review_summary, "1/2 unanimous=true cap=waiting");
     }
@@ -305,6 +328,48 @@ mod tests {
 
         let row = TaskOverviewRow::from_task(&task);
         assert_eq!(row.branch, "-");
+    }
+
+    #[test]
+    fn display_state_reflects_verify_status_when_running() {
+        use super::effective_display_state;
+
+        // Running + NotRun → "Running"
+        let mut task = mk_task("T3");
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.display_state, "Running");
+
+        // Running + Failed → "VerifyFail"
+        task.verify_status = VerifyStatus::Failed {
+            tier: VerifyTier::Quick,
+            summary: "fmt".to_string(),
+        };
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.display_state, "VerifyFail");
+
+        // Running + Passed → "Verified"
+        task.verify_status = VerifyStatus::Passed {
+            tier: VerifyTier::Quick,
+        };
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.display_state, "Verified");
+
+        // Running + Running → "Verifying"
+        task.verify_status = VerifyStatus::Running {
+            tier: VerifyTier::Quick,
+        };
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.display_state, "Verifying");
+
+        // Non-Running states use the raw state name
+        assert_eq!(
+            effective_display_state(TaskState::Failed, &VerifyStatus::NotRun),
+            "Failed"
+        );
+        assert_eq!(
+            effective_display_state(TaskState::Reviewing, &VerifyStatus::NotRun),
+            "Reviewing"
+        );
     }
 
     #[test]

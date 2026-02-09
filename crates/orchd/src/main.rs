@@ -19,7 +19,10 @@ use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_git::{discover_repo, GitCli};
 use orch_graphite::GraphiteClient;
-use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiError, TuiEvent, UiAction};
+use orch_tui::{
+    effective_display_state, run_tui_with_hook, AgentPaneStatus, TuiApp, TuiError, TuiEvent,
+    UiAction,
+};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
     ServiceError,
@@ -1413,11 +1416,13 @@ fn build_task_activity_lines(
     approvals: &[orch_core::types::TaskApproval],
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    let display_state = effective_display_state(task.state, &task.verify_status);
     lines.push(format!(
-        "task={} state={:?} repo={} branch={}",
-        task.id.0,
-        task.state,
-        task.repo_id.0,
+        "task={} state={} repo={}",
+        task.id.0, display_state, task.repo_id.0,
+    ));
+    lines.push(format!(
+        "branch={}",
         task.branch_name.as_deref().unwrap_or("-")
     ));
     if let Some(pr) = &task.pr {
