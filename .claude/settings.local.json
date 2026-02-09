@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /home/mugen/projects/Othala log --oneline -20)",
+      "Bash(grep:*)",
+      "Bash(cargo check:*)",
+      "Bash(echo:*)",
+      "Bash(nix develop:*)",
+      "Bash(ls:*)",
+      "Bash(codex exec:*)",
+      "Bash(sqlite3:*)",
+      "Bash(find:*)",
+      "Bash(git -C /home/mugen/projects/Othala log --oneline -15)",
+      "Bash(git -C /home/mugen/projects/Othala show 0a5b304 --stat)",
+      "Bash(git -C /home/mugen/projects/Othala show e15176a --stat)",
+      "Bash(git -C /home/mugen/projects/Othala show e9677d7 --stat)",
+      "Bash(git -C /home/mugen/projects/Othala show:*)",
+      "Bash(cargo test:*)",
+      "Bash(PATH=\"$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/nix/var/nix/profiles/default/bin:$PATH\" which:*)",
+      "WebSearch",
+      "Bash(/nix/store/zgrfzkjsphsi8wpaifg7r29icxxhswx8-cargo-stable-2025-09-18/bin/cargo test -p orchd)",
+      "Bash(nix-shell:*)",
+      "Bash(~/.cargo/bin/cargo:*)",
+      "Bash(gt status:*)",
+      "Bash(gt log:*)",
+      "Bash(gt restack:*)",
+      "Bash(git -C /home/mugen/projects/Othala worktree list)",
+      "Bash(git checkout:*)",
+      "Bash(gt add:*)",
+      "Bash(gt continue:*)",
+      "Bash(gt submit:*)",
+      "Bash(gt sync:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git symbolic-ref:*)"
+    ]
+  }
+}
