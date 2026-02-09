@@ -138,6 +138,24 @@ resolve_latest_tag() {
   return 1
 }
 
+install_nix_profile() {
+  local flake_ref="${1:-}"
+  [[ -n "$flake_ref" ]] || return 1
+
+  if nix profile install "$flake_ref"; then
+    return 0
+  fi
+
+  # If othala is already installed, replace it and retry once.
+  if nix profile list 2>/dev/null | grep -Fq "othala"; then
+    nix profile remove othala >/dev/null 2>&1 || true
+    nix profile install "$flake_ref"
+    return $?
+  fi
+
+  return 1
+}
+
 if [[ -z "$tag" ]]; then
   tag="$(resolve_latest_tag || true)"
 fi
@@ -162,11 +180,17 @@ fi
 echo "installing othala from ${repo} release ${tag} using ${method}"
 
 if [[ "$method" == "nix" ]]; then
-  if nix profile install "github:${repo}/${tag}#othala"; then
+  if install_nix_profile "github:${repo}/${tag}#othala"; then
     exit 0
   fi
-  nix profile install "git+ssh://git@github.com/${repo}.git?ref=${tag}#othala"
-  exit 0
+  if install_nix_profile "git+https://github.com/${repo}.git?ref=refs/tags/${tag}#othala"; then
+    exit 0
+  fi
+  if install_nix_profile "git+ssh://git@github.com/${repo}.git?ref=refs/tags/${tag}#othala"; then
+    exit 0
+  fi
+  echo "nix install failed for ${repo} (${tag})" >&2
+  exit 1
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
