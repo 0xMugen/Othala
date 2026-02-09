@@ -1,7 +1,8 @@
 use chrono::{Local, Utc};
 use orch_agents::{
-    probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupError,
-    SetupProbeConfig, SetupProbeReport, SetupSummary, ValidatedSetupSelection,
+    default_adapter_for, probe_models, summarize_setup, validate_setup_selection, EpochRequest,
+    ModelSetupSelection, SetupError, SetupProbeConfig, SetupProbeReport, SetupSummary,
+    ValidatedSetupSelection,
 };
 use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
@@ -16,7 +17,7 @@ use orch_core::state::{
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
-use orch_tui::{run_tui_with_hook, TuiApp, TuiError, UiAction};
+use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiError, TuiEvent, UiAction};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
     ServiceError,
@@ -24,9 +25,11 @@ use orchd::{
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +39,7 @@ const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_ROOT: &str = ".orch/events";
 const DEFAULT_TUI_TICK_MS: u64 = 250;
 const TUI_ORCH_TICK_INTERVAL: Duration = Duration::from_secs(5);
+const TUI_AGENT_TIMEOUT_SECS: u64 = 3600;
 static TUI_EVENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,11 +242,12 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         args.tick_ms,
         TUI_ORCH_TICK_INTERVAL.as_secs()
     );
+    let mut agent_supervisor = TuiAgentSupervisor::default();
 
     let mut last_orch_tick = Instant::now()
         .checked_sub(TUI_ORCH_TICK_INTERVAL)
         .unwrap_or_else(Instant::now);
-    run_tui_with_hook(&mut app, Duration::from_millis(args.tick_ms), |app| {
+    let tui_result = run_tui_with_hook(&mut app, Duration::from_millis(args.tick_ms), |app| {
         let actions = app.drain_actions();
         let mut force_tick = false;
 
@@ -255,11 +260,16 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 &org,
                 &enabled_models,
                 &probe_config,
+                &repo_config_by_id,
+                &mut agent_supervisor,
                 at,
             ) {
                 Ok(outcome) => {
                     app.state.status_line = outcome.message;
                     force_tick |= outcome.force_tick;
+                    for event in outcome.events {
+                        app.apply_event(event);
+                    }
                 }
                 Err(err) => {
                     app.state.status_line = format!("action failed: {err}");
@@ -297,8 +307,14 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 app.state.status_line = format!("failed to refresh tasks: {err}");
             }
         }
+
+        for event in agent_supervisor.poll_events() {
+            app.apply_event(event);
+        }
         refresh_selected_task_activity(app, &service);
-    })?;
+    });
+    agent_supervisor.stop_all();
+    tui_result?;
     Ok(())
 }
 
@@ -306,6 +322,270 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
 struct TuiActionOutcome {
     message: String,
     force_tick: bool,
+    events: Vec<TuiEvent>,
+}
+
+#[derive(Debug)]
+struct TuiAgentSession {
+    instance_id: String,
+    task_id: TaskId,
+    model: ModelKind,
+    child: Child,
+    output_rx: Receiver<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiStartedAgentSession {
+    instance_id: String,
+    task_id: TaskId,
+    model: ModelKind,
+}
+
+#[derive(Debug, Default)]
+struct TuiAgentSupervisor {
+    sessions_by_task: HashMap<String, TuiAgentSession>,
+    next_instance_nonce: u64,
+}
+
+impl TuiAgentSupervisor {
+    fn has_task_session(&self, task_id: &TaskId) -> bool {
+        self.sessions_by_task.contains_key(&task_id.0)
+    }
+
+    fn start_task_session(
+        &mut self,
+        task: &Task,
+        repo_config: &RepoConfig,
+        enabled_models: &[ModelKind],
+    ) -> Result<TuiStartedAgentSession, MainError> {
+        if self.has_task_session(&task.id) {
+            return Err(MainError::InvalidConfig(format!(
+                "agent already running for task {}",
+                task.id.0
+            )));
+        }
+
+        let model = select_agent_model(task, enabled_models)?;
+        let adapter = default_adapter_for(model).map_err(|err| {
+            MainError::InvalidConfig(format!("failed to configure adapter: {err}"))
+        })?;
+        let repo_path = resolve_task_runtime_path(task, repo_config);
+        let request = EpochRequest {
+            task_id: task.id.clone(),
+            repo_id: task.repo_id.clone(),
+            model,
+            repo_path: repo_path.clone(),
+            prompt: task_agent_prompt(task),
+            timeout_secs: TUI_AGENT_TIMEOUT_SECS,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+        };
+        let command_spec = adapter.build_command(&request);
+
+        let mut command = Command::new(&command_spec.executable);
+        command
+            .args(&command_spec.args)
+            .current_dir(&request.repo_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in &command_spec.env {
+            if key.trim().is_empty() {
+                continue;
+            }
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn().map_err(|source| {
+            MainError::InvalidConfig(format!(
+                "failed to spawn {} for task {} in {}: {source}",
+                model_kind_tag(&model),
+                task.id.0,
+                request.repo_path.display()
+            ))
+        })?;
+
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            spawn_pipe_reader(stdout, tx.clone(), false);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_pipe_reader(stderr, tx.clone(), true);
+        }
+        drop(tx);
+
+        let instance_id = format!("A-{}-{}", task.id.0, self.next_instance_nonce);
+        self.next_instance_nonce = self.next_instance_nonce.saturating_add(1);
+        self.sessions_by_task.insert(
+            task.id.0.clone(),
+            TuiAgentSession {
+                instance_id: instance_id.clone(),
+                task_id: task.id.clone(),
+                model,
+                child,
+                output_rx: rx,
+            },
+        );
+
+        Ok(TuiStartedAgentSession {
+            instance_id,
+            task_id: task.id.clone(),
+            model,
+        })
+    }
+
+    fn stop_task_session(&mut self, task_id: &TaskId) -> Option<TuiStartedAgentSession> {
+        let mut session = self.sessions_by_task.remove(&task_id.0)?;
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+        Some(TuiStartedAgentSession {
+            instance_id: session.instance_id,
+            task_id: session.task_id,
+            model: session.model,
+        })
+    }
+
+    fn poll_events(&mut self) -> Vec<TuiEvent> {
+        let mut events = Vec::new();
+        let mut finished_task_keys = Vec::new();
+
+        for (task_key, session) in &mut self.sessions_by_task {
+            let mut lines = Vec::new();
+            while let Ok(line) = session.output_rx.try_recv() {
+                lines.push(line);
+            }
+            if !lines.is_empty() {
+                events.push(TuiEvent::AgentPaneOutput {
+                    instance_id: session.instance_id.clone(),
+                    task_id: session.task_id.clone(),
+                    model: session.model,
+                    lines,
+                });
+            }
+
+            match session.child.try_wait() {
+                Ok(Some(status)) => {
+                    let exit_code = status.code().unwrap_or(-1);
+                    events.push(TuiEvent::AgentPaneOutput {
+                        instance_id: session.instance_id.clone(),
+                        task_id: session.task_id.clone(),
+                        model: session.model,
+                        lines: vec![format!("[agent exited code={exit_code}]")],
+                    });
+                    events.push(TuiEvent::AgentPaneStatusChanged {
+                        instance_id: session.instance_id.clone(),
+                        status: if status.success() {
+                            AgentPaneStatus::Exited
+                        } else {
+                            AgentPaneStatus::Failed
+                        },
+                    });
+                    finished_task_keys.push(task_key.clone());
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    events.push(TuiEvent::AgentPaneOutput {
+                        instance_id: session.instance_id.clone(),
+                        task_id: session.task_id.clone(),
+                        model: session.model,
+                        lines: vec![format!("[agent status error: {err}]")],
+                    });
+                    events.push(TuiEvent::AgentPaneStatusChanged {
+                        instance_id: session.instance_id.clone(),
+                        status: AgentPaneStatus::Failed,
+                    });
+                    finished_task_keys.push(task_key.clone());
+                }
+            }
+        }
+
+        for task_key in finished_task_keys {
+            self.sessions_by_task.remove(&task_key);
+        }
+
+        events
+    }
+
+    fn stop_all(&mut self) {
+        let keys = self
+            .sessions_by_task
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>();
+        for key in keys {
+            let task_id = TaskId(key);
+            let _ = self.stop_task_session(&task_id);
+        }
+    }
+}
+
+fn spawn_pipe_reader<R>(reader: R, tx: mpsc::Sender<String>, is_stderr: bool)
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffered = BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match buffered.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let normalized = if is_stderr {
+                        format!("[stderr] {}", line.trim_end_matches('\n'))
+                    } else {
+                        line.trim_end_matches('\n').to_string()
+                    };
+                    let _ = tx.send(normalized);
+                }
+                Err(err) => {
+                    let _ = tx.send(format!("[reader error: {err}]"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn select_agent_model(task: &Task, enabled_models: &[ModelKind]) -> Result<ModelKind, MainError> {
+    if enabled_models.is_empty() {
+        return Err(MainError::InvalidConfig(
+            "no enabled models configured for agent start".to_string(),
+        ));
+    }
+    if let Some(preferred) = task.preferred_model {
+        if enabled_models.contains(&preferred) {
+            return Ok(preferred);
+        }
+    }
+    Ok(enabled_models[0])
+}
+
+fn resolve_task_runtime_path(task: &Task, repo_config: &RepoConfig) -> PathBuf {
+    if task.worktree_path.is_absolute() && task.worktree_path.exists() {
+        return task.worktree_path.clone();
+    }
+    if task.worktree_path.is_relative() {
+        let joined = repo_config.repo_path.join(&task.worktree_path);
+        if joined.exists() {
+            return joined;
+        }
+    }
+    repo_config.repo_path.clone()
+}
+
+fn task_agent_prompt(task: &Task) -> String {
+    format!(
+        "You are working on task {id}: {title}\n\
+State: {state:?}\n\
+Role: {role:?}\n\
+Type: {task_type:?}\n\
+Work in this task worktree, make focused changes, and report progress.",
+        id = task.id.0,
+        title = task.title,
+        state = task.state,
+        role = task.role,
+        task_type = task.task_type
+    )
 }
 
 fn execute_tui_action(
@@ -315,24 +595,31 @@ fn execute_tui_action(
     org: &OrgConfig,
     enabled_models: &[ModelKind],
     probe_config: &SetupProbeConfig,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+    agent_supervisor: &mut TuiAgentSupervisor,
     at: chrono::DateTime<Utc>,
 ) -> Result<TuiActionOutcome, MainError> {
+    if action == UiAction::CreateTask {
+        let task = create_tui_task(task_id, service, org, repo_config_by_id, at)?;
+        return Ok(TuiActionOutcome {
+            message: format!("created task {} in repo {}", task.id.0, task.repo_id.0),
+            force_tick: false,
+            events: Vec::new(),
+        });
+    }
+
     let selected_task_id = task_id.cloned().ok_or_else(|| {
         MainError::InvalidConfig("select a task before running this action".to_string())
     })?;
 
-    let task = service
+    let mut task = service
         .task(&selected_task_id)?
         .ok_or_else(|| ServiceError::TaskNotFound {
             task_id: selected_task_id.0.clone(),
         })?;
 
     let outcome = match action {
-        UiAction::CreateTask => TuiActionOutcome {
-            message: "create task from TUI is not wired yet; use `othala create-task --spec ...`"
-                .to_string(),
-            force_tick: false,
-        },
+        UiAction::CreateTask => unreachable!("handled above"),
         UiAction::ApproveTask => {
             let review_config = orchd::ReviewGateConfig {
                 enabled_models: org.models.enabled.clone(),
@@ -400,48 +687,78 @@ fn execute_tui_action(
                     selected_task_id.0
                 ),
                 force_tick: true,
+                events: Vec::new(),
             }
         }
         UiAction::StartAgent => {
-            if task.state == TaskState::Queued {
+            if agent_supervisor.has_task_session(&selected_task_id) {
                 TuiActionOutcome {
-                    message: format!("queued task {} for scheduler start", selected_task_id.0),
-                    force_tick: true,
+                    message: format!("agent already running for {}", selected_task_id.0),
+                    force_tick: false,
+                    events: Vec::new(),
                 }
-            } else if task.state == TaskState::Paused {
-                let _ = service.resume_task(
-                    &selected_task_id,
-                    orchd::ResumeTaskEventIds {
-                        resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
-                    },
-                    at,
-                )?;
-                TuiActionOutcome {
-                    message: format!("resumed task {}", selected_task_id.0),
-                    force_tick: true,
-                }
-            } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
-                let _ = service.transition_task_state(
-                    &selected_task_id,
-                    TaskState::Running,
-                    tui_event_id(&selected_task_id, "START-RUNNING", at),
-                    at,
-                )?;
-                TuiActionOutcome {
-                    message: format!("moved task {} to RUNNING", selected_task_id.0),
-                    force_tick: true,
-                }
-            } else {
+            } else if task.state == TaskState::Queued || task.state == TaskState::Initializing {
                 TuiActionOutcome {
                     message: format!(
-                        "cannot start task {} from state {:?}",
-                        selected_task_id.0, task.state
+                        "task {} is {}; scheduler/runtime will prepare worktree first",
+                        selected_task_id.0,
+                        orchd::task_state_tag(task.state)
                     ),
-                    force_tick: false,
+                    force_tick: true,
+                    events: Vec::new(),
+                }
+            } else {
+                if task.state == TaskState::Paused {
+                    task = service.resume_task(
+                        &selected_task_id,
+                        orchd::ResumeTaskEventIds {
+                            resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                        },
+                        at,
+                    )?;
+                } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                    task = service.transition_task_state(
+                        &selected_task_id,
+                        TaskState::Running,
+                        tui_event_id(&selected_task_id, "START-RUNNING", at),
+                        at,
+                    )?;
+                } else {
+                    return Ok(TuiActionOutcome {
+                        message: format!(
+                            "cannot start task {} from state {:?}",
+                            selected_task_id.0, task.state
+                        ),
+                        force_tick: false,
+                        events: Vec::new(),
+                    });
+                }
+                let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                    MainError::InvalidConfig(format!(
+                        "missing repo config for repo_id={}",
+                        task.repo_id.0
+                    ))
+                })?;
+                let started =
+                    agent_supervisor.start_task_session(&task, repo_config, enabled_models)?;
+                TuiActionOutcome {
+                    message: format!(
+                        "started {} agent for {}",
+                        model_kind_tag(&started.model),
+                        selected_task_id.0
+                    ),
+                    force_tick: true,
+                    events: vec![TuiEvent::AgentPaneOutput {
+                        instance_id: started.instance_id,
+                        task_id: started.task_id,
+                        model: started.model,
+                        lines: vec!["[agent session started]".to_string()],
+                    }],
                 }
             }
         }
         UiAction::StopAgent | UiAction::PauseTask => {
+            let stopped = agent_supervisor.stop_task_session(&selected_task_id);
             let _ = service.pause_task(
                 &selected_task_id,
                 orchd::PauseTaskEventIds {
@@ -449,54 +766,115 @@ fn execute_tui_action(
                 },
                 at,
             )?;
+            let mut events = Vec::new();
+            let mut stop_note = "no active agent session".to_string();
+            if let Some(stopped) = stopped {
+                stop_note = format!("stopped {}", model_kind_tag(&stopped.model));
+                events.push(TuiEvent::AgentPaneOutput {
+                    instance_id: stopped.instance_id.clone(),
+                    task_id: stopped.task_id.clone(),
+                    model: stopped.model,
+                    lines: vec!["[agent session stopped]".to_string()],
+                });
+                events.push(TuiEvent::AgentPaneStatusChanged {
+                    instance_id: stopped.instance_id,
+                    status: AgentPaneStatus::Exited,
+                });
+            }
             TuiActionOutcome {
-                message: format!("paused task {}", selected_task_id.0),
+                message: format!("paused task {} ({stop_note})", selected_task_id.0),
                 force_tick: false,
+                events,
             }
         }
         UiAction::RestartAgent => {
-            if task.state == TaskState::Queued {
-                TuiActionOutcome {
-                    message: format!("queued task {} for scheduler start", selected_task_id.0),
-                    force_tick: true,
-                }
-            } else if orchd::is_transition_allowed(task.state, TaskState::Paused) {
-                let _ = service.pause_task(
-                    &selected_task_id,
-                    orchd::PauseTaskEventIds {
-                        pause_state_changed: tui_event_id(&selected_task_id, "RESTART-PAUSE", at),
-                    },
-                    at,
-                )?;
-                let _ = service.resume_task(
-                    &selected_task_id,
-                    orchd::ResumeTaskEventIds {
-                        resume_state_changed: tui_event_id(&selected_task_id, "RESTART-RESUME", at),
-                    },
-                    at,
-                )?;
-                TuiActionOutcome {
-                    message: format!("restarted task {}", selected_task_id.0),
-                    force_tick: true,
-                }
-            } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
-                let _ = service.transition_task_state(
-                    &selected_task_id,
-                    TaskState::Running,
-                    tui_event_id(&selected_task_id, "RESTART-RUNNING", at),
-                    at,
-                )?;
-                TuiActionOutcome {
-                    message: format!("moved task {} to RUNNING", selected_task_id.0),
-                    force_tick: true,
-                }
-            } else {
+            let mut events = Vec::new();
+            if let Some(stopped) = agent_supervisor.stop_task_session(&selected_task_id) {
+                events.push(TuiEvent::AgentPaneOutput {
+                    instance_id: stopped.instance_id.clone(),
+                    task_id: stopped.task_id.clone(),
+                    model: stopped.model,
+                    lines: vec!["[agent session restarting]".to_string()],
+                });
+                events.push(TuiEvent::AgentPaneStatusChanged {
+                    instance_id: stopped.instance_id,
+                    status: AgentPaneStatus::Exited,
+                });
+            }
+
+            if task.state == TaskState::Queued || task.state == TaskState::Initializing {
                 TuiActionOutcome {
                     message: format!(
-                        "cannot restart task {} from state {:?}",
-                        selected_task_id.0, task.state
+                        "task {} is {}; scheduler/runtime will prepare worktree first",
+                        selected_task_id.0,
+                        orchd::task_state_tag(task.state)
                     ),
-                    force_tick: false,
+                    force_tick: true,
+                    events,
+                }
+            } else {
+                if orchd::is_transition_allowed(task.state, TaskState::Paused) {
+                    let _ = service.pause_task(
+                        &selected_task_id,
+                        orchd::PauseTaskEventIds {
+                            pause_state_changed: tui_event_id(
+                                &selected_task_id,
+                                "RESTART-PAUSE",
+                                at,
+                            ),
+                        },
+                        at,
+                    )?;
+                    task = service.resume_task(
+                        &selected_task_id,
+                        orchd::ResumeTaskEventIds {
+                            resume_state_changed: tui_event_id(
+                                &selected_task_id,
+                                "RESTART-RESUME",
+                                at,
+                            ),
+                        },
+                        at,
+                    )?;
+                } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                    task = service.transition_task_state(
+                        &selected_task_id,
+                        TaskState::Running,
+                        tui_event_id(&selected_task_id, "RESTART-RUNNING", at),
+                        at,
+                    )?;
+                } else {
+                    return Ok(TuiActionOutcome {
+                        message: format!(
+                            "cannot restart task {} from state {:?}",
+                            selected_task_id.0, task.state
+                        ),
+                        force_tick: false,
+                        events,
+                    });
+                }
+                let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                    MainError::InvalidConfig(format!(
+                        "missing repo config for repo_id={}",
+                        task.repo_id.0
+                    ))
+                })?;
+                let started =
+                    agent_supervisor.start_task_session(&task, repo_config, enabled_models)?;
+                events.push(TuiEvent::AgentPaneOutput {
+                    instance_id: started.instance_id.clone(),
+                    task_id: started.task_id.clone(),
+                    model: started.model,
+                    lines: vec!["[agent session started]".to_string()],
+                });
+                TuiActionOutcome {
+                    message: format!(
+                        "restarted {} agent for {}",
+                        model_kind_tag(&started.model),
+                        selected_task_id.0
+                    ),
+                    force_tick: true,
+                    events,
                 }
             }
         }
@@ -513,6 +891,7 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("triggered quick verify for {}", selected_task_id.0),
                 force_tick: true,
+                events: Vec::new(),
             }
         }
         UiAction::RunVerifyFull => {
@@ -528,6 +907,7 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("triggered full verify for {}", selected_task_id.0),
                 force_tick: true,
+                events: Vec::new(),
             }
         }
         UiAction::TriggerRestack => {
@@ -542,6 +922,7 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("started restack for {}", selected_task_id.0),
                 force_tick: true,
+                events: Vec::new(),
             }
         }
         UiAction::MarkNeedsHuman => {
@@ -557,6 +938,7 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("marked task {} NEEDS_HUMAN", selected_task_id.0),
                 force_tick: false,
+                events: Vec::new(),
             }
         }
         UiAction::OpenWebUiForTask => {
@@ -568,6 +950,7 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("open: http://{task_url}"),
                 force_tick: false,
+                events: Vec::new(),
             }
         }
         UiAction::ResumeTask => {
@@ -581,11 +964,88 @@ fn execute_tui_action(
             TuiActionOutcome {
                 message: format!("resumed task {}", selected_task_id.0),
                 force_tick: true,
+                events: Vec::new(),
             }
         }
     };
 
     Ok(outcome)
+}
+
+fn create_tui_task(
+    selected_task_id: Option<&TaskId>,
+    service: &OrchdService,
+    org: &OrgConfig,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+    at: chrono::DateTime<Utc>,
+) -> Result<Task, MainError> {
+    let repo_id = match selected_task_id {
+        Some(task_id) => {
+            let selected_task =
+                service
+                    .task(task_id)?
+                    .ok_or_else(|| ServiceError::TaskNotFound {
+                        task_id: task_id.0.clone(),
+                    })?;
+            selected_task.repo_id.0
+        }
+        None => {
+            let mut repo_ids = repo_config_by_id.keys().cloned().collect::<Vec<_>>();
+            repo_ids.sort();
+            repo_ids.into_iter().next().ok_or_else(|| {
+                MainError::InvalidConfig(
+                    "no repo configs loaded; cannot create task from tui".to_string(),
+                )
+            })?
+        }
+    };
+
+    let base_id = format!("T{}", at.timestamp_millis());
+    let mut task_id = TaskId(base_id.clone());
+    let mut suffix = 1usize;
+    while service.task(&task_id)?.is_some() {
+        task_id = TaskId(format!("{base_id}-{suffix}"));
+        suffix += 1;
+    }
+
+    let task = Task {
+        id: task_id.clone(),
+        repo_id: orch_core::types::RepoId(repo_id),
+        title: format!("TUI task {}", task_id.0),
+        state: TaskState::Queued,
+        role: orch_core::types::TaskRole::General,
+        task_type: orch_core::types::TaskType::Feature,
+        preferred_model: None,
+        depends_on: Vec::new(),
+        submit_mode: org.graphite.submit_mode_default,
+        branch_name: None,
+        worktree_path: PathBuf::from(format!(".orch/wt/{}", task_id.0)),
+        pr: None,
+        verify_status: VerifyStatus::NotRun,
+        review_status: ReviewStatus {
+            required_models: Vec::new(),
+            approvals_received: 0,
+            approvals_required: 0,
+            unanimous: false,
+            capacity_state: ReviewCapacityState::Sufficient,
+        },
+        created_at: at,
+        updated_at: at,
+    };
+
+    let event = Event {
+        id: EventId(format!(
+            "E-TUI-CREATE-{}-{}",
+            task.id.0,
+            at.timestamp_nanos_opt().unwrap_or_default()
+        )),
+        task_id: Some(task.id.clone()),
+        repo_id: Some(task.repo_id.clone()),
+        at,
+        kind: EventKind::TaskCreated,
+    };
+    service.create_task(&task, &event)?;
+    Ok(task)
 }
 
 fn run_single_orchestrator_tick(
@@ -2141,6 +2601,9 @@ mod tests {
         RunCliArgs, SetupCliArgs, TuiCliArgs, WizardCliArgs,
     };
     use chrono::Utc;
+    use orch_core::config::{
+        NixConfig, RepoConfig, RepoGraphiteConfig, VerifyCommands, VerifyConfig,
+    };
     use orch_core::events::{
         Event, EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
     };
@@ -2151,6 +2614,7 @@ mod tests {
     use orch_core::types::{ModelKind, TaskId};
     use orch_tui::UiAction;
     use orchd::{OrchdService, Scheduler, SchedulerConfig};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -2663,6 +3127,29 @@ submit_mode = "single"
         OrchdService::open(sqlite, events, scheduler).expect("open service")
     }
 
+    fn mk_repo_config(repo_id: &str, root: &Path) -> RepoConfig {
+        RepoConfig {
+            repo_id: repo_id.to_string(),
+            repo_path: root.to_path_buf(),
+            base_branch: "main".to_string(),
+            nix: NixConfig {
+                dev_shell: "nix develop".to_string(),
+            },
+            verify: VerifyConfig {
+                quick: VerifyCommands {
+                    commands: vec!["nix develop -c true".to_string()],
+                },
+                full: VerifyCommands {
+                    commands: vec!["nix develop -c true".to_string()],
+                },
+            },
+            graphite: RepoGraphiteConfig {
+                draft_on_start: true,
+                submit_mode: Some(SubmitMode::Single),
+            },
+        }
+    }
+
     #[test]
     fn execute_tui_action_approve_task_records_manual_approvals() {
         let root = std::env::temp_dir().join(format!(
@@ -2685,6 +3172,8 @@ submit_mode = "single"
                 },
             )
             .expect("create task");
+        let repo_configs = HashMap::new();
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
 
         let outcome = execute_tui_action(
             UiAction::ApproveTask,
@@ -2693,6 +3182,8 @@ submit_mode = "single"
             &org,
             &org.models.enabled,
             &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
             Utc::now(),
         )
         .expect("approve action");
@@ -2701,6 +3192,41 @@ submit_mode = "single"
         assert_eq!(approvals.len(), org.models.enabled.len());
         assert!(outcome.force_tick);
         assert!(outcome.message.contains("recorded APPROVE"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_tui_action_create_task_creates_queued_task() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-create-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let mut repo_configs = HashMap::new();
+        repo_configs.insert("example".to_string(), mk_repo_config("example", &root));
+        let mut agent_supervisor = super::TuiAgentSupervisor::default();
+
+        let outcome = execute_tui_action(
+            UiAction::CreateTask,
+            None,
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            &repo_configs,
+            &mut agent_supervisor,
+            Utc::now(),
+        )
+        .expect("create action");
+
+        assert!(outcome.message.contains("created task"));
+        let tasks = service.list_tasks().expect("list tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Queued);
+        assert_eq!(tasks[0].repo_id.0, "example");
 
         let _ = fs::remove_dir_all(root);
     }
