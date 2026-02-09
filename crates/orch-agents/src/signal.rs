@@ -2,7 +2,23 @@ use chrono::Utc;
 
 use crate::types::{AgentSignal, AgentSignalKind};
 
+/// Returns true for lines that are part of diff or structured output (not agent prose).
+fn is_structured_output_line(line: &str) -> bool {
+    line.starts_with("diff --")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("@@ ")
+        || line.starts_with("@@@ ")
+        || line.starts_with("*** ")
+        || line.starts_with("index ")
+}
+
 pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
+    // Skip diff / structured output lines — they may contain signal-like substrings.
+    if is_structured_output_line(line) {
+        return None;
+    }
+
     let lower = line.to_ascii_lowercase();
 
     // Skip prompt echo lines — agent startup echoes instructions containing signal markers.
@@ -10,18 +26,11 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         return None;
     }
 
-    let kind = if lower.contains("needs_human")
-        || lower.contains("need_human")
-        || lower.contains("[need_human]")
-        || lower.contains("[needs_human]")
-    {
+    let kind = if lower.contains("[needs_human]") || lower.contains("[need_human]") {
         Some(AgentSignalKind::NeedHuman)
-    } else if lower.contains("patch_ready")
-        || lower.contains("[patch_ready]")
-        || lower.contains("ready for review")
-    {
+    } else if lower.contains("[patch_ready]") {
         Some(AgentSignalKind::PatchReady)
-    } else if lower.contains("[conflict_resolved]") || lower.contains("conflict_resolved") {
+    } else if lower.contains("[conflict_resolved]") {
         Some(AgentSignalKind::ConflictResolved)
     } else if lower.contains("rate limit")
         || lower.contains("rate_limit")
@@ -62,7 +71,7 @@ mod tests {
     #[test]
     fn detects_patch_ready_variants() {
         let signal =
-            detect_common_signal("all done, ready for review").expect("patch ready signal");
+            detect_common_signal("status: [patch_ready] all changes applied").expect("patch ready signal");
         assert_eq!(signal.kind, AgentSignalKind::PatchReady);
     }
 
@@ -106,7 +115,7 @@ mod tests {
     #[test]
     fn prioritizes_need_human_over_other_markers_in_same_line() {
         let signal = detect_common_signal(
-            "status: [needs_human] and ready for review but fatal: waiting for human",
+            "status: [needs_human] and [patch_ready] but fatal: waiting for human",
         )
         .expect("need human signal");
         assert_eq!(signal.kind, AgentSignalKind::NeedHuman);
@@ -127,5 +136,41 @@ mod tests {
             detect_common_signal("status: [patch_ready] but got rate limit warning afterwards")
                 .expect("signal");
         assert_eq!(signal.kind, AgentSignalKind::PatchReady);
+    }
+
+    #[test]
+    fn skips_diff_header_lines() {
+        assert!(detect_common_signal("diff --git a/error.rs b/error.rs").is_none());
+    }
+
+    #[test]
+    fn skips_diff_context_lines() {
+        assert!(detect_common_signal("--- a/file_with_error.rs").is_none());
+        assert!(detect_common_signal("+++ b/file_with_error.rs").is_none());
+        assert!(detect_common_signal("@@ -1,3 +1,4 @@ fn error_handler").is_none());
+        assert!(detect_common_signal("index abc1234..def5678 100644").is_none());
+        assert!(detect_common_signal("*** Begin Patch error: something").is_none());
+    }
+
+    #[test]
+    fn bare_signal_words_no_longer_match() {
+        assert!(detect_common_signal("the needs_human flag is set").is_none());
+        assert!(detect_common_signal("patch_ready variable was true").is_none());
+        assert!(detect_common_signal("conflict_resolved in the merge").is_none());
+    }
+
+    #[test]
+    fn bracket_signals_still_match() {
+        let signal =
+            detect_common_signal("status: [needs_human] blocked").expect("need human signal");
+        assert_eq!(signal.kind, AgentSignalKind::NeedHuman);
+
+        let signal =
+            detect_common_signal("done: [patch_ready]").expect("patch ready signal");
+        assert_eq!(signal.kind, AgentSignalKind::PatchReady);
+
+        let signal =
+            detect_common_signal("ok: [conflict_resolved]").expect("conflict resolved signal");
+        assert_eq!(signal.kind, AgentSignalKind::ConflictResolved);
     }
 }

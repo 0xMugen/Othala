@@ -492,81 +492,55 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             }
         }
 
-        // Bridge: conflict_resolved agent signal -> gt add -A + gt continue + resolve restack.
+        // Bridge: conflict_resolved agent signal -> resolve restack.
+        // The agent already ran `gt add -A` + `gt continue` in its session.
         for task_id in agent_supervisor.drain_conflict_resolved_tasks() {
             let at = Utc::now();
             if let Some(stopped) = agent_supervisor.stop_task_session(&task_id) {
                 apply_stopped_agent_session_event(app, stopped, "conflict_resolved");
             }
-            match service.task(&task_id) {
-                Ok(Some(task)) => {
-                    let repo_config = repo_config_by_id.get(&task.repo_id.0);
-                    let resolve_ok = (|| -> Result<(), String> {
-                        let repo_cfg = repo_config.ok_or_else(|| {
-                            format!("missing repo config for repo_id={}", task.repo_id.0)
-                        })?;
-                        let runtime_path = resolve_task_runtime_path(&task, repo_cfg);
-                        let gt = GraphiteClient::new(runtime_path);
-                        gt.begin_conflict_resolution()
-                            .map_err(|e| format!("gt add -A failed: {e}"))?;
-                        gt.continue_conflict_resolution()
-                            .map_err(|e| format!("gt continue failed: {e}"))?;
-                        service
-                            .resolve_restack_conflict(
-                                &task_id,
-                                orchd::ResolveRestackConflictEventIds {
-                                    restack_state_changed: tui_event_id(
-                                        &task_id,
-                                        "CR-RESOLVE-S",
-                                        at,
-                                    ),
-                                    restack_resolved: tui_event_id(&task_id, "CR-RESOLVE-E", at),
-                                },
-                                at,
-                            )
-                            .map_err(|e| format!("resolve_restack_conflict failed: {e}"))?;
-                        Ok(())
-                    })();
-                    match resolve_ok {
-                        Ok(()) => {
-                            signal_tick_requested = true;
-                            app.state.status_line =
-                                format!("conflict resolved for {}; restack continuing", task_id.0);
+            let resolve_ok = (|| -> Result<(), String> {
+                service
+                    .resolve_restack_conflict(
+                        &task_id,
+                        orchd::ResolveRestackConflictEventIds {
+                            restack_state_changed: tui_event_id(&task_id, "CR-RESOLVE-S", at),
+                            restack_resolved: tui_event_id(&task_id, "CR-RESOLVE-E", at),
+                        },
+                        at,
+                    )
+                    .map_err(|e| format!("resolve_restack_conflict failed: {e}"))?;
+                Ok(())
+            })();
+            match resolve_ok {
+                Ok(()) => {
+                    signal_tick_requested = true;
+                    app.state.status_line =
+                        format!("conflict resolved for {}; restack continuing", task_id.0);
+                }
+                Err(reason) => {
+                    match service.mark_needs_human(
+                        &task_id,
+                        &format!("conflict resolution failed: {reason}"),
+                        orchd::MarkNeedsHumanEventIds {
+                            needs_human_state_changed: tui_event_id(&task_id, "CR-NH-S", at),
+                            needs_human_event: tui_event_id(&task_id, "CR-NH-E", at),
+                        },
+                        at,
+                    ) {
+                        Ok(_) => {
+                            app.state.status_line = format!(
+                                "conflict resolution failed for {}: {reason}; marked needs-human",
+                                task_id.0
+                            );
                         }
-                        Err(reason) => {
-                            match service.mark_needs_human(
-                                &task_id,
-                                &format!("conflict resolution failed: {reason}"),
-                                orchd::MarkNeedsHumanEventIds {
-                                    needs_human_state_changed: tui_event_id(
-                                        &task_id, "CR-NH-S", at,
-                                    ),
-                                    needs_human_event: tui_event_id(&task_id, "CR-NH-E", at),
-                                },
-                                at,
-                            ) {
-                                Ok(_) => {
-                                    app.state.status_line = format!(
-                                        "conflict resolution failed for {}: {reason}; marked needs-human",
-                                        task_id.0
-                                    );
-                                }
-                                Err(nh_err) => {
-                                    app.state.status_line = format!(
-                                        "conflict resolution failed for {}: {reason} (also failed to mark needs-human: {nh_err})",
-                                        task_id.0
-                                    );
-                                }
-                            }
+                        Err(nh_err) => {
+                            app.state.status_line = format!(
+                                "conflict resolution failed for {}: {reason} (also failed to mark needs-human: {nh_err})",
+                                task_id.0
+                            );
                         }
                     }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    app.state.status_line = format!(
-                        "failed to load task {} for conflict-resolved signal: {err}",
-                        task_id.0
-                    );
                 }
             }
         }
@@ -786,6 +760,11 @@ impl TuiAgentSupervisor {
             MainError::InvalidConfig(format!("failed to configure adapter: {err}"))
         })?;
         let repo_path = resolve_task_runtime_path(task, repo_config);
+        let mut extra_args = Vec::new();
+        if model == ModelKind::Codex && repo_path != repo_config.repo_path {
+            extra_args.push("--add-dir".to_string());
+            extra_args.push(repo_config.repo_path.display().to_string());
+        }
         let request = EpochRequest {
             task_id: task.id.clone(),
             repo_id: task.repo_id.clone(),
@@ -793,7 +772,7 @@ impl TuiAgentSupervisor {
             repo_path: repo_path.clone(),
             prompt: task_agent_prompt(task, user_prompt),
             timeout_secs: TUI_AGENT_TIMEOUT_SECS,
-            extra_args: Vec::new(),
+            extra_args,
             env: Vec::new(),
         };
         let command_spec = adapter.build_command(&request);
@@ -1112,6 +1091,11 @@ impl TuiAgentSupervisor {
             MainError::InvalidConfig(format!("failed to configure adapter: {err}"))
         })?;
         let repo_path = resolve_task_runtime_path(task, repo_config);
+        let mut extra_args = Vec::new();
+        if model == ModelKind::Codex && repo_path != repo_config.repo_path {
+            extra_args.push("--add-dir".to_string());
+            extra_args.push(repo_config.repo_path.display().to_string());
+        }
         let request = EpochRequest {
             task_id: task.id.clone(),
             repo_id: task.repo_id.clone(),
@@ -1119,7 +1103,7 @@ impl TuiAgentSupervisor {
             repo_path: repo_path.clone(),
             prompt: conflict_resolution_prompt(task),
             timeout_secs: TUI_AGENT_TIMEOUT_SECS,
-            extra_args: Vec::new(),
+            extra_args,
             env: Vec::new(),
         };
         let command_spec = adapter.build_command(&request);
@@ -1317,14 +1301,17 @@ Role: {role:?}\n\
 
 fn conflict_resolution_prompt(task: &Task) -> String {
     format!(
-        "You are resolving git merge/rebase conflicts in a worktree for task {id}: {title}\n\
+        "You are resolving rebase conflicts in a worktree for task {id}: {title}\n\
         The current branch has rebase conflicts that need resolution.\n\
         \n\
         Steps:\n\
         1. Run `git status` to identify files with conflicts\n\
         2. Open each conflicted file and resolve the conflict markers (<<<<<<< / ======= / >>>>>>>)\n\
         3. Choose the correct resolution by understanding the intent of both sides\n\
-        4. After resolving all conflicts, print exactly [conflict_resolved]\n\
+        4. Run `gt add -A` to stage all resolved files\n\
+        5. Run `gt continue` to continue the rebase\n\
+        6. If `gt continue` shows new conflicts, go back to step 1\n\
+        7. When `gt continue` succeeds with no more conflicts, print exactly [conflict_resolved]\n\
         \n\
         If you cannot resolve the conflicts because you need human guidance, print exactly [needs_human] with a short reason.",
         id = task.id.0,

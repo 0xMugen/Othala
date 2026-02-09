@@ -371,6 +371,11 @@ pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> Strin
             VerifyStatus::Running { .. } => "Verifying".to_string(),
             VerifyStatus::NotRun => "Running".to_string(),
         },
+        TaskState::Failed => match verify {
+            VerifyStatus::Failed { .. } => "VerifyFail".to_string(),
+            VerifyStatus::Passed { .. } => "SubmitFail".to_string(),
+            _ => "Failed".to_string(),
+        },
         other => format!("{other:?}"),
     }
 }
@@ -480,11 +485,36 @@ mod tests {
         let row = TaskOverviewRow::from_task(&task);
         assert_eq!(row.display_state, "Verifying");
 
-        // Non-Running states use the raw state name
+        // Failed + Passed verify → "SubmitFail"
+        assert_eq!(
+            effective_display_state(
+                TaskState::Failed,
+                &VerifyStatus::Passed {
+                    tier: VerifyTier::Quick
+                }
+            ),
+            "SubmitFail"
+        );
+
+        // Failed + Failed verify → "VerifyFail"
+        assert_eq!(
+            effective_display_state(
+                TaskState::Failed,
+                &VerifyStatus::Failed {
+                    tier: VerifyTier::Quick,
+                    summary: "fmt".to_string()
+                }
+            ),
+            "VerifyFail"
+        );
+
+        // Failed + NotRun → "Failed"
         assert_eq!(
             effective_display_state(TaskState::Failed, &VerifyStatus::NotRun),
             "Failed"
         );
+
+        // Non-Running/Failed states use the raw state name
         assert_eq!(
             effective_display_state(TaskState::Reviewing, &VerifyStatus::NotRun),
             "Reviewing"

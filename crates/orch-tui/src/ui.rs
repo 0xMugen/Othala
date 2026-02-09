@@ -43,7 +43,7 @@ fn state_color(state: TaskState) -> Color {
 /// `state_color` for states that are not overridden by verify status.
 fn display_state_color(state: TaskState, display_state: &str) -> Color {
     match display_state {
-        "VerifyFail" => Color::Red,
+        "VerifyFail" | "SubmitFail" => Color::Red,
         "Verified" => Color::Cyan,
         "Verifying" => Color::Yellow,
         _ => state_color(state),
@@ -75,17 +75,139 @@ fn status_line_color(message: &str) -> Color {
     }
 }
 
-fn output_line_style(line: &str, in_patch_block: bool) -> Style {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OutputBlockState {
+    in_patch_block: bool,
+    in_code_fence: bool,
+    in_diff_block: bool,
+    in_exec_block: bool,
+}
+
+impl OutputBlockState {
+    fn update(&mut self, line: &str) {
+        let trimmed = line.trim();
+
+        // Patch block: *** Begin Patch / *** End Patch
+        if line.starts_with("*** Begin Patch") {
+            self.in_patch_block = true;
+            self.in_exec_block = false;
+        } else if line.starts_with("*** End Patch") {
+            self.in_patch_block = false;
+        }
+
+        // Code fence: toggle on lines starting with ```
+        if line.trim_start().starts_with("```") {
+            self.in_code_fence = !self.in_code_fence;
+            if self.in_code_fence {
+                self.in_exec_block = false;
+            }
+        }
+
+        // Diff block: enter on diff header, exit when line doesn't match diff patterns
+        if line.starts_with("diff --git") || line.starts_with("diff --cc") {
+            self.in_diff_block = true;
+            self.in_exec_block = false;
+        } else if self.in_diff_block && !self.in_patch_block {
+            let is_diff_line = line.starts_with('+')
+                || line.starts_with('-')
+                || line.starts_with(' ')
+                || line.starts_with("@@")
+                || line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with('\\')
+                || line.is_empty();
+            if !is_diff_line {
+                self.in_diff_block = false;
+            }
+        }
+
+        // Exec block: enter on "exec" marker, exit on agent markers or other blocks
+        if trimmed == "exec" {
+            self.in_exec_block = true;
+        } else if self.in_exec_block
+            && (trimmed == "thinking"
+                || trimmed == "codex"
+                || trimmed == "claude"
+                || trimmed == "gemini"
+                || is_patch_marker(line))
+        {
+            self.in_exec_block = false;
+        }
+    }
+}
+
+fn output_line_style(line: &str, state: &OutputBlockState) -> Style {
+    // Patch block lines (existing behavior)
+    if let Some(style) = patch_line_style(line, state.in_patch_block) {
+        return style;
+    }
+
+    // Code fence markers
+    if line.trim_start().starts_with("```") {
+        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    }
+
+    // Diff block header
+    if line.starts_with("diff --git") || line.starts_with("diff --cc") {
+        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    }
+
+    // Inside code fence: muted style, skip content-based heuristics
+    if state.in_code_fence {
+        return Style::default().fg(Color::Gray);
+    }
+
+    // Inside diff block: apply diff coloring
+    if state.in_diff_block {
+        return diff_line_style(line);
+    }
+
+    // Agent CLI markers
+    let trimmed = line.trim();
+    if trimmed == "thinking" {
+        return Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::DIM);
+    }
+    if trimmed == "exec" {
+        return Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+    }
+    if trimmed == "codex" || trimmed == "claude" || trimmed == "gemini" {
+        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    }
+
+    // Command result lines (e.g. "⎿  ... succeeded in 3.2s")
+    if trimmed.ends_with('s')
+        && (trimmed.contains("succeeded in") || trimmed.contains("failed in"))
+    {
+        return Style::default().fg(Color::Yellow);
+    }
+
+    // Agent exit / token lines
+    if line.starts_with("[agent exited") {
+        return Style::default().fg(DIM);
+    }
+    if line.starts_with("tokens used") {
+        return Style::default().fg(DIM);
+    }
+
+    // Inside exec block: muted style, skip content heuristics
+    if state.in_exec_block {
+        return Style::default().fg(Color::Gray);
+    }
+
+    // Outside all blocks: content-based styling
     let lower = line.to_ascii_lowercase();
-    if let Some(style) = patch_line_style(line, in_patch_block) {
-        style
-    } else if line.trim().is_empty() {
+    if line.trim().is_empty() {
         Style::default().fg(DIM)
-    } else if lower.contains("[needs_human]") || lower.contains("needs_human") {
+    } else if lower.contains("[needs_human]") {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
-    } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
+    } else if lower.contains("[patch_ready]") {
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
@@ -93,6 +215,20 @@ fn output_line_style(line: &str, in_patch_block: bool) -> Style {
         Style::default().fg(Color::Red)
     } else if line.starts_with("## ") {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OUTPUT_FG)
+    }
+}
+
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("@@") {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
     } else {
         Style::default().fg(OUTPUT_FG)
     }
@@ -131,21 +267,13 @@ fn is_patch_marker(line: &str) -> bool {
         || line.starts_with("*** Move to:")
 }
 
-fn update_patch_block_state(line: &str, in_patch_block: &mut bool) {
-    if line.starts_with("*** Begin Patch") {
-        *in_patch_block = true;
-    } else if line.starts_with("*** End Patch") {
-        *in_patch_block = false;
-    }
-}
-
 fn stylize_output_lines(lines: impl IntoIterator<Item = String>) -> Vec<Line<'static>> {
-    let mut in_patch_block = false;
+    let mut block_state = OutputBlockState::default();
     lines
         .into_iter()
         .map(|line| {
-            let style = output_line_style(&line, in_patch_block);
-            update_patch_block_state(&line, &mut in_patch_block);
+            let style = output_line_style(&line, &block_state);
+            block_state.update(&line);
             Line::from(Span::styled(line, style))
         })
         .collect()
@@ -932,6 +1060,11 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
 
     // -- coding: Active during initial work, Done once past Running --
     let coding = match task.state {
+        TaskState::Failed
+            if task.display_state == "VerifyFail" || task.display_state == "SubmitFail" =>
+        {
+            ChecklistState::Done
+        }
         TaskState::Failed => ChecklistState::Blocked,
         TaskState::Queued | TaskState::Paused => ChecklistState::Pending,
         TaskState::Initializing | TaskState::DraftPrOpen => ChecklistState::Active,
@@ -948,7 +1081,8 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
     ) || task.display_state == "Verifying"
     {
         ChecklistState::Active
-    } else if task.display_state == "Verified"
+    } else if task.display_state == "SubmitFail"
+        || task.display_state == "Verified"
         || matches!(
             task.state,
             TaskState::Reviewing
@@ -985,9 +1119,7 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
     let pushing = match task.state {
         TaskState::Submitting => ChecklistState::Active,
         TaskState::AwaitingMerge | TaskState::Merged => ChecklistState::Done,
-        TaskState::Failed if matches!(task.display_state.as_str(), "Submitting") => {
-            ChecklistState::Blocked
-        }
+        TaskState::Failed if task.display_state == "SubmitFail" => ChecklistState::Blocked,
         _ => ChecklistState::Pending,
     };
 
@@ -1020,7 +1152,11 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             TaskState::AwaitingMerge => "awaiting merge",
             TaskState::Restacking => "restacking",
             TaskState::RestackConflict => "restack conflict",
-            TaskState::Failed => "failed",
+            TaskState::Failed => match task.display_state.as_str() {
+                "VerifyFail" => "verify failed",
+                "SubmitFail" => "push failed",
+                _ => "failed",
+            },
             TaskState::Merged => unreachable!(),
         };
         ("phase: ", phase, Color::Yellow)
@@ -1109,7 +1245,7 @@ mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
     use orch_core::types::{ModelKind, RepoId, TaskId};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
@@ -1117,7 +1253,7 @@ mod tests {
     use super::{
         footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
         status_activity, status_line_color, status_sidebar_lines, to_local_time,
-        wrapped_visual_line_count,
+        wrapped_visual_line_count, OutputBlockState,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1267,32 +1403,44 @@ mod tests {
 
     #[test]
     fn output_line_style_marks_special_chat_signals() {
+        let default_state = OutputBlockState::default();
         assert_eq!(
-            output_line_style("[needs_human] unblock me", false).fg,
+            output_line_style("[needs_human] unblock me", &default_state).fg,
             Some(Color::Yellow)
         );
         assert_eq!(
-            output_line_style("[patch_ready] complete", false).fg,
+            output_line_style("[patch_ready] complete", &default_state).fg,
             Some(Color::Green)
         );
-        assert_eq!(output_line_style("fatal error", false).fg, Some(Color::Red));
+        assert_eq!(
+            output_line_style("fatal error", &default_state).fg,
+            Some(Color::Red)
+        );
     }
 
     #[test]
     fn output_line_style_marks_patch_edits_clearly() {
+        let default_state = OutputBlockState::default();
+        let patch_state = OutputBlockState {
+            in_patch_block: true,
+            ..OutputBlockState::default()
+        };
         assert_eq!(
-            output_line_style("*** Begin Patch", false).fg,
+            output_line_style("*** Begin Patch", &default_state).fg,
             Some(Color::Cyan)
         );
         assert_eq!(
-            output_line_style("@@ fn main @@ ", true).fg,
+            output_line_style("@@ fn main @@ ", &patch_state).fg,
             Some(Color::Yellow)
         );
         assert_eq!(
-            output_line_style("+let x = 1;", true).fg,
+            output_line_style("+let x = 1;", &patch_state).fg,
             Some(Color::Green)
         );
-        assert_eq!(output_line_style("-let x = 0;", true).fg, Some(Color::Red));
+        assert_eq!(
+            output_line_style("-let x = 0;", &patch_state).fg,
+            Some(Color::Red)
+        );
     }
 
     #[test]
@@ -1368,5 +1516,151 @@ mod tests {
             .any(|line| line.contains("push: gt submit in progress...")));
         assert!(text.iter().any(|line| line.contains("[~] pushing")));
         assert!(text.iter().any(|line| line.contains("[ ] merging")));
+    }
+
+    #[test]
+    fn code_fence_lines_use_muted_style() {
+        let state = OutputBlockState {
+            in_code_fence: true,
+            ..OutputBlockState::default()
+        };
+        assert_eq!(
+            output_line_style("let x = 42;", &state).fg,
+            Some(Color::Gray)
+        );
+    }
+
+    #[test]
+    fn code_fence_skips_false_error_styling() {
+        let state = OutputBlockState {
+            in_code_fence: true,
+            ..OutputBlockState::default()
+        };
+        // Inside a code fence, "error: something" should be Gray, not Red
+        assert_eq!(
+            output_line_style("error: something went wrong", &state).fg,
+            Some(Color::Gray)
+        );
+    }
+
+    #[test]
+    fn diff_block_lines_get_diff_coloring() {
+        let state = OutputBlockState {
+            in_diff_block: true,
+            ..OutputBlockState::default()
+        };
+        assert_eq!(
+            output_line_style("+added line", &state).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            output_line_style("-removed line", &state).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            output_line_style("@@ -1,3 +1,4 @@", &state).fg,
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn diff_block_header_styled_as_accent() {
+        let default_state = OutputBlockState::default();
+        let style = output_line_style("diff --git a/f b/f", &default_state);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn status_sidebar_shows_push_failed_when_submit_fails() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::Failed;
+        row.display_state = "SubmitFail".to_string();
+
+        let rendered = status_sidebar_lines(Some(&row));
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("[x] coding")));
+        assert!(text.iter().any(|line| line.contains("[x] verifying")));
+        assert!(text.iter().any(|line| line.contains("[!] pushing")));
+        assert!(text.iter().any(|line| line.contains("phase: push failed")));
+    }
+
+    #[test]
+    fn status_sidebar_shows_verify_failed_when_verify_fails() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::Failed;
+        row.display_state = "VerifyFail".to_string();
+
+        let rendered = status_sidebar_lines(Some(&row));
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("[x] coding")));
+        assert!(text.iter().any(|line| line.contains("[!] verifying")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("phase: verify failed")));
+    }
+
+    #[test]
+    fn exec_block_lines_use_muted_style() {
+        let state = OutputBlockState {
+            in_exec_block: true,
+            ..OutputBlockState::default()
+        };
+        assert_eq!(
+            output_line_style("    Finished test profile [unoptimized + debuginfo]", &state).fg,
+            Some(Color::Gray)
+        );
+    }
+
+    #[test]
+    fn exec_block_skips_false_error_styling() {
+        let state = OutputBlockState {
+            in_exec_block: true,
+            ..OutputBlockState::default()
+        };
+        // Inside an exec block, test result line should be Gray, not Red
+        assert_eq!(
+            output_line_style("test result: ok. 0 passed; 0 failed;", &state).fg,
+            Some(Color::Gray)
+        );
+    }
+
+    #[test]
+    fn thinking_marker_styled_as_dim_magenta() {
+        let default_state = OutputBlockState::default();
+        let style = output_line_style("thinking", &default_state);
+        assert_eq!(style.fg, Some(Color::Magenta));
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn exec_marker_styled_as_yellow_bold() {
+        let default_state = OutputBlockState::default();
+        let style = output_line_style("exec", &default_state);
+        assert_eq!(style.fg, Some(Color::Yellow));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn codex_marker_styled_as_accent() {
+        let default_state = OutputBlockState::default();
+        let style = output_line_style("codex", &default_state);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn agent_exit_line_styled_as_dim() {
+        let default_state = OutputBlockState::default();
+        let style = output_line_style("[agent exited code=0]", &default_state);
+        assert_eq!(style.fg, Some(Color::DarkGray));
     }
 }
