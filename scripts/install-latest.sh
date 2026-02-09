@@ -140,7 +140,7 @@ resolve_latest_tag() {
 
 install_nix_profile() {
   local flake_ref="${1:-}"
-  local priority=4
+  local priority=-1
   local output rc
   [[ -n "$flake_ref" ]] || return 1
 
