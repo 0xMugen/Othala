@@ -4,11 +4,19 @@ pub mod state;
 pub mod types;
 pub mod validation;
 
+// MVP simplified types
+pub mod chat;
+pub mod chat_state;
+
 pub use config::*;
 pub use events::*;
 pub use state::*;
 pub use types::*;
 pub use validation::*;
+
+// MVP re-exports
+pub use chat::{Chat, ChatId};
+pub use chat_state::{ChatState, VerifyResult};
 
 #[cfg(test)]
 mod tests {
