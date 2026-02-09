@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+install_step=0
+
+log_step() {
+  install_step=$((install_step + 1))
+  printf '[install:%02d] %s\n' "$install_step" "$*"
+}
+
+log_info() {
+  printf '[install] %s\n' "$*"
+}
+
+strip_ansi() {
+  sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g'
+}
+
 usage() {
   cat <<'USAGE'
 Usage: scripts/install-latest.sh [--repo <owner/name>] [--tag <release-tag>] [--method <auto|nix|cargo>] [--force]
@@ -138,33 +153,73 @@ resolve_latest_tag() {
   return 1
 }
 
+next_nix_profile_priority() {
+  local current_min found value
+  local profile_json
+  current_min=0
+  found=0
+
+  profile_json="$(nix profile list --json 2>/dev/null || true)"
+  if [[ -n "$profile_json" ]]; then
+    while IFS= read -r value; do
+      [[ -n "$value" ]] || continue
+      if [[ "$found" -eq 0 || "$value" -lt "$current_min" ]]; then
+        current_min="$value"
+        found=1
+      fi
+    done < <(
+      printf '%s' "$profile_json" \
+        | tr '{},' '\n' \
+        | sed -n 's/^[[:space:]]*"priority":[[:space:]]*\(-\?[0-9]\+\)[[:space:]]*$/\1/p'
+    )
+  fi
+
+  if [[ "$found" -eq 0 ]]; then
+    printf '%s\n' "-1"
+    return 0
+  fi
+
+  printf '%s\n' "$((current_min - 1))"
+}
+
 install_nix_profile() {
   local flake_ref="${1:-}"
-  local priority=-1
-  local output rc
+  local priority
+  local output cleaned rc attempt
   [[ -n "$flake_ref" ]] || return 1
+  priority="$(next_nix_profile_priority)"
+  log_step "Installing via nix profile (${flake_ref}) with priority ${priority}"
 
-  while [[ "$priority" -ge -64 ]]; do
+  for attempt in $(seq 1 32); do
     if output="$(nix profile install "$flake_ref" --priority "$priority" 2>&1)"; then
       if [[ -n "$output" ]]; then
         printf '%s\n' "$output"
       fi
+      log_info "Installed successfully with priority ${priority}"
       return 0
-    fi
-    rc=$?
-    printf '%s\n' "$output" >&2
+    else
+      rc=$?
+      cleaned="$(printf '%s\n' "$output" | strip_ansi)"
+      printf '%s\n' "$cleaned" >&2
 
-    if ! printf '%s\n' "$output" | grep -Fq "An existing package already provides the following file:"; then
-      return "$rc"
-    fi
+      if ! printf '%s\n' "$cleaned" | grep -Fq "already provides the following file"; then
+        return "$rc"
+      fi
 
-    priority=$((priority - 1))
+      log_info "Profile conflict at priority ${priority}; retrying with lower priority"
+      priority=$((priority - 1))
+      if [[ "$attempt" -eq 32 ]]; then
+        break
+      fi
+    fi
   done
 
+  echo "nix install failed after repeated profile priority conflicts" >&2
   return 1
 }
 
 if [[ -z "$tag" ]]; then
+  log_step "Resolving latest release tag from ${repo}"
   tag="$(resolve_latest_tag || true)"
 fi
 
@@ -175,6 +230,7 @@ if ! is_valid_tag "$tag"; then
 fi
 
 if [[ "$method" == "auto" ]]; then
+  log_step "Selecting install method"
   if command -v nix >/dev/null 2>&1; then
     method="nix"
   elif command -v cargo >/dev/null 2>&1; then
@@ -185,15 +241,18 @@ if [[ "$method" == "auto" ]]; then
   fi
 fi
 
-echo "installing othala from ${repo} release ${tag} using ${method}"
+log_step "Installing othala from ${repo} release ${tag} using ${method}"
 
 if [[ "$method" == "nix" ]]; then
+  log_info "Trying nix flake ref: github:${repo}/${tag}#othala"
   if install_nix_profile "github:${repo}/${tag}#othala"; then
     exit 0
   fi
+  log_info "Primary nix ref failed, trying git+https fallback"
   if install_nix_profile "git+https://github.com/${repo}.git?ref=refs/tags/${tag}#othala"; then
     exit 0
   fi
+  log_info "HTTPS fallback failed, trying git+ssh fallback"
   if install_nix_profile "git+ssh://git@github.com/${repo}.git?ref=refs/tags/${tag}#othala"; then
     exit 0
   fi
@@ -219,6 +278,7 @@ if [[ "$force" -eq 1 ]]; then
   cargo_args+=(--force)
 fi
 
+log_step "Running cargo install over HTTPS"
 if cargo "${cargo_args[@]}"; then
   exit 0
 fi
@@ -236,4 +296,5 @@ if [[ "$force" -eq 1 ]]; then
   fallback_args+=(--force)
 fi
 
+log_info "HTTPS cargo install failed, retrying over SSH"
 cargo "${fallback_args[@]}"
