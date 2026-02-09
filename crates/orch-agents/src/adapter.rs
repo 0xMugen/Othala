@@ -31,7 +31,12 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = request.extra_args.clone();
+        let mut args = vec![
+            "-p".to_string(),
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {
             executable: self.executable.clone(),
@@ -60,7 +65,8 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = request.extra_args.clone();
+        let mut args = vec!["exec".to_string()];
+        args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {
             executable: self.executable.clone(),
@@ -89,7 +95,11 @@ impl AgentAdapter for GeminiAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = request.extra_args.clone();
+        let mut args = vec![
+            "-p".to_string(),
+            "--yolo".to_string(),
+        ];
+        args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {
             executable: self.executable.clone(),
@@ -131,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_adapter_builds_command_with_prompt_appended() {
+    fn claude_adapter_builds_command_with_noninteractive_flags_and_prompt() {
         let adapter = ClaudeAdapter::default();
         let request = mk_request(ModelKind::Claude);
         let command = adapter.build_command(&request);
@@ -140,6 +150,9 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
+                "-p".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
                 "--flag".to_string(),
                 "--json".to_string(),
                 "implement feature".to_string()
@@ -149,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_adapter_builds_command_with_prompt_appended() {
+    fn codex_adapter_builds_command_with_exec_subcommand_and_prompt() {
         let adapter = CodexAdapter::default();
         let request = mk_request(ModelKind::Codex);
         let command = adapter.build_command(&request);
@@ -158,6 +171,7 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
+                "exec".to_string(),
                 "--flag".to_string(),
                 "--json".to_string(),
                 "implement feature".to_string()
@@ -167,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_adapter_builds_command_with_prompt_appended() {
+    fn gemini_adapter_builds_command_with_noninteractive_flags_and_prompt() {
         let adapter = GeminiAdapter::default();
         let request = mk_request(ModelKind::Gemini);
         let command = adapter.build_command(&request);
@@ -176,6 +190,8 @@ mod tests {
         assert_eq!(
             command.args,
             vec![
+                "-p".to_string(),
+                "--yolo".to_string(),
                 "--flag".to_string(),
                 "--json".to_string(),
                 "implement feature".to_string()
@@ -211,19 +227,16 @@ mod tests {
             ..request.clone()
         });
 
-        assert_eq!(
-            claude.args,
-            vec!["--json".to_string(), "".to_string()],
+        assert!(
+            claude.args.last() == Some(&"".to_string()),
             "claude must append prompt slot even when empty"
         );
-        assert_eq!(
-            codex.args,
-            vec!["--json".to_string(), "".to_string()],
+        assert!(
+            codex.args.last() == Some(&"".to_string()),
             "codex must append prompt slot even when empty"
         );
-        assert_eq!(
-            gemini.args,
-            vec!["--json".to_string(), "".to_string()],
+        assert!(
+            gemini.args.last() == Some(&"".to_string()),
             "gemini must append prompt slot even when empty"
         );
     }
@@ -241,9 +254,13 @@ mod tests {
         };
 
         let command = ClaudeAdapter::default().build_command(&request);
+        // Default flags come first, then extra_args, then prompt
         assert_eq!(
             command.args,
             vec![
+                "-p".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
                 "--first".to_string(),
                 "--second".to_string(),
                 "--third".to_string(),

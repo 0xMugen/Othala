@@ -323,8 +323,8 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .collect()
     };
 
-    let title = format!("Task Detail ({selected_task})");
-    let widget = Paragraph::new(lines)
+    let title = format!("Task Detail ({task_id_str})");
+    let activity_widget = Paragraph::new(activity_lines)
         .block(focused_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(activity_widget, cols[1]);
