@@ -57,7 +57,7 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (Reviewing, Ready | Running | VerifyingFull | NeedsHuman | Failed | Paused) => true,
         (Ready, VerifyingFull | Submitting | AwaitingMerge | Failed | Paused) => true,
         (Submitting, AwaitingMerge | Failed | Paused) => true,
-        (AwaitingMerge, VerifyingFull | Merged | Running | Failed | Paused) => true,
+        (AwaitingMerge, VerifyingFull | Submitting | Merged | Running | Failed | Paused) => true,
         (NeedsHuman, Running | Paused | Failed) => true,
         (Paused, Running | Failed) => true,
         (Failed, Running | Submitting | Paused) => true,

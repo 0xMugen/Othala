@@ -15,6 +15,8 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         || lower.contains("ready for review")
     {
         Some(AgentSignalKind::PatchReady)
+    } else if lower.contains("[conflict_resolved]") || lower.contains("conflict_resolved") {
+        Some(AgentSignalKind::ConflictResolved)
     } else if lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("too many requests")
@@ -56,6 +58,14 @@ mod tests {
         let signal =
             detect_common_signal("all done, ready for review").expect("patch ready signal");
         assert_eq!(signal.kind, AgentSignalKind::PatchReady);
+    }
+
+    #[test]
+    fn detects_conflict_resolved_variants() {
+        let signal =
+            detect_common_signal("done: [conflict_resolved] all conflicts fixed")
+                .expect("conflict resolved signal");
+        assert_eq!(signal.kind, AgentSignalKind::ConflictResolved);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::error::GraphiteError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AllowedAutoCommand {
     Create,
+    Modify,
     Restack,
     Sync,
     AddAllForConflict,
@@ -114,6 +115,18 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
                     !branch.trim().is_empty() && !branch.starts_with('-')
                 }
         }
+        AllowedAutoCommand::Modify => {
+            args.len() == 6
+                && arg_eq(args, 0, "modify")
+                && arg_eq(args, 1, "--all")
+                && arg_eq(args, 2, "--commit")
+                && arg_eq(args, 3, "-m")
+                && {
+                    let msg = arg_at(args, 4);
+                    !msg.trim().is_empty()
+                }
+                && arg_eq(args, 5, "--no-interactive")
+        }
         AllowedAutoCommand::Restack => {
             args.len() == 2 && arg_eq(args, 0, "restack") && arg_eq(args, 1, "--no-interactive")
         }
@@ -202,6 +215,11 @@ mod tests {
         assert!(validate_contract(
             AllowedAutoCommand::Create,
             &os(&["create", "-m", "my message", "--no-interactive", "task/T1"])
+        )
+        .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Modify,
+            &os(&["modify", "--all", "--commit", "-m", "agent changes", "--no-interactive"])
         )
         .is_ok());
         assert!(validate_contract(

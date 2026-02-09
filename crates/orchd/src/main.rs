@@ -27,7 +27,7 @@ use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
     ServiceError,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
@@ -450,13 +450,31 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             let at = Utc::now();
             match service.task(&task_id) {
                 Ok(Some(task)) => {
+                    // If we can't go directly to Submitting, try routing through Running first.
                     if !orchd::is_transition_allowed(task.state, TaskState::Submitting) {
-                        app.state.status_line = format!(
-                            "patch-ready signal ignored for {} from state {}",
-                            task_id.0,
-                            orchd::task_state_tag(task.state)
-                        );
-                        continue;
+                        if orchd::is_transition_allowed(task.state, TaskState::Running)
+                            && orchd::is_transition_allowed(TaskState::Running, TaskState::Submitting)
+                        {
+                            if let Err(err) = service.transition_task_state(
+                                &task_id,
+                                TaskState::Running,
+                                tui_event_id(&task_id, "SIG-PR-RUNNING", at),
+                                at,
+                            ) {
+                                app.state.status_line = format!(
+                                    "patch-ready: failed to transition {} to running: {err}",
+                                    task_id.0,
+                                );
+                                continue;
+                            }
+                        } else {
+                            app.state.status_line = format!(
+                                "patch-ready signal ignored for {} from state {}",
+                                task_id.0,
+                                orchd::task_state_tag(task.state)
+                            );
+                            continue;
+                        }
                     }
                     let mode = resolve_submit_mode_for_task(&task, &repo_config_by_id);
                     match service.start_submit(
@@ -485,6 +503,116 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 Err(err) => {
                     app.state.status_line =
                         format!("failed to load task {} for submit signal: {err}", task_id.0);
+                }
+            }
+        }
+
+        // Bridge: conflict_resolved agent signal -> gt add -A + gt continue + resolve restack.
+        for task_id in agent_supervisor.drain_conflict_resolved_tasks() {
+            let at = Utc::now();
+            agent_supervisor.stop_task_session(&task_id);
+            match service.task(&task_id) {
+                Ok(Some(task)) => {
+                    let repo_config = repo_config_by_id.get(&task.repo_id.0);
+                    let resolve_ok = (|| -> Result<(), String> {
+                        let repo_cfg = repo_config.ok_or_else(|| {
+                            format!("missing repo config for repo_id={}", task.repo_id.0)
+                        })?;
+                        let runtime_path = resolve_task_runtime_path(&task, repo_cfg);
+                        let gt = GraphiteClient::new(runtime_path);
+                        gt.begin_conflict_resolution()
+                            .map_err(|e| format!("gt add -A failed: {e}"))?;
+                        gt.continue_conflict_resolution()
+                            .map_err(|e| format!("gt continue failed: {e}"))?;
+                        service
+                            .resolve_restack_conflict(
+                                &task_id,
+                                orchd::ResolveRestackConflictEventIds {
+                                    restack_state_changed: tui_event_id(
+                                        &task_id,
+                                        "CR-RESOLVE-S",
+                                        at,
+                                    ),
+                                    restack_resolved: tui_event_id(&task_id, "CR-RESOLVE-E", at),
+                                },
+                                at,
+                            )
+                            .map_err(|e| format!("resolve_restack_conflict failed: {e}"))?;
+                        Ok(())
+                    })();
+                    match resolve_ok {
+                        Ok(()) => {
+                            signal_tick_requested = true;
+                            app.state.status_line = format!(
+                                "conflict resolved for {}; restack continuing",
+                                task_id.0
+                            );
+                        }
+                        Err(reason) => {
+                            app.state.status_line = format!(
+                                "conflict resolution post-steps failed for {}: {reason}",
+                                task_id.0
+                            );
+                            let _ = service.mark_needs_human(
+                                &task_id,
+                                &format!("conflict resolution failed: {reason}"),
+                                orchd::MarkNeedsHumanEventIds {
+                                    needs_human_state_changed: tui_event_id(
+                                        &task_id,
+                                        "CR-NH-S",
+                                        at,
+                                    ),
+                                    needs_human_event: tui_event_id(&task_id, "CR-NH-E", at),
+                                },
+                                at,
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    app.state.status_line = format!(
+                        "failed to load task {} for conflict-resolved signal: {err}",
+                        task_id.0
+                    );
+                }
+            }
+        }
+
+        // Auto-trigger: spawn conflict resolution agents for RestackConflict tasks.
+        if let Ok(tasks) = service.list_tasks() {
+            for task in &tasks {
+                if task.state == TaskState::RestackConflict
+                    && !agent_supervisor.has_task_session(&task.id)
+                {
+                    if let Some(repo_config) = repo_config_by_id.get(&task.repo_id.0) {
+                        match agent_supervisor.start_conflict_resolution_session(
+                            task,
+                            repo_config,
+                            &enabled_models,
+                        ) {
+                            Ok(started) => {
+                                app.state.status_line = format!(
+                                    "auto-started conflict resolution for {}",
+                                    task.id.0
+                                );
+                                app.apply_event(TuiEvent::AgentPaneOutput {
+                                    instance_id: started.instance_id,
+                                    task_id: started.task_id,
+                                    model: started.model,
+                                    lines: vec![
+                                        "[conflict resolution agent started]".to_string(),
+                                    ],
+                                });
+                            }
+                            Err(err) => {
+                                app.state.status_line = format!(
+                                    "failed to auto-start conflict resolution for {}: {err}",
+                                    task.id.0
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -555,6 +683,8 @@ struct TuiAgentSupervisor {
     next_instance_nonce: u64,
     pending_patch_ready_tasks: Vec<TaskId>,
     pending_needs_human_tasks: Vec<TaskId>,
+    pending_conflict_resolved_tasks: Vec<TaskId>,
+    conflict_resolution_tasks: HashSet<String>,
 }
 
 impl TuiAgentSupervisor {
@@ -654,6 +784,7 @@ impl TuiAgentSupervisor {
         let _ = session.child.kill();
         let _ = session.child.wait();
         self.pending_start_by_task.remove(&task_id.0);
+        self.conflict_resolution_tasks.remove(&task_id.0);
         Some(TuiStartedAgentSession {
             instance_id: session.instance_id,
             task_id: session.task_id,
@@ -751,6 +882,9 @@ impl TuiAgentSupervisor {
                         AgentSignalKind::NeedHuman => {
                             push_unique_task_id(&mut self.pending_needs_human_tasks, &session.task_id)
                         }
+                        AgentSignalKind::ConflictResolved => {
+                            push_unique_task_id(&mut self.pending_conflict_resolved_tasks, &session.task_id)
+                        }
                         AgentSignalKind::RateLimited | AgentSignalKind::ErrorHint => {}
                     }
                 }
@@ -834,6 +968,13 @@ impl TuiAgentSupervisor {
 
         for task_key in finished_task_keys {
             self.sessions_by_task.remove(&task_key);
+            if self.conflict_resolution_tasks.remove(&task_key) {
+                let task_id = TaskId(task_key);
+                // If no conflict_resolved signal was pending, the agent couldn't resolve it.
+                if !self.pending_conflict_resolved_tasks.iter().any(|id| *id == task_id) {
+                    push_unique_task_id(&mut self.pending_needs_human_tasks, &task_id);
+                }
+            }
         }
 
         events
@@ -847,6 +988,93 @@ impl TuiAgentSupervisor {
         std::mem::take(&mut self.pending_needs_human_tasks)
     }
 
+    fn drain_conflict_resolved_tasks(&mut self) -> Vec<TaskId> {
+        std::mem::take(&mut self.pending_conflict_resolved_tasks)
+    }
+
+    fn start_conflict_resolution_session(
+        &mut self,
+        task: &Task,
+        repo_config: &RepoConfig,
+        enabled_models: &[ModelKind],
+    ) -> Result<TuiStartedAgentSession, MainError> {
+        if self.has_task_session(&task.id) {
+            return Err(MainError::InvalidConfig(format!(
+                "agent already running for task {}",
+                task.id.0
+            )));
+        }
+
+        let model = select_agent_model(task, enabled_models)?;
+        let adapter = default_adapter_for(model).map_err(|err| {
+            MainError::InvalidConfig(format!("failed to configure adapter: {err}"))
+        })?;
+        let repo_path = resolve_task_runtime_path(task, repo_config);
+        let request = EpochRequest {
+            task_id: task.id.clone(),
+            repo_id: task.repo_id.clone(),
+            model,
+            repo_path: repo_path.clone(),
+            prompt: conflict_resolution_prompt(task),
+            timeout_secs: TUI_AGENT_TIMEOUT_SECS,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+        };
+        let command_spec = adapter.build_command(&request);
+
+        let mut command = Command::new(&command_spec.executable);
+        command
+            .args(&command_spec.args)
+            .current_dir(&request.repo_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in &command_spec.env {
+            if key.trim().is_empty() {
+                continue;
+            }
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn().map_err(|source| {
+            MainError::InvalidConfig(format!(
+                "failed to spawn {} for conflict resolution on {} in {}: {source}",
+                model_kind_tag(&model),
+                task.id.0,
+                request.repo_path.display()
+            ))
+        })?;
+
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            spawn_pipe_reader(stdout, tx.clone(), false);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_pipe_reader(stderr, tx.clone(), true);
+        }
+        drop(tx);
+
+        let instance_id = format!("CR-{}-{}", task.id.0, self.next_instance_nonce);
+        self.next_instance_nonce = self.next_instance_nonce.saturating_add(1);
+        self.sessions_by_task.insert(
+            task.id.0.clone(),
+            TuiAgentSession {
+                instance_id: instance_id.clone(),
+                task_id: task.id.clone(),
+                model,
+                child,
+                output_rx: rx,
+            },
+        );
+        self.conflict_resolution_tasks.insert(task.id.0.clone());
+
+        Ok(TuiStartedAgentSession {
+            instance_id,
+            task_id: task.id.clone(),
+            model,
+        })
+    }
+
     fn stop_all(&mut self) {
         let keys = self
             .sessions_by_task
@@ -858,6 +1086,7 @@ impl TuiAgentSupervisor {
             let _ = self.stop_task_session(&task_id);
         }
         self.pending_start_by_task.clear();
+        self.conflict_resolution_tasks.clear();
     }
 }
 
@@ -985,6 +1214,23 @@ Role: {role:?}\n\
         role = task.role,
         task_type = task.task_type,
         requested_work = requested_work
+    )
+}
+
+fn conflict_resolution_prompt(task: &Task) -> String {
+    format!(
+        "You are resolving git merge/rebase conflicts in a worktree for task {id}: {title}\n\
+        The current branch has rebase conflicts that need resolution.\n\
+        \n\
+        Steps:\n\
+        1. Run `git status` to identify files with conflicts\n\
+        2. Open each conflicted file and resolve the conflict markers (<<<<<<< / ======= / >>>>>>>)\n\
+        3. Choose the correct resolution by understanding the intent of both sides\n\
+        4. After resolving all conflicts, print exactly [conflict_resolved]\n\
+        \n\
+        If you cannot resolve the conflicts because you need human guidance, print exactly [needs_human] with a short reason.",
+        id = task.id.0,
+        title = task.title,
     )
 }
 
@@ -1330,20 +1576,39 @@ fn execute_tui_action(
             }
         }
         UiAction::SubmitTask => {
-            let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
-            let _ = service.start_submit(
-                &selected_task_id,
-                mode,
-                orchd::StartSubmitEventIds {
-                    submit_state_changed: tui_event_id(&selected_task_id, "SUBMIT-S", at),
-                    submit_started: tui_event_id(&selected_task_id, "SUBMIT-E", at),
-                },
-                at,
-            )?;
-            TuiActionOutcome {
-                message: format!("started graphite submit for {} ({mode:?})", selected_task_id.0),
-                force_tick: true,
-                events: Vec::new(),
+            if task.state == TaskState::Merged {
+                TuiActionOutcome {
+                    message: format!("task {} already merged; nothing to do", selected_task_id.0),
+                    force_tick: false,
+                    events: Vec::new(),
+                }
+            } else {
+                // Route through Running if direct transition to Submitting isn't allowed.
+                if !orchd::is_transition_allowed(task.state, TaskState::Submitting)
+                    && orchd::is_transition_allowed(task.state, TaskState::Running)
+                {
+                    service.transition_task_state(
+                        &selected_task_id,
+                        TaskState::Running,
+                        tui_event_id(&selected_task_id, "SUBMIT-VIA-RUNNING", at),
+                        at,
+                    )?;
+                }
+                let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                let _ = service.start_submit(
+                    &selected_task_id,
+                    mode,
+                    orchd::StartSubmitEventIds {
+                        submit_state_changed: tui_event_id(&selected_task_id, "SUBMIT-S", at),
+                        submit_started: tui_event_id(&selected_task_id, "SUBMIT-E", at),
+                    },
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("started graphite submit for {} ({mode:?})", selected_task_id.0),
+                    force_tick: true,
+                    events: Vec::new(),
+                }
             }
         }
         UiAction::RunVerifyFull => {
@@ -1363,7 +1628,19 @@ fn execute_tui_action(
             }
         }
         UiAction::TriggerRestack => {
-            if task.state == TaskState::RestackConflict || task.state == TaskState::Failed {
+            if task.state == TaskState::Merged {
+                TuiActionOutcome {
+                    message: format!(
+                        "task {} already merged; nothing to do",
+                        selected_task_id.0
+                    ),
+                    force_tick: false,
+                    events: Vec::new(),
+                }
+            } else if task.state == TaskState::RestackConflict
+                || task.state == TaskState::Failed
+                || task.state == TaskState::AwaitingMerge
+            {
                 let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
                 let _ = service.start_submit(
                     &selected_task_id,
@@ -1377,8 +1654,7 @@ fn execute_tui_action(
                 TuiActionOutcome {
                     message: format!(
                         "task {} in {}; started graphite submit ({mode:?})",
-                        selected_task_id.0
-                        ,
+                        selected_task_id.0,
                         orchd::task_state_tag(task.state)
                     ),
                     force_tick: true,
@@ -1429,17 +1705,185 @@ fn execute_tui_action(
             }
         }
         UiAction::ResumeTask => {
-            let _ = service.resume_task(
-                &selected_task_id,
-                orchd::ResumeTaskEventIds {
-                    resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
-                },
-                at,
-            )?;
-            TuiActionOutcome {
-                message: format!("resumed task {}", selected_task_id.0),
-                force_tick: true,
-                events: Vec::new(),
+            match task.state {
+                TaskState::Merged => {
+                    TuiActionOutcome {
+                        message: format!("task {} already merged; nothing to do", selected_task_id.0),
+                        force_tick: false,
+                        events: Vec::new(),
+                    }
+                }
+                TaskState::Running if agent_supervisor.has_task_session(&selected_task_id) => {
+                    TuiActionOutcome {
+                        message: format!("agent already running for {}", selected_task_id.0),
+                        force_tick: false,
+                        events: Vec::new(),
+                    }
+                }
+                TaskState::Paused | TaskState::Failed | TaskState::NeedsHuman => {
+                    // Transition to Running and restart the agent.
+                    if task.state == TaskState::Paused {
+                        task = service.resume_task(
+                            &selected_task_id,
+                            orchd::ResumeTaskEventIds {
+                                resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                            },
+                            at,
+                        )?;
+                    } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                        task = service.transition_task_state(
+                            &selected_task_id,
+                            TaskState::Running,
+                            tui_event_id(&selected_task_id, "RESUME-RUNNING", at),
+                            at,
+                        )?;
+                    }
+                    let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                        MainError::InvalidConfig(format!(
+                            "missing repo config for repo_id={}",
+                            task.repo_id.0
+                        ))
+                    })?;
+                    let started = agent_supervisor.start_task_session(
+                        &task,
+                        repo_config,
+                        enabled_models,
+                        prompt,
+                    )?;
+                    TuiActionOutcome {
+                        message: format!(
+                            "resumed {} with {} agent",
+                            selected_task_id.0,
+                            model_kind_tag(&started.model),
+                        ),
+                        force_tick: true,
+                        events: vec![TuiEvent::AgentPaneOutput {
+                            instance_id: started.instance_id,
+                            task_id: started.task_id,
+                            model: started.model,
+                            lines: vec!["[agent session started]".to_string()],
+                        }],
+                    }
+                }
+                TaskState::Running => {
+                    // Running but no agent — work is done, commit + submit.
+                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                    let _ = service.start_submit(
+                        &selected_task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&selected_task_id, "RESUME-SUBMIT-S", at),
+                            submit_started: tui_event_id(&selected_task_id, "RESUME-SUBMIT-E", at),
+                        },
+                        at,
+                    )?;
+                    TuiActionOutcome {
+                        message: format!(
+                            "resumed {} with commit+submit ({mode:?})",
+                            selected_task_id.0,
+                        ),
+                        force_tick: true,
+                        events: Vec::new(),
+                    }
+                }
+                TaskState::AwaitingMerge => {
+                    // Re-submit.
+                    let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
+                    let _ = service.start_submit(
+                        &selected_task_id,
+                        mode,
+                        orchd::StartSubmitEventIds {
+                            submit_state_changed: tui_event_id(&selected_task_id, "RESUME-RESUBMIT-S", at),
+                            submit_started: tui_event_id(&selected_task_id, "RESUME-RESUBMIT-E", at),
+                        },
+                        at,
+                    )?;
+                    TuiActionOutcome {
+                        message: format!(
+                            "re-submitted {} ({mode:?})",
+                            selected_task_id.0,
+                        ),
+                        force_tick: true,
+                        events: Vec::new(),
+                    }
+                }
+                TaskState::RestackConflict => {
+                    // Start conflict resolution agent.
+                    let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                        MainError::InvalidConfig(format!(
+                            "missing repo config for repo_id={}",
+                            task.repo_id.0
+                        ))
+                    })?;
+                    let started = agent_supervisor.start_conflict_resolution_session(
+                        &task,
+                        repo_config,
+                        enabled_models,
+                    )?;
+                    TuiActionOutcome {
+                        message: format!(
+                            "started conflict resolution for {}",
+                            selected_task_id.0,
+                        ),
+                        force_tick: true,
+                        events: vec![TuiEvent::AgentPaneOutput {
+                            instance_id: started.instance_id,
+                            task_id: started.task_id,
+                            model: started.model,
+                            lines: vec!["[conflict resolution agent started]".to_string()],
+                        }],
+                    }
+                }
+                _ => {
+                    // Fallback: resume + start agent.
+                    if task.state == TaskState::Paused {
+                        task = service.resume_task(
+                            &selected_task_id,
+                            orchd::ResumeTaskEventIds {
+                                resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                            },
+                            at,
+                        )?;
+                    } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                        task = service.transition_task_state(
+                            &selected_task_id,
+                            TaskState::Running,
+                            tui_event_id(&selected_task_id, "RESUME-RUNNING", at),
+                            at,
+                        )?;
+                    }
+                    let repo_config = repo_config_by_id.get(&task.repo_id.0).ok_or_else(|| {
+                        MainError::InvalidConfig(format!(
+                            "missing repo config for repo_id={}",
+                            task.repo_id.0
+                        ))
+                    })?;
+                    match agent_supervisor.start_task_session(
+                        &task,
+                        repo_config,
+                        enabled_models,
+                        prompt,
+                    ) {
+                        Ok(started) => TuiActionOutcome {
+                            message: format!("resumed task {}", selected_task_id.0),
+                            force_tick: true,
+                            events: vec![TuiEvent::AgentPaneOutput {
+                                instance_id: started.instance_id,
+                                task_id: started.task_id,
+                                model: started.model,
+                                lines: vec!["[agent session started]".to_string()],
+                            }],
+                        },
+                        Err(err) => TuiActionOutcome {
+                            message: format!(
+                                "resumed task {} (agent start failed: {err})",
+                                selected_task_id.0,
+                            ),
+                            force_tick: true,
+                            events: Vec::new(),
+                        },
+                    }
+                }
             }
         }
     };

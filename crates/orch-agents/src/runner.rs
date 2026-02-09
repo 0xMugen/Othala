@@ -205,6 +205,7 @@ fn signal_to_stop_reason(kind: AgentSignalKind) -> Option<EpochStopReason> {
     match kind {
         AgentSignalKind::NeedHuman => Some(EpochStopReason::NeedHuman),
         AgentSignalKind::PatchReady => Some(EpochStopReason::PatchReady),
+        AgentSignalKind::ConflictResolved => None,
         AgentSignalKind::RateLimited => Some(EpochStopReason::RateLimited),
         AgentSignalKind::ErrorHint => None,
     }

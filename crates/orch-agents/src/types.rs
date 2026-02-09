@@ -27,6 +27,7 @@ pub struct EpochRequest {
 pub enum AgentSignalKind {
     NeedHuman,
     PatchReady,
+    ConflictResolved,
     RateLimited,
     ErrorHint,
 }
@@ -85,6 +86,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentSignalKind::PatchReady).expect("serialize"),
             "\"patch_ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentSignalKind::ConflictResolved).expect("serialize"),
+            "\"conflict_resolved\""
         );
         assert_eq!(
             serde_json::to_string(&AgentSignalKind::RateLimited).expect("serialize"),

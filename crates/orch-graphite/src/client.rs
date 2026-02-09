@@ -56,6 +56,20 @@ impl GraphiteClient {
         Ok(())
     }
 
+    pub fn commit_pending(&self, message: &str) -> Result<(), GraphiteError> {
+        if message.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "commit message for gt modify must not be empty".to_string(),
+            });
+        }
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::Modify,
+            ["modify", "--all", "--commit", "-m", message, "--no-interactive"],
+        )?;
+        Ok(())
+    }
+
     pub fn sync_trunk(&self) -> Result<(), GraphiteError> {
         self.cli.run_allowed(
             self.repo_root.as_path(),
