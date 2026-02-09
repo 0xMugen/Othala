@@ -350,6 +350,9 @@ impl RuntimeEngine {
         let runtime_path = task_runtime_path(task, repo_config);
         let client = GraphiteClient::new(runtime_path);
 
+        // Abort any stuck rebase so move/restack can proceed.
+        let _ = client.abort_rebase();
+
         // Move onto the stack anchor before restacking so the branch is properly stacked.
         if let Some(anchor_branch) =
             select_stack_anchor_branch(&service.list_tasks()?, task)
@@ -533,6 +536,9 @@ impl RuntimeEngine {
         let client = GraphiteClient::new(runtime_path);
         let graphite_title = normalize_task_title(&task.title);
 
+        // Abort any stuck rebase so commit and submit can proceed.
+        let _ = client.abort_rebase();
+
         // Commit any uncommitted changes in the worktree before submitting.
         if let Err(err) = client.commit_pending(&graphite_title) {
             service.record_event(&Event {
@@ -548,43 +554,6 @@ impl RuntimeEngine {
                     ),
                 },
             })?;
-        }
-
-        // Sync trunk from remote before submitting so gt submit sees an up-to-date trunk.
-        let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
-        if let Err(err) = repo_client.sync_trunk() {
-            service.record_event(&Event {
-                id: event_id(&task.id, "SUBMIT-SYNC-WARN", at),
-                task_id: Some(task.id.clone()),
-                repo_id: Some(task.repo_id.clone()),
-                at,
-                kind: EventKind::Error {
-                    code: "submit_sync_trunk_failed".to_string(),
-                    message: format!(
-                        "failed to sync trunk before submit for {}: {err}",
-                        task.id.0
-                    ),
-                },
-            })?;
-        }
-
-        // Move onto the stack anchor BEFORE submitting so the PR is created as stacked.
-        if let Some(anchor_branch) =
-            select_stack_anchor_branch(&service.list_tasks()?, task)
-        {
-            if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
-                self.mark_task_failed(
-                    service,
-                    task,
-                    "submit_move_onto_failed",
-                    format!(
-                        "failed to stack {} onto {}: {err}",
-                        task.id.0, anchor_branch
-                    ),
-                    at,
-                )?;
-                return Ok(false);
-            }
         }
 
         let mode = repo_config.graphite.submit_mode.unwrap_or(task.submit_mode);

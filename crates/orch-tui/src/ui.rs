@@ -542,7 +542,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Left: task status checklist
     let status_title = format!("Status ({task_id_str})");
-    let status_widget = Paragraph::new(status_sidebar_lines(selected_task))
+    let status_widget = Paragraph::new(status_sidebar_lines(selected_task, &app.state.selected_task_activity))
         .block(focused_block(&status_title))
         .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
@@ -1050,7 +1050,7 @@ fn checklist_line(label: &str, state: ChecklistState) -> Line<'static> {
     ])
 }
 
-fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
+fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> Vec<Line<'static>> {
     let Some(task) = task else {
         return vec![Line::from(Span::styled(
             "no task selected",
@@ -1228,6 +1228,36 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             Span::styled("push: ", Style::default().fg(DIM)),
             Span::styled(detail.to_string(), Style::default().fg(Color::White)),
         ]));
+    }
+
+    // -- activity log --
+    if !activity.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "activity",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        let tail = if activity.len() > 10 {
+            &activity[activity.len() - 10..]
+        } else {
+            activity
+        };
+        for entry in tail {
+            let lower = entry.to_lowercase();
+            let color = if lower.contains("error") {
+                Color::Red
+            } else if lower.contains("submit") {
+                Color::Yellow
+            } else if lower.contains("restack") {
+                Color::Cyan
+            } else {
+                DIM
+            };
+            lines.push(Line::from(Span::styled(
+                entry.clone(),
+                Style::default().fg(color),
+            )));
+        }
     }
 
     lines
@@ -1464,7 +1494,7 @@ mod tests {
         row.state = TaskState::Running;
         row.display_state = "Running".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row));
+        let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1488,7 +1518,7 @@ mod tests {
         row.state = TaskState::Merged;
         row.display_state = "Merged".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row));
+        let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1505,7 +1535,7 @@ mod tests {
         row.state = TaskState::Submitting;
         row.display_state = "Submitting".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row));
+        let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1577,7 +1607,7 @@ mod tests {
         row.state = TaskState::Failed;
         row.display_state = "SubmitFail".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row));
+        let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1595,7 +1625,7 @@ mod tests {
         row.state = TaskState::Failed;
         row.display_state = "VerifyFail".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row));
+        let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1606,6 +1636,68 @@ mod tests {
         assert!(text
             .iter()
             .any(|line| line.contains("phase: verify failed")));
+    }
+
+    #[test]
+    fn status_sidebar_shows_activity_lines_with_styling() {
+        let row = mk_row("T1");
+        let activity = vec![
+            "gt submit --publish".to_string(),
+            "error: push rejected".to_string(),
+            "restack onto task/T0".to_string(),
+            "some other log line".to_string(),
+        ];
+
+        let rendered = status_sidebar_lines(Some(&row), &activity);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        // Activity header present
+        assert!(text.iter().any(|line| line == "activity"));
+        // All activity entries present
+        assert!(text.iter().any(|line| line.contains("gt submit --publish")));
+        assert!(text.iter().any(|line| line.contains("error: push rejected")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("restack onto task/T0")));
+        assert!(text.iter().any(|line| line.contains("some other log line")));
+
+        // Verify color styling on activity lines
+        for line in &rendered {
+            for span in &line.spans {
+                let content = span.content.as_ref();
+                if content.contains("error") && content.contains("push rejected") {
+                    assert_eq!(span.style.fg, Some(Color::Red));
+                } else if content.contains("gt submit") {
+                    assert_eq!(span.style.fg, Some(Color::Yellow));
+                } else if content.contains("restack onto") {
+                    assert_eq!(span.style.fg, Some(Color::Cyan));
+                } else if content == "some other log line" {
+                    assert_eq!(span.style.fg, Some(Color::DarkGray));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_sidebar_limits_activity_to_last_10() {
+        let row = mk_row("T1");
+        let activity: Vec<String> = (0..15).map(|i| format!("log line {i}")).collect();
+
+        let rendered = status_sidebar_lines(Some(&row), &activity);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        // Should NOT contain the first 5 entries
+        assert!(!text.iter().any(|line| line.contains("log line 0")));
+        assert!(!text.iter().any(|line| line.contains("log line 4")));
+        // Should contain the last 10 entries
+        assert!(text.iter().any(|line| line.contains("log line 5")));
+        assert!(text.iter().any(|line| line.contains("log line 14")));
     }
 
     #[test]

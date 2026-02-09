@@ -13,6 +13,7 @@ pub enum AllowedAutoCommand {
     Sync,
     AddAllForConflict,
     ContinueConflict,
+    Abort,
     LogShort,
     Status,
     Submit,
@@ -152,6 +153,7 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
             args.len() == 2 && arg_eq(args, 0, "add") && arg_eq(args, 1, "-A")
         }
         AllowedAutoCommand::ContinueConflict => args.len() == 1 && arg_eq(args, 0, "continue"),
+        AllowedAutoCommand::Abort => args.len() == 1 && arg_eq(args, 0, "abort"),
         AllowedAutoCommand::LogShort => {
             args.len() == 2 && arg_eq(args, 0, "log") && arg_eq(args, 1, "short")
         }
@@ -256,6 +258,7 @@ mod tests {
         assert!(
             validate_contract(AllowedAutoCommand::ContinueConflict, &os(&["continue"])).is_ok()
         );
+        assert!(validate_contract(AllowedAutoCommand::Abort, &os(&["abort"])).is_ok());
         assert!(validate_contract(AllowedAutoCommand::LogShort, &os(&["log", "short"])).is_ok());
         assert!(validate_contract(AllowedAutoCommand::Status, &os(&["status"])).is_ok());
         assert!(validate_contract(

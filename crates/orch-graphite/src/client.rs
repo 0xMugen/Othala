@@ -118,6 +118,15 @@ impl GraphiteClient {
         Ok(())
     }
 
+    pub fn abort_rebase(&self) -> Result<(), GraphiteError> {
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::Abort,
+            ["abort"],
+        )?;
+        Ok(())
+    }
+
     pub fn begin_conflict_resolution(&self) -> Result<(), GraphiteError> {
         self.cli.run_allowed(
             self.repo_root.as_path(),
