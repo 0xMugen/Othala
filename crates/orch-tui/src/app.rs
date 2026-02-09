@@ -372,7 +372,6 @@ impl TuiApp {
                 for line in lines {
                     pane.append_line(line);
                 }
-                self.state.status_line = format!("pane updated: {instance_id}");
             }
             TuiEvent::AgentPaneStatusChanged {
                 instance_id,
@@ -382,7 +381,17 @@ impl TuiApp {
                     let pane = &mut self.state.panes[idx];
                     pane.status = status;
                     pane.updated_at = Utc::now();
-                    self.state.status_line = format!("pane status updated: {instance_id}");
+                    match status {
+                        AgentPaneStatus::Failed => {
+                            self.state.status_line = format!("pane failed: {instance_id}");
+                        }
+                        AgentPaneStatus::Exited => {
+                            self.state.status_line = format!("pane exited: {instance_id}");
+                        }
+                        AgentPaneStatus::Starting
+                        | AgentPaneStatus::Running
+                        | AgentPaneStatus::Waiting => {}
+                    }
                 } else {
                     self.state.status_line = format!("pane not found: {instance_id}");
                 }
@@ -479,7 +488,29 @@ mod tests {
         });
 
         assert_eq!(app.state.panes[0].status, AgentPaneStatus::Waiting);
-        assert_eq!(app.state.status_line, "pane status updated: A1");
+        assert_eq!(app.state.status_line, "ready");
+    }
+
+    #[test]
+    fn apply_event_terminal_status_updates_status_line() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["boot".to_string()],
+        });
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "A1".to_string(),
+            status: AgentPaneStatus::Exited,
+        });
+        assert_eq!(app.state.status_line, "pane exited: A1");
+
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "A1".to_string(),
+            status: AgentPaneStatus::Failed,
+        });
+        assert_eq!(app.state.status_line, "pane failed: A1");
     }
 
     #[test]

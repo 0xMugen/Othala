@@ -24,6 +24,7 @@ const OUTPUT_FG: Color = Color::White;
 const FOOTER_DEFAULT_HEIGHT: u16 = 3;
 const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
 const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
+const THINKING_FRAMES: [&str; 4] = ["o..", ".o.", "..o", ".o."];
 
 fn state_color(state: TaskState) -> Color {
     match state {
@@ -74,9 +75,11 @@ fn status_line_color(message: &str) -> Color {
     }
 }
 
-fn output_line_style(line: &str) -> Style {
+fn output_line_style(line: &str, in_patch_block: bool) -> Style {
     let lower = line.to_ascii_lowercase();
-    if line.trim().is_empty() {
+    if let Some(style) = patch_line_style(line, in_patch_block) {
+        style
+    } else if line.trim().is_empty() {
         Style::default().fg(DIM)
     } else if lower.contains("[needs_human]") || lower.contains("needs_human") {
         Style::default()
@@ -95,9 +98,57 @@ fn output_line_style(line: &str) -> Style {
     }
 }
 
-fn stylize_output_line(line: String) -> Line<'static> {
-    let style = output_line_style(&line);
-    Line::from(Span::styled(line, style))
+fn patch_line_style(line: &str, in_patch_block: bool) -> Option<Style> {
+    if is_patch_marker(line) {
+        return Some(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    }
+
+    if !in_patch_block {
+        return None;
+    }
+
+    if line.starts_with("@@") {
+        Some(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if line.starts_with('+') {
+        Some(Style::default().fg(Color::Green))
+    } else if line.starts_with('-') {
+        Some(Style::default().fg(Color::Red))
+    } else {
+        None
+    }
+}
+
+fn is_patch_marker(line: &str) -> bool {
+    line.starts_with("*** Begin Patch")
+        || line.starts_with("*** End Patch")
+        || line.starts_with("*** Update File:")
+        || line.starts_with("*** Add File:")
+        || line.starts_with("*** Delete File:")
+        || line.starts_with("*** Move to:")
+}
+
+fn update_patch_block_state(line: &str, in_patch_block: &mut bool) {
+    if line.starts_with("*** Begin Patch") {
+        *in_patch_block = true;
+    } else if line.starts_with("*** End Patch") {
+        *in_patch_block = false;
+    }
+}
+
+fn stylize_output_lines(lines: impl IntoIterator<Item = String>) -> Vec<Line<'static>> {
+    let mut in_patch_block = false;
+    lines
+        .into_iter()
+        .map(|line| {
+            let style = output_line_style(&line, in_patch_block);
+            update_patch_block_state(&line, &mut in_patch_block);
+            Line::from(Span::styled(line, style))
+        })
+        .collect()
 }
 
 fn normal_block(title: &str) -> Block<'_> {
@@ -263,7 +314,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             )));
         } else {
-            lines.extend(tail.into_iter().map(stylize_output_line));
+            lines.extend(stylize_output_lines(tail));
         }
         (format!("Chat {}", pane.instance_id), lines)
     } else {
@@ -292,13 +343,9 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             )));
         } else {
-            lines.extend(
-                app.state
-                    .selected_task_activity
-                    .iter()
-                    .cloned()
-                    .map(stylize_output_line),
-            );
+            lines.extend(stylize_output_lines(
+                app.state.selected_task_activity.iter().cloned(),
+            ));
         }
         (format!("Task Activity ({selected_task})"), lines)
     };
@@ -331,7 +378,7 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             )));
         } else {
-            lines.extend(window.into_iter().map(stylize_output_line));
+            lines.extend(stylize_output_lines(window));
         }
         (format!("Focused Chat {}", pane.instance_id), lines)
     } else {
@@ -384,7 +431,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             )));
         } else {
-            lines.extend(window.into_iter().map(stylize_output_line));
+            lines.extend(stylize_output_lines(window));
         }
         (format!("Agent {}", pane.instance_id), lines)
     } else {
@@ -537,6 +584,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             ));
         }
+        if let Some((activity, color)) = footer_activity_indicator(app) {
+            spans.push(Span::styled(" | thinking: ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                activity,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
         if !app.state.status_line.is_empty() {
             spans.push(Span::styled(" | status: ", Style::default().fg(DIM)));
             spans.push(Span::styled(
@@ -563,6 +617,77 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .block(normal_block(title))
         .wrap(Wrap { trim: wrap_trim });
     frame.render_widget(widget, area);
+}
+
+fn pane_status_active(status: AgentPaneStatus) -> bool {
+    matches!(
+        status,
+        AgentPaneStatus::Starting | AgentPaneStatus::Running | AgentPaneStatus::Waiting
+    )
+}
+
+fn animation_frame_now() -> usize {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    (millis / 250) as usize
+}
+
+fn status_activity(status: AgentPaneStatus, frame: usize) -> Option<(String, Color)> {
+    let pulse = THINKING_FRAMES[frame % THINKING_FRAMES.len()];
+    match status {
+        AgentPaneStatus::Starting => Some((format!("starting {pulse}"), Color::Yellow)),
+        AgentPaneStatus::Running => Some((format!("thinking {pulse}"), Color::Cyan)),
+        AgentPaneStatus::Waiting => Some((format!("percolating {pulse}"), Color::Magenta)),
+        AgentPaneStatus::Exited | AgentPaneStatus::Failed => None,
+    }
+}
+
+fn active_activity_pane(app: &TuiApp) -> Option<&AgentPane> {
+    if app.state.focused_task {
+        if let Some(task) = app.state.selected_task() {
+            if let Some(pane) = app
+                .state
+                .panes
+                .iter()
+                .find(|pane| pane.task_id == task.task_id && pane_status_active(pane.status))
+            {
+                return Some(pane);
+            }
+        }
+    }
+
+    if let Some(idx) = app.state.focused_pane_idx {
+        if let Some(pane) = app
+            .state
+            .panes
+            .get(idx)
+            .filter(|pane| pane_status_active(pane.status))
+        {
+            return Some(pane);
+        }
+    }
+
+    if let Some(pane) = app
+        .state
+        .selected_pane()
+        .filter(|pane| pane_status_active(pane.status))
+    {
+        return Some(pane);
+    }
+
+    app.state
+        .panes
+        .iter()
+        .find(|pane| pane_status_active(pane.status))
+}
+
+fn footer_activity_indicator(app: &TuiApp) -> Option<(String, Color)> {
+    let pane = active_activity_pane(app)?;
+    let frame = animation_frame_now();
+    let (activity, color) = status_activity(pane.status, frame)?;
+    Some((format!("{} {activity}", pane.instance_id), color))
 }
 
 fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Option<&str>) {
@@ -991,7 +1116,8 @@ mod tests {
 
     use super::{
         footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
-        status_line_color, status_sidebar_lines, to_local_time, wrapped_visual_line_count,
+        status_activity, status_line_color, status_sidebar_lines, to_local_time,
+        wrapped_visual_line_count,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1142,14 +1268,46 @@ mod tests {
     #[test]
     fn output_line_style_marks_special_chat_signals() {
         assert_eq!(
-            output_line_style("[needs_human] unblock me").fg,
+            output_line_style("[needs_human] unblock me", false).fg,
             Some(Color::Yellow)
         );
         assert_eq!(
-            output_line_style("[patch_ready] complete").fg,
+            output_line_style("[patch_ready] complete", false).fg,
             Some(Color::Green)
         );
-        assert_eq!(output_line_style("fatal error").fg, Some(Color::Red));
+        assert_eq!(output_line_style("fatal error", false).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn output_line_style_marks_patch_edits_clearly() {
+        assert_eq!(
+            output_line_style("*** Begin Patch", false).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            output_line_style("@@ fn main @@ ", true).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            output_line_style("+let x = 1;", true).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(output_line_style("-let x = 0;", true).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn status_activity_only_animates_live_pane_statuses() {
+        let (running, running_color) =
+            status_activity(AgentPaneStatus::Running, 2).expect("running activity");
+        assert_eq!(running, "thinking ..o");
+        assert_eq!(running_color, Color::Cyan);
+
+        let (waiting, waiting_color) =
+            status_activity(AgentPaneStatus::Waiting, 1).expect("waiting activity");
+        assert_eq!(waiting, "percolating .o.");
+        assert_eq!(waiting_color, Color::Magenta);
+
+        assert!(status_activity(AgentPaneStatus::Exited, 0).is_none());
     }
 
     #[test]
