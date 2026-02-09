@@ -774,7 +774,7 @@ impl TuiAgentSupervisor {
             repo_id: task.repo_id.clone(),
             model,
             repo_path: repo_path.clone(),
-            prompt: task_agent_prompt(task, user_prompt),
+            prompt: task_agent_prompt(task, repo_config, user_prompt),
             timeout_secs: TUI_AGENT_TIMEOUT_SECS,
             extra_args,
             env: Vec::new(),
@@ -1280,17 +1280,35 @@ fn resolve_task_runtime_path(task: &Task, repo_config: &RepoConfig) -> PathBuf {
     repo_config.repo_path.clone()
 }
 
-fn task_agent_prompt(task: &Task, user_prompt: Option<&str>) -> String {
+fn task_agent_prompt(task: &Task, repo_config: &RepoConfig, user_prompt: Option<&str>) -> String {
     let requested_work = user_prompt
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .unwrap_or(task.title.as_str());
+    let context_refresh_line = match orchd::maybe_refresh_global_context(repo_config, Utc::now()) {
+        Ok(outcome) if outcome.refreshed => format!(
+            "Global context agent refreshed base-branch snapshot for {} (files changed: {}).",
+            repo_config.repo_id, outcome.changed_files
+        ),
+        Ok(_) => format!(
+            "Global context agent checked {} and found no new base-branch updates.",
+            repo_config.repo_id
+        ),
+        Err(err) => format!("Global context agent refresh failed: {err}"),
+    };
+    let context_section = match orchd::build_task_context_prompt(repo_config, task, requested_work)
+    {
+        Ok(section) => section,
+        Err(err) => format!("Global context unavailable for this run due to setup error: {err}"),
+    };
     format!(
         "You are working on task {id}: {title}\n\
 State: {state:?}\n\
 Role: {role:?}\n\
 	Type: {task_type:?}\n\
 	Requested work:\n{requested_work}\n\
+	{context_section}\n\
+	{context_refresh_line}\n\
 	Work in this task worktree, make focused changes, and report progress.\n\
 	When implementation is complete and ready to submit, print exactly [patch_ready].\n\
 	If blocked and human input is required, print exactly [needs_human] with a short reason.",
@@ -1299,7 +1317,9 @@ Role: {role:?}\n\
         state = task.state,
         role = task.role,
         task_type = task.task_type,
-        requested_work = requested_work
+        requested_work = requested_work,
+        context_section = context_section,
+        context_refresh_line = context_refresh_line,
     )
 }
 
@@ -2332,17 +2352,30 @@ fn run_single_orchestrator_tick(
     probe_config: &SetupProbeConfig,
     at: chrono::DateTime<Utc>,
 ) -> Result<Option<String>, MainError> {
+    let context_tick = refresh_global_contexts(repo_config_by_id, at);
     let (scheduler_availability, runtime_availability) =
         current_model_availability(enabled_models, probe_config);
     let scheduling = service.schedule_queued_tasks(enabled_models, &scheduler_availability, at)?;
     let runtime_tick = runtime.tick(service, org, repo_config_by_id, &runtime_availability, at)?;
 
-    if scheduling.scheduled.is_empty() && scheduling.blocked.is_empty() && !runtime_tick.touched() {
+    if scheduling.scheduled.is_empty()
+        && scheduling.blocked.is_empty()
+        && !runtime_tick.touched()
+        && context_tick.refreshed == 0
+        && context_tick.errors == 0
+    {
         return Ok(None);
     }
 
-    // Produce a cleaner message when a submit/push occurred.
-    let message = if runtime_tick.submitted > 0 {
+    let mut message = if scheduling.scheduled.is_empty()
+        && scheduling.blocked.is_empty()
+        && !runtime_tick.touched()
+    {
+        format!(
+            "global-context: refreshed={} errors={}",
+            context_tick.refreshed, context_tick.errors
+        )
+    } else if runtime_tick.submitted > 0 {
         format!("pushed {} task(s) to graphite", runtime_tick.submitted)
     } else if runtime_tick.submit_failed > 0 {
         format!("push failed for {} task(s)", runtime_tick.submit_failed)
@@ -2362,8 +2395,66 @@ fn run_single_orchestrator_tick(
             runtime_tick.errors
         )
     };
+    if context_tick.refreshed > 0 || context_tick.errors > 0 {
+        message.push_str(&format!(
+            "; global_context_refreshed={} global_context_errors={}",
+            context_tick.refreshed, context_tick.errors
+        ));
+        if !context_tick.details.is_empty() {
+            message.push_str(&format!(" [{}]", context_tick.details.join("; ")));
+        }
+    }
 
     Ok(Some(message))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct GlobalContextTickSummary {
+    refreshed: usize,
+    errors: usize,
+    details: Vec<String>,
+}
+
+fn refresh_global_contexts(
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+    at: chrono::DateTime<Utc>,
+) -> GlobalContextTickSummary {
+    let mut summary = GlobalContextTickSummary::default();
+    let mut repo_ids = repo_config_by_id.keys().cloned().collect::<Vec<_>>();
+    repo_ids.sort();
+
+    for repo_id in repo_ids {
+        let Some(repo_config) = repo_config_by_id.get(&repo_id) else {
+            continue;
+        };
+        match orchd::maybe_refresh_global_context(repo_config, at) {
+            Ok(outcome) if outcome.refreshed => {
+                summary.refreshed += 1;
+                summary.details.push(format!(
+                    "repo={} base={} files_changed={} head={}",
+                    repo_config.repo_id,
+                    repo_config.base_branch,
+                    outcome.changed_files,
+                    short_sha_for_log(&outcome.current_head),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                summary.errors += 1;
+                summary
+                    .details
+                    .push(format!("repo={} error={err}", repo_config.repo_id));
+            }
+        }
+    }
+
+    summary
+}
+
+fn short_sha_for_log(value: &str) -> &str {
+    let trimmed = value.trim();
+    let max = 12usize.min(trimmed.len());
+    &trimmed[..max]
 }
 
 fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
@@ -2632,6 +2723,16 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
             runtime_tick.errors
         );
     }
+    let context_tick = refresh_global_contexts(&repo_config_by_id, Utc::now());
+    if context_tick.refreshed > 0 || context_tick.errors > 0 {
+        println!(
+            "orchd global context tick refreshed={} errors={}",
+            context_tick.refreshed, context_tick.errors
+        );
+        for detail in context_tick.details {
+            println!("  {detail}");
+        }
+    }
 
     if args.once {
         println!("orchd exiting after bootstrap + single scheduler tick (--once)");
@@ -2673,6 +2774,16 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
                 runtime_tick.submit_failed,
                 runtime_tick.errors
             );
+        }
+        let context_tick = refresh_global_contexts(&repo_config_by_id, Utc::now());
+        if context_tick.refreshed > 0 || context_tick.errors > 0 {
+            println!(
+                "orchd global context tick refreshed={} errors={}",
+                context_tick.refreshed, context_tick.errors
+            );
+            for detail in context_tick.details {
+                println!("  {detail}");
+            }
         }
     }
 }
@@ -4815,6 +4926,32 @@ Fix flaky task scheduling by debouncing tick updates";
             title,
             "Fix Flaky Task Scheduling by Debouncing Tick Updates"
         );
+    }
+
+    #[test]
+    fn task_agent_prompt_includes_global_context_section() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-context-prompt-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        init_git_repo(&root);
+        run_git(&root, &["branch", "-M", "main"]);
+        let repo_config = mk_repo_config("example", &root);
+        let task = mk_reviewing_task("T-CONTEXT");
+
+        let prompt = super::task_agent_prompt(
+            &task,
+            &repo_config,
+            Some("check recent main diff and tighten verify behavior"),
+        );
+
+        assert!(prompt.contains("Global context (shared across all tasks in this repo):"));
+        assert!(prompt.contains(".orch/context/core.md"));
+        assert!(prompt.contains("Use compartment-based loading:"));
+        assert!(prompt.contains("main-diff-latest.md"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

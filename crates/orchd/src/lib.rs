@@ -1,5 +1,6 @@
 pub mod dependency_graph;
 pub mod event_log;
+pub mod global_context;
 pub mod lifecycle_gate;
 pub mod persistence;
 pub mod review_gate;
@@ -12,6 +13,7 @@ pub mod types;
 
 pub use dependency_graph::*;
 pub use event_log::*;
+pub use global_context::*;
 pub use lifecycle_gate::*;
 pub use persistence::*;
 pub use review_gate::*;
