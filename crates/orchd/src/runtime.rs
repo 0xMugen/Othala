@@ -575,6 +575,8 @@ impl RuntimeEngine {
         match client.restack_with_outcome() {
             Ok(RestackOutcome::Restacked) => {}
             Ok(RestackOutcome::Conflict { stderr, .. }) => {
+                // Abort the in-progress rebase so restack_task starts clean.
+                let _ = client.abort_rebase();
                 reattach_worktrees(&self.git, &detached);
                 service.record_event(&Event {
                     id: event_id(&task.id, "SUBMIT-RESTACK-CONFLICT", at),
@@ -598,6 +600,8 @@ impl RuntimeEngine {
                 return Ok(false);
             }
             Err(err) => {
+                // Abort any in-progress rebase so restack_task starts clean.
+                let _ = client.abort_rebase();
                 reattach_worktrees(&self.git, &detached);
                 service.record_event(&Event {
                     id: event_id(&task.id, "SUBMIT-RESTACK-FAIL", at),
