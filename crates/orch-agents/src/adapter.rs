@@ -65,7 +65,10 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = vec!["exec".to_string()];
+        let mut args = vec![
+            "exec".to_string(),
+            "--full-auto".to_string(),
+        ];
         args.extend(request.extra_args.iter().cloned());
         args.push(request.prompt.clone());
         AgentCommand {
@@ -172,6 +175,7 @@ mod tests {
             command.args,
             vec![
                 "exec".to_string(),
+                "--full-auto".to_string(),
                 "--flag".to_string(),
                 "--json".to_string(),
                 "implement feature".to_string()
