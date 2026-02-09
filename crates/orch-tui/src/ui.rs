@@ -3,7 +3,7 @@ use orch_core::state::TaskState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::TuiApp;
@@ -109,6 +109,10 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 
     render_footer(frame, root[2], app);
+
+    if let Some((task_id, branch)) = app.delete_confirm_display() {
+        render_delete_confirm_modal(frame, &task_id.0, branch);
+    }
 }
 
 // -- Header -----------------------------------------------------------------
@@ -289,12 +293,8 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .unwrap_or_else(|| "-".to_string());
 
     // Find the agent pane for this task
-    let task_pane = selected_task.and_then(|task| {
-        app.state
-            .panes
-            .iter()
-            .find(|p| p.task_id == task.task_id)
-    });
+    let task_pane =
+        selected_task.and_then(|task| app.state.panes.iter().find(|p| p.task_id == task.task_id));
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -360,7 +360,16 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Footer -----------------------------------------------------------------
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let line = if let Some((models, selected)) = app.model_select_display() {
+    let line = if let Some((task_id, branch)) = app.delete_confirm_display() {
+        let branch_label = branch.unwrap_or("-");
+        Line::from(vec![
+            Span::styled(" delete: ", Style::default().fg(DIM)),
+            Span::styled(task_id.0.clone(), Style::default().fg(HEADER_FG)),
+            Span::styled(" branch=", Style::default().fg(DIM)),
+            Span::styled(branch_label, Style::default().fg(HEADER_FG)),
+            Span::styled("  Enter=confirm Esc=cancel", Style::default().fg(DIM)),
+        ])
+    } else if let Some((models, selected)) = app.model_select_display() {
         let mut spans = vec![Span::styled(" model: ", Style::default().fg(DIM))];
         for (i, m) in models.iter().enumerate() {
             if i == selected {
@@ -386,10 +395,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled(" prompt: ", Style::default().fg(DIM)),
             Span::styled(prompt, Style::default().fg(HEADER_FG)),
             Span::styled("_", Style::default().fg(ACCENT)),
-            Span::styled(
-                "  Enter=submit Esc=cancel",
-                Style::default().fg(DIM),
-            ),
+            Span::styled("  Enter=submit Esc=cancel", Style::default().fg(DIM)),
         ])
     } else {
         let mut spans: Vec<Span<'_>> = Vec::new();
@@ -401,6 +407,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ("s", "start"),
             ("x", "stop"),
             ("r", "restart"),
+            ("d", "delete"),
             ("q", "quick"),
             ("f", "full"),
             ("t", "restack/submit"),
@@ -410,8 +417,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ("u", "resume"),
         ];
         for (key, label) in keys {
-            spans.push(Span::styled(*key, Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled(format!("={label} "), Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                *key,
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("={label} "),
+                Style::default().fg(MUTED),
+            ));
         }
         if app.state.focused_task || app.state.focused_pane_idx.is_some() {
             spans.push(Span::styled(
@@ -433,7 +446,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Line::from(spans)
     };
 
-    let title = if app.model_select_display().is_some() {
+    let title = if app.delete_confirm_display().is_some() {
+        "Confirm Delete"
+    } else if app.model_select_display().is_some() {
         "Select Model"
     } else if app.input_prompt().is_some() {
         "New Chat"
@@ -445,6 +460,56 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .block(normal_block(title))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
+}
+
+fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Option<&str>) {
+    let area = centered_rect(64, 36, frame.area());
+    let branch_line = match branch {
+        Some(value) => format!("Branch to delete: {value}"),
+        None => "Branch to delete: (none)".to_string(),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Delete task {task_id}?"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("This permanently removes task state from local storage."),
+        Line::from(branch_line),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter/Y = delete now    Esc = cancel",
+            Style::default().fg(DIM),
+        )),
+    ];
+
+    let widget = Paragraph::new(lines)
+        .block(focused_block("Are You Sure?"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 // -- Formatting helpers -----------------------------------------------------
@@ -462,14 +527,38 @@ fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a>
     let prefix = if is_selected { "\u{25B6} " } else { "  " };
 
     Line::from(vec![
-        Span::styled(prefix, if is_selected { Style::default().fg(ACCENT) } else { Style::default().fg(DIM) }),
+        Span::styled(
+            prefix,
+            if is_selected {
+                Style::default().fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            },
+        ),
         Span::styled(&task.repo_id.0, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(&task.task_id.0, if is_selected { Style::default().fg(Color::White).add_modifier(Modifier::BOLD).bg(SELECTED_BG) } else { Style::default().fg(Color::White) }),
+        Span::styled(
+            &task.task_id.0,
+            if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(SELECTED_BG)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.branch, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
+<<<<<<< HEAD
         Span::styled(task.display_state.as_str(), Style::default().fg(sc).add_modifier(Modifier::BOLD)),
+=======
+        Span::styled(
+            state_label,
+            Style::default().fg(sc).add_modifier(Modifier::BOLD),
+        ),
+>>>>>>> 1e93cbb (add the delete feature for tasks this should also delete the branch. But there should be an a...)
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
@@ -505,10 +594,7 @@ fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
         } else {
             spans.push(Span::styled(label, Style::default().fg(MUTED)));
         }
-        spans.push(Span::styled(
-            format!(":{tag}"),
-            Style::default().fg(sc),
-        ));
+        spans.push(Span::styled(format!(":{tag}"), Style::default().fg(sc)));
     }
     Line::from(spans)
 }

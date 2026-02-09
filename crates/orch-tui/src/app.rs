@@ -18,11 +18,17 @@ pub struct QueuedAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
-    NewChatPrompt { buffer: String },
+    NewChatPrompt {
+        buffer: String,
+    },
     ModelSelect {
         prompt: String,
         models: Vec<ModelKind>,
         selected: usize,
+    },
+    DeleteTaskConfirm {
+        task_id: TaskId,
+        branch: Option<String>,
     },
 }
 
@@ -156,6 +162,7 @@ impl TuiApp {
 
         match command {
             UiCommand::Dispatch(UiAction::CreateTask) => self.begin_new_chat_prompt(),
+            UiCommand::Dispatch(UiAction::DeleteTask) => self.begin_delete_task_confirmation(),
             UiCommand::Dispatch(action) => self.push_action(action),
             UiCommand::SelectNextTask => self.state.move_task_selection_next(),
             UiCommand::SelectPreviousTask => self.state.move_task_selection_previous(),
@@ -205,11 +212,32 @@ impl TuiApp {
             "new chat prompt: type feature request, Enter=submit Esc=cancel".to_string();
     }
 
+    fn begin_delete_task_confirmation(&mut self) {
+        let Some(task) = self.state.selected_task() else {
+            self.state.status_line = "no task selected to delete".to_string();
+            return;
+        };
+        let branch = if task.branch.trim().is_empty() || task.branch == "-" {
+            None
+        } else {
+            Some(task.branch.clone())
+        };
+        self.input_mode = InputMode::DeleteTaskConfirm {
+            task_id: task.task_id.clone(),
+            branch,
+        };
+        self.state.status_line = format!(
+            "confirm delete task {}: Enter=delete Esc=cancel",
+            task.task_id.0
+        );
+    }
+
     pub fn input_prompt(&self) -> Option<&str> {
         match &self.input_mode {
             InputMode::Normal => None,
             InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
             InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
+            InputMode::DeleteTaskConfirm { .. } => None,
         }
     }
 
@@ -218,6 +246,13 @@ impl TuiApp {
             InputMode::ModelSelect {
                 models, selected, ..
             } => Some((models, *selected)),
+            _ => None,
+        }
+    }
+
+    pub fn delete_confirm_display(&self) -> Option<(&TaskId, Option<&str>)> {
+        match &self.input_mode {
+            InputMode::DeleteTaskConfirm { task_id, branch } => Some((task_id, branch.as_deref())),
             _ => None,
         }
     }
@@ -284,10 +319,27 @@ impl TuiApp {
                         model: Some(chosen_model),
                     });
                     self.input_mode = InputMode::Normal;
-                    self.state.status_line = format!(
-                        "queued action=create_task (chat) model={:?}",
-                        chosen_model
-                    );
+                    self.state.status_line =
+                        format!("queued action=create_task (chat) model={:?}", chosen_model);
+                }
+                _ => {}
+            },
+            InputMode::DeleteTaskConfirm { task_id, .. } => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = "delete task canceled".to_string();
+                }
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let confirmed_task_id = task_id.clone();
+                    self.action_queue.push_back(QueuedAction {
+                        action: UiAction::DeleteTask,
+                        task_id: Some(confirmed_task_id.clone()),
+                        prompt: None,
+                        model: None,
+                    });
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line =
+                        format!("queued action=delete_task task={}", confirmed_task_id.0);
                 }
                 _ => {}
             },
@@ -707,6 +759,64 @@ mod tests {
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
         assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
         assert_eq!(drained[0].model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn delete_task_key_enters_confirm_mode_and_enter_queues_delete() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::DeleteTaskConfirm { .. }
+        ));
+        assert_eq!(
+            app.state.status_line,
+            "confirm delete task T1: Enter=delete Esc=cancel"
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "queued action=delete_task task=T1");
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::DeleteTask);
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+        assert_eq!(drained[0].prompt, None);
+        assert_eq!(drained[0].model, None);
+    }
+
+    #[test]
+    fn delete_task_confirmation_escape_cancels_without_queueing_action() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "delete task canceled");
+        assert!(app.drain_actions().is_empty());
     }
 
     #[test]
