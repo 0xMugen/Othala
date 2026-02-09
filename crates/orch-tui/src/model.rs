@@ -97,6 +97,18 @@ impl AgentPane {
         let start = len.saturating_sub(max_lines);
         self.lines.iter().skip(start).cloned().collect()
     }
+
+    /// Returns a window of lines ending `scroll_back` lines from the bottom.
+    /// When `scroll_back == 0` this is equivalent to `tail(max_lines)`.
+    pub fn window(&self, max_lines: usize, scroll_back: usize) -> Vec<String> {
+        let len = self.lines.len();
+        // Clamp so the window never slides past the first line.
+        let max_back = len.saturating_sub(max_lines.min(len));
+        let clamped = scroll_back.min(max_back);
+        let end = len - clamped;
+        let start = end.saturating_sub(max_lines);
+        self.lines.iter().skip(start).take(end - start).cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +121,8 @@ pub struct DashboardState {
     pub focused_pane_idx: Option<usize>,
     pub focused_task: bool,
     pub status_line: String,
+    /// Lines scrolled back from the bottom in focused views. 0 = latest output.
+    pub scroll_back: usize,
 }
 
 impl Default for DashboardState {
@@ -122,6 +136,7 @@ impl Default for DashboardState {
             focused_pane_idx: None,
             focused_task: false,
             status_line: "ready".to_string(),
+            scroll_back: 0,
         }
     }
 }
@@ -185,6 +200,37 @@ impl DashboardState {
         } else {
             self.selected_pane_idx - 1
         };
+    }
+
+    /// Number of buffered lines in the currently focused pane (if any).
+    fn focused_pane_line_count(&self) -> usize {
+        if self.focused_task {
+            self.selected_task()
+                .and_then(|task| self.panes.iter().find(|p| p.task_id == task.task_id))
+                .map(|p| p.lines.len())
+                .unwrap_or(0)
+        } else if let Some(idx) = self.focused_pane_idx {
+            self.panes.get(idx).map(|p| p.lines.len()).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn scroll_up(&mut self, amount: usize) {
+        let max = self.focused_pane_line_count();
+        self.scroll_back = (self.scroll_back + amount).min(max);
+    }
+
+    pub fn scroll_down(&mut self, amount: usize) {
+        self.scroll_back = self.scroll_back.saturating_sub(amount);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_back = self.focused_pane_line_count();
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_back = 0;
     }
 }
 
@@ -304,5 +350,54 @@ mod tests {
                 "line-404".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn agent_pane_window_returns_slice_offset_from_bottom() {
+        let mut pane = AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex);
+        for i in 0..20 {
+            pane.append_line(format!("L{i}"));
+        }
+
+        // scroll_back=0 is equivalent to tail
+        assert_eq!(pane.window(3, 0), vec!["L17", "L18", "L19"]);
+
+        // scroll_back=5 skips last 5 lines
+        assert_eq!(pane.window(3, 5), vec!["L12", "L13", "L14"]);
+
+        // scroll_back larger than buffer clamps to beginning
+        assert_eq!(pane.window(3, 100), vec!["L0", "L1", "L2"]);
+
+        // window larger than available lines returns all
+        assert_eq!(pane.window(100, 0).len(), 20);
+    }
+
+    #[test]
+    fn dashboard_scroll_up_down_and_clamps() {
+        let mut state = DashboardState::default();
+        let mut pane = AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex);
+        for i in 0..50 {
+            pane.append_line(format!("line-{i}"));
+        }
+        state.panes.push(pane);
+        state.tasks.push(TaskOverviewRow::from_task(&mk_task("T1")));
+        state.focused_task = true;
+
+        assert_eq!(state.scroll_back, 0);
+        state.scroll_up(10);
+        assert_eq!(state.scroll_back, 10);
+        state.scroll_down(3);
+        assert_eq!(state.scroll_back, 7);
+        state.scroll_down(100);
+        assert_eq!(state.scroll_back, 0);
+
+        // clamps to line count
+        state.scroll_up(999);
+        assert_eq!(state.scroll_back, 50);
+
+        state.scroll_to_bottom();
+        assert_eq!(state.scroll_back, 0);
+        state.scroll_to_top();
+        assert_eq!(state.scroll_back, 50);
     }
 }

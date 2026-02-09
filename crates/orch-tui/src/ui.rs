@@ -239,13 +239,21 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .focused_pane_idx
         .and_then(|idx| app.state.panes.get(idx));
 
+    let viewport_height = area.height.saturating_sub(2) as usize;
+    let scroll_back = app.state.scroll_back;
+
     let (title, lines) = if let Some(pane) = pane {
+        let scroll_hint = if scroll_back > 0 {
+            format!(" [+{}]", scroll_back)
+        } else {
+            String::new()
+        };
         (
             format!(
-                "Focused PTY {} ({:?}, task={})",
-                pane.instance_id, pane.model, pane.task_id.0
+                "Focused PTY {} ({:?}, task={}){}",
+                pane.instance_id, pane.model, pane.task_id.0, scroll_hint
             ),
-            pane.tail(200)
+            pane.window(viewport_height, scroll_back)
                 .into_iter()
                 .map(Line::from)
                 .collect::<Vec<_>>(),
@@ -282,14 +290,22 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
 
+    let viewport_height = cols[0].height.saturating_sub(2) as usize;
+    let scroll_back = app.state.scroll_back;
+
     // Left: agent PTY output
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
+        let scroll_hint = if scroll_back > 0 {
+            format!(" [+{}]", scroll_back)
+        } else {
+            String::new()
+        };
         (
             format!(
-                "Agent {} ({:?}, task={})",
-                pane.instance_id, pane.model, pane.task_id.0
+                "Agent {} ({:?}, task={}){}",
+                pane.instance_id, pane.model, pane.task_id.0, scroll_hint
             ),
-            pane.tail(200)
+            pane.window(viewport_height, scroll_back)
                 .into_iter()
                 .map(Line::from)
                 .collect::<Vec<_>>(),
@@ -385,10 +401,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             spans.push(Span::styled(*key, Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD)));
             spans.push(Span::styled(format!("={label} "), Style::default().fg(MUTED)));
         }
-        spans.push(Span::styled(
-            "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
-            Style::default().fg(DIM),
-        ));
+        if app.state.focused_task || app.state.focused_pane_idx.is_some() {
+            spans.push(Span::styled(
+                "| \u{2191}\u{2193}=scroll PgUp/Dn=page Home/End=top/bottom esc=back",
+                Style::default().fg(DIM),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
+                Style::default().fg(DIM),
+            ));
+        }
         if !app.state.status_line.is_empty() {
             spans.push(Span::styled(
                 format!(" | {}", app.state.status_line),

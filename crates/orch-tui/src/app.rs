@@ -105,16 +105,49 @@ impl TuiApp {
         if key.code == KeyCode::Esc {
             if self.state.focused_task {
                 self.state.focused_task = false;
+                self.state.scroll_back = 0;
                 self.state.status_line = "task detail closed".to_string();
                 return;
             }
             if self.state.focused_pane_idx.is_some() {
                 self.state.focused_pane_idx = None;
+                self.state.scroll_back = 0;
                 self.state.status_line = "pane focus cleared".to_string();
                 return;
             }
             self.should_quit = true;
             return;
+        }
+
+        // In focused views, arrow keys and page keys scroll content.
+        if self.state.focused_task || self.state.focused_pane_idx.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.state.scroll_up(1);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.state.scroll_down(1);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.state.scroll_up(20);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.state.scroll_down(20);
+                    return;
+                }
+                KeyCode::Home => {
+                    self.state.scroll_to_top();
+                    return;
+                }
+                KeyCode::End => {
+                    self.state.scroll_to_bottom();
+                    return;
+                }
+                _ => {} // fall through to normal command handling
+            }
         }
 
         let Some(command) = map_key_to_command(key) else {
@@ -131,10 +164,12 @@ impl TuiApp {
             UiCommand::ToggleFocusedPane => {
                 if self.state.focused_pane_idx.is_some() {
                     self.state.focused_pane_idx = None;
+                    self.state.scroll_back = 0;
                     self.state.status_line = "pane focus cleared".to_string();
                 } else if !self.state.panes.is_empty() {
                     self.state.focused_pane_idx = Some(self.state.selected_pane_idx);
                     self.state.focused_task = false;
+                    self.state.scroll_back = 0;
                     self.state.status_line = format!(
                         "focused pane {}",
                         self.state.selected_pane_idx.saturating_add(1)
@@ -144,10 +179,12 @@ impl TuiApp {
             UiCommand::ToggleFocusedTask => {
                 if self.state.focused_task {
                     self.state.focused_task = false;
+                    self.state.scroll_back = 0;
                     self.state.status_line = "task detail closed".to_string();
                 } else if !self.state.tasks.is_empty() {
                     self.state.focused_task = true;
                     self.state.focused_pane_idx = None;
+                    self.state.scroll_back = 0;
                     let task_id = self
                         .state
                         .selected_task()
