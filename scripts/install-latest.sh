@@ -140,18 +140,26 @@ resolve_latest_tag() {
 
 install_nix_profile() {
   local flake_ref="${1:-}"
+  local priority=4
+  local output rc
   [[ -n "$flake_ref" ]] || return 1
 
-  if nix profile install "$flake_ref"; then
-    return 0
-  fi
+  while [[ "$priority" -ge -64 ]]; do
+    if output="$(nix profile install "$flake_ref" --priority "$priority" 2>&1)"; then
+      if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+      fi
+      return 0
+    fi
+    rc=$?
+    printf '%s\n' "$output" >&2
 
-  # If othala is already installed, replace it and retry once.
-  if nix profile list 2>/dev/null | grep -Fq "othala"; then
-    nix profile remove othala >/dev/null 2>&1 || true
-    nix profile install "$flake_ref"
-    return $?
-  fi
+    if ! printf '%s\n' "$output" | grep -Fq "An existing package already provides the following file:"; then
+      return "$rc"
+    fi
+
+    priority=$((priority - 1))
+  done
 
   return 1
 }
