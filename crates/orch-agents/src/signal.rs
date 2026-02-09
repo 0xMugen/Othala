@@ -68,9 +68,8 @@ mod tests {
 
     #[test]
     fn detects_conflict_resolved_variants() {
-        let signal =
-            detect_common_signal("done: [conflict_resolved] all conflicts fixed")
-                .expect("conflict resolved signal");
+        let signal = detect_common_signal("done: [conflict_resolved] all conflicts fixed")
+            .expect("conflict resolved signal");
         assert_eq!(signal.kind, AgentSignalKind::ConflictResolved);
     }
 
@@ -95,18 +94,13 @@ mod tests {
 
     #[test]
     fn ignores_prompt_echo_lines_containing_signal_markers() {
-        assert!(detect_common_signal(
-            "print exactly [conflict_resolved]"
-        ).is_none());
-        assert!(detect_common_signal(
-            "print exactly [needs_human] with a short reason."
-        ).is_none());
+        assert!(detect_common_signal("print exactly [conflict_resolved]").is_none());
+        assert!(detect_common_signal("print exactly [needs_human] with a short reason.").is_none());
         assert!(detect_common_signal(
             "When implementation is complete, print exactly [patch_ready]."
-        ).is_none());
-        assert!(detect_common_signal(
-            "[stderr] print [conflict_resolved]"
-        ).is_none());
+        )
+        .is_none());
+        assert!(detect_common_signal("[stderr] print [conflict_resolved]").is_none());
     }
 
     #[test]

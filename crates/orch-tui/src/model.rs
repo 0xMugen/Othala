@@ -91,7 +91,11 @@ impl AgentPane {
     }
 
     pub fn append_line(&mut self, line: impl Into<String>) {
-        self.lines.push_back(line.into());
+        let raw = line.into();
+        let Some(line) = normalize_pane_line(&raw) else {
+            return;
+        };
+        self.lines.push_back(line);
         self.updated_at = Utc::now();
         while self.lines.len() > 400 {
             self.lines.pop_front();
@@ -113,8 +117,120 @@ impl AgentPane {
         let clamped = scroll_back.min(max_back);
         let end = len - clamped;
         let start = end.saturating_sub(max_lines);
-        self.lines.iter().skip(start).take(end - start).cloned().collect()
+        self.lines
+            .iter()
+            .skip(start)
+            .take(end - start)
+            .cloned()
+            .collect()
     }
+}
+
+/// Normalize raw pane output into stable display text.
+///
+/// The daemon can forward lines from stdout/stderr and model tool output may
+/// include terminal escape sequences. We strip terminal control sequences and
+/// legacy `[stderr]` prefixes so the chat UI stays clean.
+pub fn normalize_pane_line(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_end_matches(['\n', '\r']);
+    let normalized = strip_terminal_sequences(trimmed).replace('\r', "");
+
+    let without_stderr = if let Some(rest) = normalized.strip_prefix("[stderr]") {
+        rest.trim_start_matches(' ')
+    } else {
+        normalized.as_str()
+    };
+
+    if without_stderr.is_empty() {
+        if trimmed.is_empty() {
+            return Some(String::new());
+        }
+        return None;
+    }
+
+    Some(without_stderr.to_string())
+}
+
+fn strip_terminal_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == 0x1B {
+            idx += 1;
+            if idx >= bytes.len() {
+                break;
+            }
+            match bytes[idx] {
+                b'[' => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        let b = bytes[idx];
+                        idx += 1;
+                        if (0x40..=0x7E).contains(&b) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == 0x07 {
+                            idx += 1;
+                            break;
+                        }
+                        if bytes[idx] == 0x1B && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                }
+                b'P' | b'X' | b'^' | b'_' => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == 0x1B && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                }
+                _ => {
+                    idx += 1;
+                }
+            }
+            continue;
+        }
+
+        if byte == 0x9B {
+            idx += 1;
+            while idx < bytes.len() {
+                let b = bytes[idx];
+                idx += 1;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if byte < 0x20 && byte != b'\t' {
+            idx += 1;
+            continue;
+        }
+
+        let ch = input[idx..]
+            .chars()
+            .next()
+            .expect("index always points at char boundary");
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +390,7 @@ mod tests {
     };
     use orch_core::types::{ModelKind, RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
 
-    use super::{AgentPane, DashboardState, TaskOverviewRow};
+    use super::{normalize_pane_line, AgentPane, DashboardState, TaskOverviewRow};
 
     fn mk_task(id: &str) -> Task {
         Task {
@@ -464,5 +580,27 @@ mod tests {
         assert_eq!(state.scroll_back, 0);
         state.scroll_to_top();
         assert_eq!(state.scroll_back, 50);
+    }
+
+    #[test]
+    fn normalize_pane_line_strips_ansi_and_stderr_prefix() {
+        let value = normalize_pane_line("[stderr] \u{1b}[31mapply failed\u{1b}[0m")
+            .expect("normalized line");
+        assert_eq!(value, "apply failed");
+    }
+
+    #[test]
+    fn normalize_pane_line_drops_control_only_sequences() {
+        let value = normalize_pane_line("\u{1b}[2K\u{1b}[0m");
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn agent_pane_append_line_normalizes_before_store() {
+        let mut pane = AgentPane::new("A1", TaskId("T1".to_string()), ModelKind::Codex);
+        pane.append_line("[stderr] \u{1b}[32mupdated src/lib.rs\u{1b}[0m");
+        pane.append_line("\u{1b}[2K\u{1b}[0m");
+
+        assert_eq!(pane.tail(10), vec!["updated src/lib.rs".to_string()]);
     }
 }

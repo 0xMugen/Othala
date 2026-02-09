@@ -44,8 +44,7 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (DraftPrOpen, Running | Failed | Paused) => true,
         (
             Running,
-            Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Submitting | Failed
-                | Paused,
+            Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Submitting | Failed | Paused,
         ) => true,
         (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
         (RestackConflict, Restacking | NeedsHuman | Submitting | Failed | Paused) => true,

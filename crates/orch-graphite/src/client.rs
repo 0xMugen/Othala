@@ -65,7 +65,14 @@ impl GraphiteClient {
         self.cli.run_allowed(
             self.repo_root.as_path(),
             AllowedAutoCommand::Modify,
-            ["modify", "--all", "--commit", "-m", message, "--no-interactive"],
+            [
+                "modify",
+                "--all",
+                "--commit",
+                "-m",
+                message,
+                "--no-interactive",
+            ],
         )?;
         Ok(())
     }
