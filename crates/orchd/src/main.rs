@@ -17,6 +17,8 @@ use orch_core::state::{
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
+use orch_git::{discover_repo, GitCli};
+use orch_graphite::GraphiteClient;
 use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiError, TuiEvent, UiAction};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -223,6 +225,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
 
     let repo_configs = load_repo_configs(&args.repos_config_dir)?;
     validate_repo_configs(&repo_configs)?;
+    run_startup_preflight(&repo_configs)?;
 
     let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
@@ -256,6 +259,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             match execute_tui_action(
                 action.action,
                 action.task_id.as_ref(),
+                action.prompt.as_deref(),
                 &service,
                 &org,
                 &enabled_models,
@@ -308,6 +312,14 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
             }
         }
 
+        for event in agent_supervisor.drain_pending_ready_starts(
+            &service,
+            &repo_config_by_id,
+            &enabled_models,
+        ) {
+            app.apply_event(event);
+        }
+
         for event in agent_supervisor.poll_events() {
             app.apply_event(event);
         }
@@ -344,6 +356,7 @@ struct TuiStartedAgentSession {
 #[derive(Debug, Default)]
 struct TuiAgentSupervisor {
     sessions_by_task: HashMap<String, TuiAgentSession>,
+    pending_start_by_task: HashMap<String, String>,
     next_instance_nonce: u64,
 }
 
@@ -357,6 +370,7 @@ impl TuiAgentSupervisor {
         task: &Task,
         repo_config: &RepoConfig,
         enabled_models: &[ModelKind],
+        user_prompt: Option<&str>,
     ) -> Result<TuiStartedAgentSession, MainError> {
         if self.has_task_session(&task.id) {
             return Err(MainError::InvalidConfig(format!(
@@ -375,7 +389,7 @@ impl TuiAgentSupervisor {
             repo_id: task.repo_id.clone(),
             model,
             repo_path: repo_path.clone(),
-            prompt: task_agent_prompt(task),
+            prompt: task_agent_prompt(task, user_prompt),
             timeout_secs: TUI_AGENT_TIMEOUT_SECS,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -434,15 +448,95 @@ impl TuiAgentSupervisor {
         })
     }
 
+    fn queue_start(&mut self, task_id: &TaskId, prompt: String) {
+        self.pending_start_by_task.insert(task_id.0.clone(), prompt);
+    }
+
     fn stop_task_session(&mut self, task_id: &TaskId) -> Option<TuiStartedAgentSession> {
         let mut session = self.sessions_by_task.remove(&task_id.0)?;
         let _ = session.child.kill();
         let _ = session.child.wait();
+        self.pending_start_by_task.remove(&task_id.0);
         Some(TuiStartedAgentSession {
             instance_id: session.instance_id,
             task_id: session.task_id,
             model: session.model,
         })
+    }
+
+    fn drain_pending_ready_starts(
+        &mut self,
+        service: &OrchdService,
+        repo_config_by_id: &HashMap<String, RepoConfig>,
+        enabled_models: &[ModelKind],
+    ) -> Vec<TuiEvent> {
+        let mut events = Vec::new();
+        let task_ids = self
+            .pending_start_by_task
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for task_id_value in task_ids {
+            if self.sessions_by_task.contains_key(&task_id_value) {
+                continue;
+            }
+
+            let task_id = TaskId(task_id_value.clone());
+            let task = match service.task(&task_id) {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    self.pending_start_by_task.remove(&task_id_value);
+                    continue;
+                }
+                Err(err) => {
+                    events.push(TuiEvent::StatusLine {
+                        message: format!("failed to load pending task {}: {err}", task_id.0),
+                    });
+                    continue;
+                }
+            };
+
+            if task.state == TaskState::Queued || task.state == TaskState::Initializing {
+                continue;
+            }
+
+            let repo_config = match repo_config_by_id.get(&task.repo_id.0) {
+                Some(cfg) => cfg,
+                None => {
+                    self.pending_start_by_task.remove(&task_id_value);
+                    events.push(TuiEvent::StatusLine {
+                        message: format!(
+                            "missing repo config for repo_id={} (task {})",
+                            task.repo_id.0, task.id.0
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            let prompt = self
+                .pending_start_by_task
+                .remove(&task_id_value)
+                .unwrap_or_else(|| task.title.clone());
+            match self.start_task_session(&task, repo_config, enabled_models, Some(&prompt)) {
+                Ok(started) => {
+                    events.push(TuiEvent::AgentPaneOutput {
+                        instance_id: started.instance_id,
+                        task_id: started.task_id,
+                        model: started.model,
+                        lines: vec!["[agent session started]".to_string()],
+                    });
+                }
+                Err(err) => {
+                    events.push(TuiEvent::StatusLine {
+                        message: format!("failed to start agent for {}: {err}", task.id.0),
+                    });
+                }
+            }
+        }
+
+        events
     }
 
     fn poll_events(&mut self) -> Vec<TuiEvent> {
@@ -516,6 +610,7 @@ impl TuiAgentSupervisor {
             let task_id = TaskId(key);
             let _ = self.stop_task_session(&task_id);
         }
+        self.pending_start_by_task.clear();
     }
 }
 
@@ -573,24 +668,31 @@ fn resolve_task_runtime_path(task: &Task, repo_config: &RepoConfig) -> PathBuf {
     repo_config.repo_path.clone()
 }
 
-fn task_agent_prompt(task: &Task) -> String {
+fn task_agent_prompt(task: &Task, user_prompt: Option<&str>) -> String {
+    let requested_work = user_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or(task.title.as_str());
     format!(
         "You are working on task {id}: {title}\n\
 State: {state:?}\n\
 Role: {role:?}\n\
 Type: {task_type:?}\n\
+Requested work:\n{requested_work}\n\
 Work in this task worktree, make focused changes, and report progress.",
         id = task.id.0,
         title = task.title,
         state = task.state,
         role = task.role,
-        task_type = task.task_type
+        task_type = task.task_type,
+        requested_work = requested_work
     )
 }
 
 fn execute_tui_action(
     action: UiAction,
     task_id: Option<&TaskId>,
+    prompt: Option<&str>,
     service: &OrchdService,
     org: &OrgConfig,
     enabled_models: &[ModelKind],
@@ -600,10 +702,22 @@ fn execute_tui_action(
     at: chrono::DateTime<Utc>,
 ) -> Result<TuiActionOutcome, MainError> {
     if action == UiAction::CreateTask {
-        let task = create_tui_task(task_id, service, org, repo_config_by_id, at)?;
+        let prompt = prompt
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                MainError::InvalidConfig(
+                    "new chat prompt is required when creating a task".to_string(),
+                )
+            })?;
+        let task = create_tui_task(task_id, prompt, service, org, repo_config_by_id, at)?;
+        agent_supervisor.queue_start(&task.id, prompt.to_string());
         return Ok(TuiActionOutcome {
-            message: format!("created task {} in repo {}", task.id.0, task.repo_id.0),
-            force_tick: false,
+            message: format!(
+                "created task {} in repo {} (starting agent)",
+                task.id.0, task.repo_id.0
+            ),
+            force_tick: true,
             events: Vec::new(),
         });
     }
@@ -698,9 +812,15 @@ fn execute_tui_action(
                     events: Vec::new(),
                 }
             } else if task.state == TaskState::Queued || task.state == TaskState::Initializing {
+                let queued_prompt = prompt
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| task.title.clone());
+                agent_supervisor.queue_start(&selected_task_id, queued_prompt);
                 TuiActionOutcome {
                     message: format!(
-                        "task {} is {}; scheduler/runtime will prepare worktree first",
+                        "task {} is {}; agent start queued until task is ready",
                         selected_task_id.0,
                         orchd::task_state_tag(task.state)
                     ),
@@ -739,8 +859,12 @@ fn execute_tui_action(
                         task.repo_id.0
                     ))
                 })?;
-                let started =
-                    agent_supervisor.start_task_session(&task, repo_config, enabled_models)?;
+                let started = agent_supervisor.start_task_session(
+                    &task,
+                    repo_config,
+                    enabled_models,
+                    prompt,
+                )?;
                 TuiActionOutcome {
                     message: format!(
                         "started {} agent for {}",
@@ -859,8 +983,12 @@ fn execute_tui_action(
                         task.repo_id.0
                     ))
                 })?;
-                let started =
-                    agent_supervisor.start_task_session(&task, repo_config, enabled_models)?;
+                let started = agent_supervisor.start_task_session(
+                    &task,
+                    repo_config,
+                    enabled_models,
+                    prompt,
+                )?;
                 events.push(TuiEvent::AgentPaneOutput {
                     instance_id: started.instance_id.clone(),
                     task_id: started.task_id.clone(),
@@ -974,6 +1102,7 @@ fn execute_tui_action(
 
 fn create_tui_task(
     selected_task_id: Option<&TaskId>,
+    prompt: &str,
     service: &OrchdService,
     org: &OrgConfig,
     repo_config_by_id: &HashMap<String, RepoConfig>,
@@ -1007,11 +1136,12 @@ fn create_tui_task(
         task_id = TaskId(format!("{base_id}-{suffix}"));
         suffix += 1;
     }
+    let title = summarize_prompt_as_title(prompt);
 
     let task = Task {
         id: task_id.clone(),
         repo_id: orch_core::types::RepoId(repo_id),
-        title: format!("TUI task {}", task_id.0),
+        title,
         state: TaskState::Queued,
         role: orch_core::types::TaskRole::General,
         task_type: orch_core::types::TaskType::Feature,
@@ -1046,6 +1176,20 @@ fn create_tui_task(
     };
     service.create_task(&task, &event)?;
     Ok(task)
+}
+
+fn summarize_prompt_as_title(prompt: &str) -> String {
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("TUI task");
+    let mut title = first.to_string();
+    if title.len() > 96 {
+        title.truncate(93);
+        title.push_str("...");
+    }
+    title
 }
 
 fn run_single_orchestrator_tick(
@@ -1301,6 +1445,7 @@ fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
 
     let repo_configs = load_repo_configs(&args.repos_config_dir)?;
     validate_repo_configs(&repo_configs)?;
+    run_startup_preflight(&repo_configs)?;
 
     let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
@@ -2031,6 +2176,106 @@ fn validate_repo_configs(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), M
         "repo config validation failed ({})",
         errors.join("; ")
     )))
+}
+
+fn run_startup_preflight(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), MainError> {
+    if repo_configs.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    if !command_in_path("nix") {
+        errors.push("missing required CLI in PATH: nix".to_string());
+    }
+    if !command_in_path("gt") {
+        errors.push("missing required CLI in PATH: gt (Graphite)".to_string());
+    }
+
+    let git = GitCli::default();
+    for (_, repo) in repo_configs {
+        if !repo.repo_path.exists() {
+            errors.push(format!(
+                "repo {} path does not exist: {}",
+                repo.repo_id,
+                repo.repo_path.display()
+            ));
+            continue;
+        }
+
+        if let Err(err) = discover_repo(&repo.repo_path, &git) {
+            errors.push(format!(
+                "repo {} is not a valid git repository at {}: {}",
+                repo.repo_id,
+                repo.repo_path.display(),
+                err
+            ));
+            continue;
+        }
+
+        if let Err(err) = verify_nix_dev_shell(repo) {
+            errors.push(format!(
+                "repo {} nix dev shell check failed: {}",
+                repo.repo_id, err
+            ));
+        }
+
+        if let Err(err) = GraphiteClient::new(repo.repo_path.clone()).status_snapshot() {
+            errors.push(format!(
+                "repo {} graphite check failed at {}: {}",
+                repo.repo_id,
+                repo.repo_path.display(),
+                err
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    Err(MainError::InvalidConfig(format!(
+        "startup preflight failed ({})",
+        errors.join("; ")
+    )))
+}
+
+fn command_in_path(binary: &str) -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {} >/dev/null 2>&1", binary))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn verify_nix_dev_shell(repo: &RepoConfig) -> Result<(), String> {
+    if repo.nix.dev_shell.trim().is_empty() {
+        return Err("dev_shell command is empty".to_string());
+    }
+
+    let cmd = format!("{} -c true", repo.nix.dev_shell);
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(&cmd)
+        .current_dir(&repo.repo_path)
+        .output()
+        .map_err(|err| format!("failed to run '{}': {}", cmd, err))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let status = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_string()
+    };
+    Err(format!("'{}' exited with {} ({})", cmd, status, detail))
 }
 
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
@@ -3178,6 +3423,7 @@ submit_mode = "single"
         let outcome = execute_tui_action(
             UiAction::ApproveTask,
             Some(&task.id),
+            None,
             &service,
             &org,
             &org.models.enabled,
@@ -3212,6 +3458,7 @@ submit_mode = "single"
         let outcome = execute_tui_action(
             UiAction::CreateTask,
             None,
+            Some("Build OAuth login with callback flow"),
             &service,
             &org,
             &org.models.enabled,
@@ -3227,6 +3474,9 @@ submit_mode = "single"
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].state, TaskState::Queued);
         assert_eq!(tasks[0].repo_id.0, "example");
+        assert_eq!(tasks[0].title, "Build OAuth login with callback flow");
+        assert_eq!(agent_supervisor.pending_start_by_task.len(), 1);
+        assert!(agent_supervisor.pending_start_by_task.contains_key(&tasks[0].id.0));
 
         let _ = fs::remove_dir_all(root);
     }

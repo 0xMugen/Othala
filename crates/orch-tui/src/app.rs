@@ -1,5 +1,5 @@
 use chrono::Utc;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use orch_core::types::{ModelKind, Task, TaskId};
 use std::collections::VecDeque;
 
@@ -11,12 +11,20 @@ use crate::model::{AgentPane, AgentPaneStatus, DashboardState};
 pub struct QueuedAction {
     pub action: UiAction,
     pub task_id: Option<TaskId>,
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    NewChatPrompt { buffer: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiApp {
     pub state: DashboardState,
     pub action_queue: VecDeque<QueuedAction>,
+    pub input_mode: InputMode,
     pub should_quit: bool,
 }
 
@@ -25,6 +33,7 @@ impl Default for TuiApp {
         Self {
             state: DashboardState::default(),
             action_queue: VecDeque::new(),
+            input_mode: InputMode::Normal,
             should_quit: false,
         }
     }
@@ -61,8 +70,11 @@ impl TuiApp {
             Some(task_id) => format!("queued action={} task={}", action_label(action), task_id.0),
             None => format!("queued action={}", action_label(action)),
         };
-        self.action_queue
-            .push_back(QueuedAction { action, task_id });
+        self.action_queue.push_back(QueuedAction {
+            action,
+            task_id,
+            prompt: None,
+        });
     }
 
     pub fn drain_actions(&mut self) -> Vec<QueuedAction> {
@@ -70,11 +82,25 @@ impl TuiApp {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        if self.handle_input_mode_key(key) {
+            return;
+        }
+
         let Some(command) = map_key_to_command(key) else {
             return;
         };
 
         match command {
+            UiCommand::Dispatch(UiAction::CreateTask) => self.begin_new_chat_prompt(),
             UiCommand::Dispatch(action) => self.push_action(action),
             UiCommand::SelectNextTask => self.state.move_task_selection_next(),
             UiCommand::SelectPreviousTask => self.state.move_task_selection_previous(),
@@ -93,6 +119,63 @@ impl TuiApp {
                 }
             }
             UiCommand::Quit => self.should_quit = true,
+        }
+    }
+
+    fn begin_new_chat_prompt(&mut self) {
+        self.input_mode = InputMode::NewChatPrompt {
+            buffer: String::new(),
+        };
+        self.state.status_line =
+            "new chat prompt: type feature request, Enter=submit Esc=cancel".to_string();
+    }
+
+    pub fn input_prompt(&self) -> Option<&str> {
+        match &self.input_mode {
+            InputMode::Normal => None,
+            InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
+        }
+    }
+
+    fn handle_input_mode_key(&mut self, key: KeyEvent) -> bool {
+        let InputMode::NewChatPrompt { buffer } = &mut self.input_mode else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.state.status_line = "new chat prompt canceled".to_string();
+                true
+            }
+            KeyCode::Enter => {
+                let prompt = buffer.trim().to_string();
+                if prompt.is_empty() {
+                    self.state.status_line = "new chat prompt cannot be empty".to_string();
+                    return true;
+                }
+                let task_id = self.state.selected_task().map(|task| task.task_id.clone());
+                self.action_queue.push_back(QueuedAction {
+                    action: UiAction::CreateTask,
+                    task_id,
+                    prompt: Some(prompt),
+                });
+                self.input_mode = InputMode::Normal;
+                self.state.status_line = "queued action=create_task (chat)".to_string();
+                true
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                true
+            }
+            KeyCode::Char(ch) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return true;
+                }
+                buffer.push(ch);
+                true
+            }
+            _ => true,
         }
     }
 
@@ -249,6 +332,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
         assert_eq!(drained[0].task_id, Some(TaskId("T2".to_string())));
+        assert_eq!(drained[0].prompt, None);
         assert_eq!(
             app.state.status_line,
             "queued action=run_verify_quick task=T2"
@@ -264,6 +348,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].action, UiAction::TriggerRestack);
         assert_eq!(drained[0].task_id, None);
+        assert_eq!(drained[0].prompt, None);
         assert_eq!(app.state.status_line, "queued action=trigger_restack");
     }
 
@@ -301,6 +386,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+        assert_eq!(drained[0].prompt, None);
     }
 
     #[test]
@@ -358,5 +444,42 @@ mod tests {
             lines: vec!["after-exit".to_string()],
         });
         assert_eq!(app.state.panes[0].status, AgentPaneStatus::Exited);
+    }
+
+    #[test]
+    fn create_task_key_enters_prompt_mode_and_enter_queues_prompted_action() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::NewChatPrompt { .. }
+        ));
+        assert_eq!(
+            app.state.status_line,
+            "new chat prompt: type feature request, Enter=submit Esc=cancel"
+        );
+
+        for ch in "Build OAuth login".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::CreateTask);
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+        assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
     }
 }

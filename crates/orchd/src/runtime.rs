@@ -472,28 +472,9 @@ impl RuntimeEngine {
         task: &Task,
         at: DateTime<Utc>,
     ) -> Result<bool, RuntimeError> {
-        let should_start = matches!(
-            task.verify_status,
-            orch_core::state::VerifyStatus::NotRun
-                | orch_core::state::VerifyStatus::Failed { .. }
-                | orch_core::state::VerifyStatus::Passed {
-                    tier: VerifyTier::Full
-                }
-        );
-        if !should_start {
-            return Ok(false);
-        }
-
-        let _ = service.start_verify(
-            &task.id,
-            VerifyTier::Quick,
-            crate::service::StartVerifyEventIds {
-                verify_state_changed: event_id(&task.id, "VERIFY-QUICK-START-S", at),
-                verify_requested: event_id(&task.id, "VERIFY-QUICK-START-E", at),
-            },
-            at,
-        )?;
-        Ok(true)
+        let _ = (service, task, at);
+        // Keep tasks in RUNNING until verify is explicitly requested from UI/CLI.
+        Ok(false)
     }
 
     fn submit_task(

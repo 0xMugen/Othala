@@ -171,8 +171,15 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let help = "keys: c=create a=approve s=start x=stop r=restart q=quick f=full t=restack n=needs-human w=web p=pause u=resume | arrows=select tab=focus esc/ctrl-c=quit";
-    let line = format!("{} | status: {}", help, app.state.status_line);
+    let help = "keys: c=new-chat a=approve s=start x=stop r=restart q=quick f=full t=restack n=needs-human w=web p=pause u=resume | arrows=select tab=focus esc/ctrl-c=quit";
+    let line = if let Some(prompt) = app.input_prompt() {
+        format!(
+            "{} | compose: {}_ | status: {}",
+            help, prompt, app.state.status_line
+        )
+    } else {
+        format!("{} | status: {}", help, app.state.status_line)
+    };
     let widget = Paragraph::new(line)
         .block(Block::default().borders(Borders::ALL).title("Actions"))
         .wrap(Wrap { trim: true });
