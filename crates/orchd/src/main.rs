@@ -10,11 +10,13 @@ use orch_core::config::{
 use orch_core::events::{
     Event, EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
 };
-use orch_core::state::{ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus};
+use orch_core::state::{
+    ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
+};
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
-use orch_tui::{run_tui, TuiApp, TuiError};
+use orch_tui::{run_tui_with_hook, TuiApp, TuiError, UiAction};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
     ServiceError,
@@ -24,14 +26,17 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_ORG_CONFIG: &str = "config/org.toml";
 const DEFAULT_REPOS_CONFIG_DIR: &str = "config/repos";
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_ROOT: &str = ".orch/events";
 const DEFAULT_TUI_TICK_MS: u64 = 250;
+const TUI_ORCH_TICK_INTERVAL: Duration = Duration::from_secs(5);
+static TUI_EVENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunCliArgs {
@@ -45,7 +50,10 @@ struct RunCliArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuiCliArgs {
     tick_ms: u64,
+    org_config_path: PathBuf,
+    repos_config_dir: PathBuf,
     sqlite_path: PathBuf,
+    event_log_root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,27 +208,426 @@ fn run() -> Result<(), MainError> {
 }
 
 fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
-    let mut app = match load_tasks_from_sqlite(&args.sqlite_path) {
-        Ok(tasks) => {
-            let mut app = TuiApp::from_tasks(&tasks);
-            app.state.status_line = format!(
-                "othala tui started tick_ms={} tasks={}",
-                args.tick_ms,
-                tasks.len()
-            );
-            app
+    ensure_parent_dir(&args.sqlite_path)?;
+    ensure_dir(&args.event_log_root)?;
+
+    let org = load_org_config(&args.org_config_path).map_err(|source| MainError::LoadConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+    validate_org_config(&org.validate())?;
+
+    let repo_configs = load_repo_configs(&args.repos_config_dir)?;
+    validate_repo_configs(&repo_configs)?;
+
+    let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
+    let service = OrchdService::open(&args.sqlite_path, &args.event_log_root, scheduler)?;
+    let runtime = RuntimeEngine::default();
+    let repo_config_by_id = repo_configs
+        .iter()
+        .map(|(_, cfg)| (cfg.repo_id.clone(), cfg.clone()))
+        .collect::<HashMap<_, _>>();
+    let enabled_models = org.models.enabled.clone();
+    let probe_config = SetupProbeConfig::default();
+
+    let tasks = service.list_tasks()?;
+    let mut app = TuiApp::from_tasks(&tasks);
+    app.state.status_line = format!(
+        "tui ready tasks={} tick_ms={} (daemon tick every {}s)",
+        tasks.len(),
+        args.tick_ms,
+        TUI_ORCH_TICK_INTERVAL.as_secs()
+    );
+
+    let mut last_orch_tick = Instant::now()
+        .checked_sub(TUI_ORCH_TICK_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    run_tui_with_hook(&mut app, Duration::from_millis(args.tick_ms), |app| {
+        let actions = app.drain_actions();
+        let mut force_tick = false;
+
+        for action in actions {
+            let at = Utc::now();
+            match execute_tui_action(
+                action.action,
+                action.task_id.as_ref(),
+                &service,
+                &org,
+                &enabled_models,
+                &probe_config,
+                at,
+            ) {
+                Ok(outcome) => {
+                    app.state.status_line = outcome.message;
+                    force_tick |= outcome.force_tick;
+                }
+                Err(err) => {
+                    app.state.status_line = format!("action failed: {err}");
+                }
+            }
         }
-        Err(err) => {
-            let mut app = TuiApp::default();
-            app.state.status_line = format!(
-                "othala tui started tick_ms={} task_load_warning={}",
-                args.tick_ms, err
-            );
-            app
+
+        let now = Instant::now();
+        if force_tick || now.duration_since(last_orch_tick) >= TUI_ORCH_TICK_INTERVAL {
+            let at = Utc::now();
+            match run_single_orchestrator_tick(
+                &service,
+                &runtime,
+                &org,
+                &repo_config_by_id,
+                &enabled_models,
+                &probe_config,
+                at,
+            ) {
+                Ok(status) => {
+                    if let Some(status) = status {
+                        app.state.status_line = status;
+                    }
+                }
+                Err(err) => {
+                    app.state.status_line = format!("daemon tick failed: {err}");
+                }
+            }
+            last_orch_tick = now;
+        }
+
+        match service.list_tasks() {
+            Ok(tasks) => app.set_tasks(&tasks),
+            Err(err) => {
+                app.state.status_line = format!("failed to refresh tasks: {err}");
+            }
+        }
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiActionOutcome {
+    message: String,
+    force_tick: bool,
+}
+
+fn execute_tui_action(
+    action: UiAction,
+    task_id: Option<&TaskId>,
+    service: &OrchdService,
+    org: &OrgConfig,
+    enabled_models: &[ModelKind],
+    probe_config: &SetupProbeConfig,
+    at: chrono::DateTime<Utc>,
+) -> Result<TuiActionOutcome, MainError> {
+    let selected_task_id = task_id.cloned().ok_or_else(|| {
+        MainError::InvalidConfig("select a task before running this action".to_string())
+    })?;
+
+    let task = service
+        .task(&selected_task_id)?
+        .ok_or_else(|| ServiceError::TaskNotFound {
+            task_id: selected_task_id.0.clone(),
+        })?;
+
+    let outcome = match action {
+        UiAction::CreateTask => TuiActionOutcome {
+            message: "create task from TUI is not wired yet; use `othala create-task --spec ...`"
+                .to_string(),
+            force_tick: false,
+        },
+        UiAction::ApproveTask => {
+            let review_config = orchd::ReviewGateConfig {
+                enabled_models: org.models.enabled.clone(),
+                policy: org.models.policy,
+                min_approvals: org.models.min_approvals,
+            };
+            let (_, availability_map) = current_model_availability(enabled_models, probe_config);
+            let availability = enabled_models
+                .iter()
+                .copied()
+                .map(|model| orchd::ReviewerAvailability {
+                    model,
+                    available: availability_map.get(&model).copied().unwrap_or(false),
+                })
+                .collect::<Vec<_>>();
+
+            let (_, computation) = service.recompute_task_review_status(
+                &selected_task_id,
+                &review_config,
+                &availability,
+                at,
+            )?;
+            let required_models = if computation.requirement.required_models.is_empty() {
+                enabled_models.to_vec()
+            } else {
+                computation.requirement.required_models.clone()
+            };
+
+            for reviewer in &required_models {
+                service.complete_review(
+                    &selected_task_id,
+                    *reviewer,
+                    ReviewOutput {
+                        verdict: ReviewVerdict::Approve,
+                        issues: Vec::new(),
+                        risk_flags: Vec::new(),
+                        graphite_hygiene: GraphiteHygieneReport {
+                            ok: true,
+                            notes: "manual approval from tui".to_string(),
+                        },
+                        test_assessment: TestAssessment {
+                            ok: true,
+                            notes: "manual approval from tui".to_string(),
+                        },
+                    },
+                    &review_config,
+                    &availability,
+                    orchd::CompleteReviewEventIds {
+                        review_completed: tui_event_id(&selected_task_id, "APPROVE-DONE", at),
+                        needs_human_state_changed: tui_event_id(
+                            &selected_task_id,
+                            "APPROVE-NH-S",
+                            at,
+                        ),
+                        needs_human_event: tui_event_id(&selected_task_id, "APPROVE-NH-E", at),
+                    },
+                    at,
+                )?;
+            }
+
+            TuiActionOutcome {
+                message: format!(
+                    "recorded APPROVE for {} reviewer(s) on {}",
+                    required_models.len(),
+                    selected_task_id.0
+                ),
+                force_tick: true,
+            }
+        }
+        UiAction::StartAgent => {
+            if task.state == TaskState::Queued {
+                TuiActionOutcome {
+                    message: format!("queued task {} for scheduler start", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else if task.state == TaskState::Paused {
+                let _ = service.resume_task(
+                    &selected_task_id,
+                    orchd::ResumeTaskEventIds {
+                        resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                    },
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("resumed task {}", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                let _ = service.transition_task_state(
+                    &selected_task_id,
+                    TaskState::Running,
+                    tui_event_id(&selected_task_id, "START-RUNNING", at),
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("moved task {} to RUNNING", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else {
+                TuiActionOutcome {
+                    message: format!(
+                        "cannot start task {} from state {:?}",
+                        selected_task_id.0, task.state
+                    ),
+                    force_tick: false,
+                }
+            }
+        }
+        UiAction::StopAgent | UiAction::PauseTask => {
+            let _ = service.pause_task(
+                &selected_task_id,
+                orchd::PauseTaskEventIds {
+                    pause_state_changed: tui_event_id(&selected_task_id, "PAUSE-S", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("paused task {}", selected_task_id.0),
+                force_tick: false,
+            }
+        }
+        UiAction::RestartAgent => {
+            if task.state == TaskState::Queued {
+                TuiActionOutcome {
+                    message: format!("queued task {} for scheduler start", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else if orchd::is_transition_allowed(task.state, TaskState::Paused) {
+                let _ = service.pause_task(
+                    &selected_task_id,
+                    orchd::PauseTaskEventIds {
+                        pause_state_changed: tui_event_id(&selected_task_id, "RESTART-PAUSE", at),
+                    },
+                    at,
+                )?;
+                let _ = service.resume_task(
+                    &selected_task_id,
+                    orchd::ResumeTaskEventIds {
+                        resume_state_changed: tui_event_id(&selected_task_id, "RESTART-RESUME", at),
+                    },
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("restarted task {}", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else if orchd::is_transition_allowed(task.state, TaskState::Running) {
+                let _ = service.transition_task_state(
+                    &selected_task_id,
+                    TaskState::Running,
+                    tui_event_id(&selected_task_id, "RESTART-RUNNING", at),
+                    at,
+                )?;
+                TuiActionOutcome {
+                    message: format!("moved task {} to RUNNING", selected_task_id.0),
+                    force_tick: true,
+                }
+            } else {
+                TuiActionOutcome {
+                    message: format!(
+                        "cannot restart task {} from state {:?}",
+                        selected_task_id.0, task.state
+                    ),
+                    force_tick: false,
+                }
+            }
+        }
+        UiAction::RunVerifyQuick => {
+            let _ = service.start_verify(
+                &selected_task_id,
+                VerifyTier::Quick,
+                orchd::StartVerifyEventIds {
+                    verify_state_changed: tui_event_id(&selected_task_id, "VERIFY-QUICK-S", at),
+                    verify_requested: tui_event_id(&selected_task_id, "VERIFY-QUICK-E", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("triggered quick verify for {}", selected_task_id.0),
+                force_tick: true,
+            }
+        }
+        UiAction::RunVerifyFull => {
+            let _ = service.start_verify(
+                &selected_task_id,
+                VerifyTier::Full,
+                orchd::StartVerifyEventIds {
+                    verify_state_changed: tui_event_id(&selected_task_id, "VERIFY-FULL-S", at),
+                    verify_requested: tui_event_id(&selected_task_id, "VERIFY-FULL-E", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("triggered full verify for {}", selected_task_id.0),
+                force_tick: true,
+            }
+        }
+        UiAction::TriggerRestack => {
+            let _ = service.start_restack(
+                &selected_task_id,
+                orchd::StartRestackEventIds {
+                    restack_state_changed: tui_event_id(&selected_task_id, "RESTACK-S", at),
+                    restack_started: tui_event_id(&selected_task_id, "RESTACK-E", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("started restack for {}", selected_task_id.0),
+                force_tick: true,
+            }
+        }
+        UiAction::MarkNeedsHuman => {
+            let _ = service.mark_needs_human(
+                &selected_task_id,
+                "marked as needs-human from tui",
+                orchd::MarkNeedsHumanEventIds {
+                    needs_human_state_changed: tui_event_id(&selected_task_id, "NH-S", at),
+                    needs_human_event: tui_event_id(&selected_task_id, "NH-E", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("marked task {} NEEDS_HUMAN", selected_task_id.0),
+                force_tick: false,
+            }
+        }
+        UiAction::OpenWebUiForTask => {
+            let task_url = if let Some(pr) = task.pr.as_ref() {
+                format!("web={} pr={}", org.ui.web_bind, pr.url)
+            } else {
+                format!("web={} task={}", org.ui.web_bind, selected_task_id.0)
+            };
+            TuiActionOutcome {
+                message: format!("open: http://{task_url}"),
+                force_tick: false,
+            }
+        }
+        UiAction::ResumeTask => {
+            let _ = service.resume_task(
+                &selected_task_id,
+                orchd::ResumeTaskEventIds {
+                    resume_state_changed: tui_event_id(&selected_task_id, "RESUME-S", at),
+                },
+                at,
+            )?;
+            TuiActionOutcome {
+                message: format!("resumed task {}", selected_task_id.0),
+                force_tick: true,
+            }
         }
     };
-    run_tui(&mut app, Duration::from_millis(args.tick_ms))?;
-    Ok(())
+
+    Ok(outcome)
+}
+
+fn run_single_orchestrator_tick(
+    service: &OrchdService,
+    runtime: &RuntimeEngine,
+    org: &OrgConfig,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+    enabled_models: &[ModelKind],
+    probe_config: &SetupProbeConfig,
+    at: chrono::DateTime<Utc>,
+) -> Result<Option<String>, MainError> {
+    let (scheduler_availability, runtime_availability) =
+        current_model_availability(enabled_models, probe_config);
+    let scheduling = service.schedule_queued_tasks(enabled_models, &scheduler_availability, at)?;
+    let runtime_tick = runtime.tick(service, org, repo_config_by_id, &runtime_availability, at)?;
+
+    if scheduling.scheduled.is_empty() && scheduling.blocked.is_empty() && !runtime_tick.touched() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "tick: scheduled={} blocked={} init={} verify_start={} restacked={} conflicts={} verify_pass={} verify_fail={} submitted={} submit_fail={} errors={}",
+        scheduling.scheduled.len(),
+        scheduling.blocked.len(),
+        runtime_tick.initialized,
+        runtime_tick.verify_started,
+        runtime_tick.restacked,
+        runtime_tick.restack_conflicts,
+        runtime_tick.verify_passed,
+        runtime_tick.verify_failed,
+        runtime_tick.submitted,
+        runtime_tick.submit_failed,
+        runtime_tick.errors
+    )))
+}
+
+fn tui_event_id(task_id: &TaskId, stage: &str, at: chrono::DateTime<Utc>) -> EventId {
+    let nonce = TUI_EVENT_NONCE.fetch_add(1, Ordering::Relaxed);
+    EventId(format!(
+        "E-TUI-{stage}-{}-{}-{nonce}",
+        task_id.0,
+        at.timestamp_nanos_opt().unwrap_or_default()
+    ))
 }
 
 fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
@@ -871,17 +1278,6 @@ fn current_model_availability(
     (scheduler_availability, availability_map)
 }
 
-fn load_tasks_from_sqlite(path: &Path) -> Result<Vec<Task>, MainError> {
-    let store = orchd::SqliteStore::open(path)
-        .map_err(|source| MainError::InvalidConfig(format!("failed to open sqlite: {source}")))?;
-    store.migrate().map_err(|source| {
-        MainError::InvalidConfig(format!("failed to migrate sqlite: {source}"))
-    })?;
-    store
-        .list_tasks()
-        .map_err(|source| MainError::InvalidConfig(format!("failed to list tasks: {source}")))
-}
-
 fn ensure_dir(path: &Path) -> Result<(), MainError> {
     fs::create_dir_all(path).map_err(|source| MainError::CreateDir {
         path: path.to_path_buf(),
@@ -992,7 +1388,11 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
         "list-tasks" => parse_list_tasks_cli_args(args[1..].to_vec(), program),
         "review-approve" => parse_review_approve_cli_args(args[1..].to_vec(), program),
         "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
-        _ => parse_run_cli_args(args, program),
+        _ if args[0].starts_with('-') => parse_tui_cli_args(args, program),
+        other => Err(MainError::Args(format!(
+            "unknown command: {other}\n\n{}",
+            usage(program)
+        ))),
     }
 }
 
@@ -1025,6 +1425,27 @@ fn parse_tui_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, Ma
                     MainError::Args("missing value for --sqlite-path".to_string())
                 })?;
                 parsed.sqlite_path = PathBuf::from(value);
+            }
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--repos-config-dir" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --repos-config-dir".to_string())
+                })?;
+                parsed.repos_config_dir = PathBuf::from(value);
+            }
+            "--event-log-root" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --event-log-root".to_string())
+                })?;
+                parsed.event_log_root = PathBuf::from(value);
             }
             other => {
                 return Err(MainError::Args(format!(
@@ -1452,22 +1873,27 @@ fn default_run_args() -> RunCliArgs {
 fn default_tui_args() -> TuiCliArgs {
     TuiCliArgs {
         tick_ms: DEFAULT_TUI_TICK_MS,
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        repos_config_dir: PathBuf::from(DEFAULT_REPOS_CONFIG_DIR),
         sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+        event_log_root: PathBuf::from(DEFAULT_EVENT_LOG_ROOT),
     }
 }
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program}\n  {program} tui [--tick-ms <u64>] [--sqlite-path <path>]\n  {program} daemon [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+        "Usage:\n  {program}\n  {program} tui [--tick-ms <u64>] [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} daemon [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 \nDefaults:\n  {program}: launches TUI\n  tui --tick-ms 250\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
     )
 }
 
 fn tui_usage(program: &str) -> String {
     format!(
-        "Usage: {program} tui [--tick-ms <u64>] [--sqlite-path <path>]\n\
+        "Usage: {program} tui [--tick-ms <u64>] [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 Defaults:\n\
   --tick-ms 250\n\
+  --org-config config/org.toml\n\
+  --repos-config-dir config/repos\n\
   --sqlite-path .orch/state.sqlite"
     )
 }
@@ -1510,15 +1936,23 @@ fn review_approve_usage(program: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_task_usage, list_tasks_usage, load_repo_configs, parse_cli_args,
+        create_task_usage, execute_tui_action, list_tasks_usage, load_repo_configs, parse_cli_args,
         parse_enabled_models, setup_usage, tui_usage, usage, wizard_usage, CliCommand,
         CreateTaskCliArgs, ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs,
         TuiCliArgs, WizardCliArgs,
     };
+    use chrono::Utc;
+    use orch_core::events::EventKind;
     use orch_core::events::ReviewVerdict;
+    use orch_core::state::{
+        ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
+    };
+    use orch_core::types::{EventId, RepoId, SubmitMode, Task, TaskRole, TaskType};
     use orch_core::types::{ModelKind, TaskId};
+    use orch_tui::UiAction;
+    use orchd::{OrchdService, Scheduler, SchedulerConfig};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parse_cli_args_uses_defaults_when_no_flags_are_passed() {
@@ -1527,7 +1961,10 @@ mod tests {
             parsed,
             CliCommand::Tui(TuiCliArgs {
                 tick_ms: 250,
+                org_config_path: PathBuf::from("config/org.toml"),
+                repos_config_dir: PathBuf::from("config/repos"),
                 sqlite_path: PathBuf::from(".orch/state.sqlite"),
+                event_log_root: PathBuf::from(".orch/events"),
             })
         );
     }
@@ -1554,8 +1991,14 @@ mod tests {
                 "tui".to_string(),
                 "--tick-ms".to_string(),
                 "500".to_string(),
+                "--org-config".to_string(),
+                "/tmp/org.toml".to_string(),
+                "--repos-config-dir".to_string(),
+                "/tmp/repos".to_string(),
                 "--sqlite-path".to_string(),
                 "/tmp/state.sqlite".to_string(),
+                "--event-log-root".to_string(),
+                "/tmp/events".to_string(),
             ],
             "orchd",
         )
@@ -1564,7 +2007,10 @@ mod tests {
             parsed,
             CliCommand::Tui(TuiCliArgs {
                 tick_ms: 500,
+                org_config_path: PathBuf::from("/tmp/org.toml"),
+                repos_config_dir: PathBuf::from("/tmp/repos"),
                 sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                event_log_root: PathBuf::from("/tmp/events"),
             })
         );
     }
@@ -1580,6 +2026,7 @@ mod tests {
     fn parse_cli_args_applies_explicit_paths_and_once_mode() {
         let parsed = parse_cli_args(
             vec![
+                "daemon".to_string(),
                 "--org-config".to_string(),
                 "/tmp/org.toml".to_string(),
                 "--repos-config-dir".to_string(),
@@ -1611,7 +2058,16 @@ mod tests {
         let err = parse_cli_args(vec!["--bad-flag".to_string()], "orchd")
             .expect_err("unknown arg should fail");
         let rendered = err.to_string();
-        assert!(rendered.contains("unknown argument: --bad-flag"));
+        assert!(rendered.contains("unknown tui argument: --bad-flag"));
+        assert!(rendered.contains("Usage:"));
+    }
+
+    #[test]
+    fn parse_cli_args_reports_unknown_command_with_usage() {
+        let err = parse_cli_args(vec!["unknown".to_string()], "orchd")
+            .expect_err("unknown command should fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("unknown command: unknown"));
         assert!(rendered.contains("Usage:"));
     }
 
@@ -1967,5 +2423,85 @@ submit_mode = "single"
         ));
         let loaded = load_repo_configs(&root).expect("missing dir should be treated as empty");
         assert!(loaded.is_empty());
+    }
+
+    fn mk_reviewing_task(task_id: &str) -> Task {
+        let now = Utc::now();
+        Task {
+            id: TaskId(task_id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "review".to_string(),
+            state: TaskState::Reviewing,
+            role: TaskRole::General,
+            task_type: TaskType::Feature,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: Some(format!("task/{task_id}")),
+            worktree_path: PathBuf::from(format!(".orch/wt/{task_id}")),
+            pr: None,
+            verify_status: VerifyStatus::Passed {
+                tier: VerifyTier::Quick,
+            },
+            review_status: ReviewStatus {
+                required_models: Vec::new(),
+                approvals_received: 0,
+                approvals_required: 0,
+                unanimous: false,
+                capacity_state: ReviewCapacityState::Sufficient,
+            },
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn mk_service(root: &Path) -> OrchdService {
+        let sqlite = root.join("state.sqlite");
+        let events = root.join("events");
+        let org = super::default_org_config();
+        let scheduler = Scheduler::new(SchedulerConfig::from_org_config(&org));
+        OrchdService::open(sqlite, events, scheduler).expect("open service")
+    }
+
+    #[test]
+    fn execute_tui_action_approve_task_records_manual_approvals() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-main-approve-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let service = mk_service(&root);
+        let org = super::default_org_config();
+        let task = mk_reviewing_task("T-APPROVE");
+        service
+            .create_task(
+                &task,
+                &super::Event {
+                    id: EventId("E-TEST-CREATE".to_string()),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                },
+            )
+            .expect("create task");
+
+        let outcome = execute_tui_action(
+            UiAction::ApproveTask,
+            Some(&task.id),
+            &service,
+            &org,
+            &org.models.enabled,
+            &super::SetupProbeConfig::default(),
+            Utc::now(),
+        )
+        .expect("approve action");
+
+        let approvals = service.task_approvals(&task.id).expect("approvals");
+        assert_eq!(approvals.len(), org.models.enabled.len());
+        assert!(outcome.force_tick);
+        assert!(outcome.message.contains("recorded APPROVE"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -23,7 +23,7 @@ Open gaps (before calling this production-ready):
 - Full autonomous agent epoch orchestration in `orchd` is not complete.
 - Reviewer automation (Claude/Codex/Gemini CLI-driven review generation) is not complete.
 - End-to-end auto-submit to GitHub is environment-dependent and not fully hardened.
-- TUI action dispatch is present, but not fully wired to daemon-side command APIs.
+- TUI supports core in-app lifecycle controls, but interactive task creation from inside TUI is not wired yet.
 
 ## Prerequisites
 

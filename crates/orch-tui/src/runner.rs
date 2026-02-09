@@ -12,13 +12,24 @@ use std::io;
 use std::time::Duration;
 
 pub fn run_tui(app: &mut TuiApp, tick_rate: Duration) -> Result<(), TuiError> {
+    run_tui_with_hook(app, tick_rate, |_| {})
+}
+
+pub fn run_tui_with_hook<F>(
+    app: &mut TuiApp,
+    tick_rate: Duration,
+    mut on_tick: F,
+) -> Result<(), TuiError>
+where
+    F: FnMut(&mut TuiApp),
+{
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let run_result = run_loop(&mut terminal, app, tick_rate);
+    let run_result = run_loop(&mut terminal, app, tick_rate, &mut on_tick);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -31,13 +42,14 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
     tick_rate: Duration,
+    on_tick: &mut impl FnMut(&mut TuiApp),
 ) -> Result<(), TuiError> {
     while !app.should_quit {
-        terminal.draw(|frame| render_dashboard(frame, app))?;
-
         if event::poll(tick_rate)? {
             handle_terminal_event(app, event::read()?);
         }
+        on_tick(app);
+        terminal.draw(|frame| render_dashboard(frame, app))?;
     }
     Ok(())
 }
