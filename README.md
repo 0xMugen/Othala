@@ -40,6 +40,14 @@ Install `othala` from the latest GitHub release tag:
 bash <(curl -fsSL https://raw.githubusercontent.com/0xMugen/Othala/main/scripts/install-latest.sh)
 ```
 
+If raw GitHub returns `404` (private/authenticated repo setup), run from a clone:
+
+```bash
+git clone git@github.com:0xMugen/Othala.git
+cd Othala
+./scripts/install-latest.sh
+```
+
 After install, start the interactive setup wizard:
 
 ```bash

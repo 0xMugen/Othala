@@ -3,18 +3,20 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/install-latest.sh [--repo <owner/name>] [--method <auto|nix|cargo>] [--force]
+Usage: scripts/install-latest.sh [--repo <owner/name>] [--tag <release-tag>] [--method <auto|nix|cargo>] [--force]
 
 Installs the `othala` CLI from the latest GitHub release tag.
 
 Options:
   --repo     GitHub repo slug (default: 0xMugen/Othala)
+  --tag      Release tag override (skip latest lookup, e.g. v0.1.0-alpha.3)
   --method   Install method: auto, nix, cargo (default: auto)
   --force    Pass --force to cargo install
 USAGE
 }
 
 repo="0xMugen/Othala"
+tag=""
 method="auto"
 force=0
 
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)
       repo="${2:-}"
+      shift 2
+      ;;
+    --tag)
+      tag="${2:-}"
       shift 2
       ;;
     --method)
@@ -54,20 +60,30 @@ if [[ "$method" != "auto" && "$method" != "nix" && "$method" != "cargo" ]]; then
   exit 1
 fi
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required to resolve the latest release tag" >&2
-  exit 1
+resolve_latest_tag() {
+  if command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1; then
+    gh api "repos/${repo}/releases/latest" --jq .tag_name 2>/dev/null || true
+    return
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    local latest_json
+    latest_json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || true
+    if [[ -n "$latest_json" ]]; then
+      printf '%s\n' "$latest_json" \
+        | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+    fi
+  fi
+}
+
+if [[ -z "$tag" ]]; then
+  tag="$(resolve_latest_tag)"
 fi
 
-latest_json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest")"
-tag="$(
-  printf '%s\n' "$latest_json" \
-    | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1
-)"
-
 if [[ -z "$tag" || "$tag" == "null" ]]; then
-  echo "failed to resolve latest release tag for ${repo}" >&2
+  echo "failed to resolve release tag for ${repo}" >&2
+  echo "hint: pass --tag <release-tag> or authenticate gh with 'gh auth login'" >&2
   exit 1
 fi
 
@@ -85,7 +101,7 @@ fi
 echo "installing othala from ${repo} release ${tag} using ${method}"
 
 if [[ "$method" == "nix" ]]; then
-  nix profile install "github:${repo}/${tag}#othala"
+  nix profile install "git+ssh://git@github.com/${repo}.git?ref=${tag}#othala"
   exit 0
 fi
 
@@ -96,7 +112,7 @@ fi
 
 cargo_args=(
   install
-  --git "https://github.com/${repo}.git"
+  --git "ssh://git@github.com/${repo}.git"
   --tag "${tag}"
   --locked
   --package orchd
