@@ -2368,8 +2368,17 @@ fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
 }
 
 fn build_task_activity_lines(events: &[Event]) -> Vec<String> {
+    // Only show events from the most recent submit attempt so stale errors
+    // don't linger in the sidebar across retries.
+    let cutoff = events
+        .iter()
+        .rposition(|e| matches!(e.kind, EventKind::SubmitStarted { .. }));
+    let visible = match cutoff {
+        Some(idx) => &events[idx..],
+        None => events,
+    };
     let mut lines = Vec::new();
-    for event in events.iter().rev().take(24) {
+    for event in visible.iter().rev().take(24) {
         append_event_lines(&mut lines, event);
     }
     lines

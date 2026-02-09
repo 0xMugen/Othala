@@ -353,6 +353,9 @@ impl RuntimeEngine {
         // Abort any stuck rebase so move/restack can proceed.
         let _ = client.abort_rebase();
 
+        // Detach HEAD in sibling worktrees so gt restack can rebase their branches.
+        let detached = detach_sibling_worktrees(&self.git, repo_config, task);
+
         // Move onto the stack anchor before restacking so the branch is properly stacked.
         if let Some(anchor_branch) =
             select_stack_anchor_branch(&service.list_tasks()?, task)
@@ -377,6 +380,7 @@ impl RuntimeEngine {
 
         match client.restack_with_outcome() {
             Ok(RestackOutcome::Restacked) => {
+                reattach_worktrees(&self.git, &detached);
                 let _ = service.complete_restack(
                     &task.id,
                     false,
@@ -391,6 +395,7 @@ impl RuntimeEngine {
                 Ok(RestackTickOutcome::Restacked)
             }
             Ok(RestackOutcome::Conflict { .. }) => {
+                reattach_worktrees(&self.git, &detached);
                 let _ = service.complete_restack(
                     &task.id,
                     true,
@@ -405,6 +410,7 @@ impl RuntimeEngine {
                 Ok(RestackTickOutcome::Conflict)
             }
             Err(err) => {
+                reattach_worktrees(&self.git, &detached);
                 self.mark_task_failed(
                     service,
                     task,
@@ -556,8 +562,71 @@ impl RuntimeEngine {
             })?;
         }
 
+        // Sync trunk so gt submit sees an up-to-date remote.
+        let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
+        let _ = repo_client.sync_trunk();
+
+        // Detach HEAD in sibling worktrees so gt restack can rebase their branches.
+        let detached = detach_sibling_worktrees(&self.git, repo_config, task);
+
+        // Restack so graphite considers the stack clean before submit.
+        // On conflict or error, transition to Restacking so the conflict
+        // resolution agent can handle it, then re-submit after resolution.
+        match client.restack_with_outcome() {
+            Ok(RestackOutcome::Restacked) => {}
+            Ok(RestackOutcome::Conflict { stderr, .. }) => {
+                reattach_worktrees(&self.git, &detached);
+                service.record_event(&Event {
+                    id: event_id(&task.id, "SUBMIT-RESTACK-CONFLICT", at),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at,
+                    kind: EventKind::Error {
+                        code: "submit_restack_conflict".to_string(),
+                        message: format!(
+                            "restack conflict during submit for {}, delegating to agent: {stderr}",
+                            task.id.0
+                        ),
+                    },
+                })?;
+                let _ = service.transition_task_state(
+                    &task.id,
+                    TaskState::Restacking,
+                    event_id(&task.id, "SUBMIT-TO-RESTACK", at),
+                    at,
+                )?;
+                return Ok(false);
+            }
+            Err(err) => {
+                reattach_worktrees(&self.git, &detached);
+                service.record_event(&Event {
+                    id: event_id(&task.id, "SUBMIT-RESTACK-FAIL", at),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at,
+                    kind: EventKind::Error {
+                        code: "submit_restack_failed".to_string(),
+                        message: format!(
+                            "restack failed during submit for {}, delegating to agent: {err}",
+                            task.id.0
+                        ),
+                    },
+                })?;
+                let _ = service.transition_task_state(
+                    &task.id,
+                    TaskState::Restacking,
+                    event_id(&task.id, "SUBMIT-TO-RESTACK", at),
+                    at,
+                )?;
+                return Ok(false);
+            }
+        }
+
         let mode = repo_config.graphite.submit_mode.unwrap_or(task.submit_mode);
         let submit_result = client.submit(mode);
+
+        // Re-attach HEAD in sibling worktrees now that restack/submit is done.
+        reattach_worktrees(&self.git, &detached);
 
         let success = submit_result.is_ok();
         let failure_message = submit_result.err().map(|err| err.to_string());
@@ -733,6 +802,54 @@ fn select_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> 
                 .then_with(|| left.2.cmp(right.2))
         })
         .map(|(_, _, _, branch)| branch.to_string())
+}
+
+/// Detach HEAD in sibling worktrees so `gt restack` can rebase their branches.
+///
+/// Returns a list of `(worktree_path, branch)` pairs that were detached so
+/// callers can re-attach them later with [`reattach_worktrees`].
+fn detach_sibling_worktrees(
+    git: &GitCli,
+    repo_config: &RepoConfig,
+    current_task: &Task,
+) -> Vec<(PathBuf, String)> {
+    let repo = match discover_repo(&repo_config.repo_path, git) {
+        Ok(repo) => repo,
+        Err(_) => return Vec::new(),
+    };
+    let worktree_mgr = WorktreeManager::default();
+    let worktrees = match worktree_mgr.list(&repo) {
+        Ok(wts) => wts,
+        Err(_) => return Vec::new(),
+    };
+
+    let current_path = task_runtime_path(current_task, repo_config);
+    let mut detached = Vec::new();
+
+    for wt in &worktrees {
+        // Skip the current task's worktree and the main repo root.
+        if wt.path == current_path || wt.path == repo_config.repo_path {
+            continue;
+        }
+        // Only detach worktrees that have a branch checked out.
+        if let Some(branch) = &wt.branch {
+            if git
+                .run(&wt.path, ["checkout", "--detach", "HEAD"])
+                .is_ok()
+            {
+                detached.push((wt.path.clone(), branch.clone()));
+            }
+        }
+    }
+
+    detached
+}
+
+/// Re-attach HEAD to the original branch in previously detached worktrees.
+fn reattach_worktrees(git: &GitCli, detached: &[(PathBuf, String)]) {
+    for (path, branch) in detached {
+        let _ = git.run(path, ["checkout", branch.as_str()]);
+    }
 }
 
 fn render_verify_failure_summary(result: &orch_verify::VerifyResult) -> String {
