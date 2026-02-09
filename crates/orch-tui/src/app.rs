@@ -21,6 +21,9 @@ pub enum InputMode {
     NewChatPrompt {
         buffer: String,
     },
+    TaskIntervenePrompt {
+        buffer: String,
+    },
     ModelSelect {
         prompt: String,
         models: Vec<ModelKind>,
@@ -175,6 +178,14 @@ impl TuiApp {
             }
         }
 
+        if self.state.focused_task
+            && key.code == KeyCode::Char('i')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.begin_task_intervene_prompt();
+            return;
+        }
+
         let Some(command) = map_key_to_command(key) else {
             return;
         };
@@ -239,10 +250,14 @@ impl TuiApp {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        let InputMode::NewChatPrompt { buffer } = &mut self.input_mode else {
-            return;
-        };
-        buffer.push_str(&normalize_paste_text(text));
+        match &mut self.input_mode {
+            InputMode::NewChatPrompt { buffer } | InputMode::TaskIntervenePrompt { buffer } => {
+                buffer.push_str(&normalize_paste_text(text));
+            }
+            InputMode::Normal
+            | InputMode::ModelSelect { .. }
+            | InputMode::DeleteTaskConfirm { .. } => {}
+        }
     }
 
     fn begin_new_chat_prompt(&mut self) {
@@ -273,12 +288,37 @@ impl TuiApp {
         );
     }
 
+    fn begin_task_intervene_prompt(&mut self) {
+        let Some(task) = self.state.selected_task() else {
+            self.state.status_line = "no task selected to intervene".to_string();
+            return;
+        };
+        self.input_mode = InputMode::TaskIntervenePrompt {
+            buffer: String::new(),
+        };
+        self.state.status_line = format!(
+            "intervene on {}: type message, Enter=send Esc=cancel",
+            task.task_id.0
+        );
+    }
+
     pub fn input_prompt(&self) -> Option<&str> {
         match &self.input_mode {
             InputMode::Normal => None,
             InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
+            InputMode::TaskIntervenePrompt { .. } => None,
             InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
             InputMode::DeleteTaskConfirm { .. } => None,
+        }
+    }
+
+    pub fn task_intervene_prompt(&self) -> Option<&str> {
+        match &self.input_mode {
+            InputMode::TaskIntervenePrompt { buffer } => Some(buffer.as_str()),
+            InputMode::Normal
+            | InputMode::NewChatPrompt { .. }
+            | InputMode::ModelSelect { .. }
+            | InputMode::DeleteTaskConfirm { .. } => None,
         }
     }
 
@@ -319,6 +359,40 @@ impl TuiApp {
                     };
                     self.state.status_line =
                         "select model: Up/Down=cycle Enter=confirm Esc=cancel".to_string();
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(ch) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        buffer.push(ch);
+                    }
+                }
+                _ => {}
+            },
+            InputMode::TaskIntervenePrompt { buffer } => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = "task intervention canceled".to_string();
+                }
+                KeyCode::Enter => {
+                    let prompt = buffer.trim().to_string();
+                    if prompt.is_empty() {
+                        self.state.status_line = "intervention message cannot be empty".to_string();
+                        return true;
+                    }
+                    let task_id = self.state.selected_task().map(|task| task.task_id.clone());
+                    self.action_queue.push_back(QueuedAction {
+                        action: UiAction::RestartAgent,
+                        task_id: task_id.clone(),
+                        prompt: Some(prompt),
+                        model: None,
+                    });
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = match task_id {
+                        Some(task_id) => format!("queued intervention for {}", task_id.0),
+                        None => "queued intervention".to_string(),
+                    };
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -848,6 +922,97 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         app.handle_paste("line 1\r\nline 2\nline 3\rline 4");
         assert_eq!(app.input_prompt(), Some("line 1\nline 2\nline 3\nline 4"));
+    }
+
+    #[test]
+    fn focused_task_intervene_mode_queues_restart_with_prompt() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+            display_state: "Running".to_string(),
+        }];
+        app.state.focused_task = true;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::TaskIntervenePrompt { .. }
+        ));
+        assert_eq!(
+            app.state.status_line,
+            "intervene on T1: type message, Enter=send Esc=cancel"
+        );
+
+        for ch in "Investigate flaky integration test".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "queued intervention for T1");
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::RestartAgent);
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+        assert_eq!(
+            drained[0].prompt.as_deref(),
+            Some("Investigate flaky integration test")
+        );
+    }
+
+    #[test]
+    fn task_intervene_mode_escape_cancels_without_queueing_action() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+            display_state: "Running".to_string(),
+        }];
+        app.state.focused_task = true;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "task intervention canceled");
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn handle_paste_appends_multiline_text_while_in_intervene_mode() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+            display_state: "Running".to_string(),
+        }];
+        app.state.focused_task = true;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_paste("line 1\r\nline 2\nline 3");
+        assert_eq!(app.task_intervene_prompt(), Some("line 1\nline 2\nline 3"));
     }
 
     #[test]

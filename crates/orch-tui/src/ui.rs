@@ -24,6 +24,8 @@ const OUTPUT_FG: Color = Color::White;
 const FOOTER_DEFAULT_HEIGHT: u16 = 3;
 const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
 const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
+const TASK_INTERVENE_MIN_HEIGHT: u16 = 3;
+const TASK_INTERVENE_MAX_HEIGHT: u16 = 8;
 const THINKING_FRAMES: [&str; 4] = ["o..", ".o.", "..o", ".o."];
 
 fn state_color(state: TaskState) -> Color {
@@ -625,7 +627,15 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    let viewport_height = cols[1].height.saturating_sub(2) as usize;
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(task_intervene_bar_height(app, cols[1].width)),
+        ])
+        .split(cols[1]);
+
+    let viewport_height = right[0].height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
 
     // Left: task status checklist (Tasks tab) or graphite stack (Ready tab)
@@ -652,7 +662,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // Right: agent PTY output
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
-        lines.push(divider_line(cols[1].width));
+        lines.push(divider_line(right[0].width));
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = pane.window(output_cap, scroll_back);
         if window.is_empty() {
@@ -679,7 +689,8 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .border_style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(pty_widget, cols[1]);
+    frame.render_widget(pty_widget, right[0]);
+    render_task_intervene_bar(frame, right[1], app, task_pane);
 }
 
 // -- Footer -----------------------------------------------------------------
@@ -717,6 +728,87 @@ fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
             }
         })
         .sum()
+}
+
+fn task_intervene_bar_height(app: &TuiApp, width: u16) -> u16 {
+    let Some(prompt) = app.task_intervene_prompt() else {
+        return TASK_INTERVENE_MIN_HEIGHT;
+    };
+    let content_width = width.saturating_sub(4).max(1);
+    let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width);
+    let total_height = prompt_visual_lines.saturating_add(2);
+    u16::try_from(total_height)
+        .unwrap_or(TASK_INTERVENE_MAX_HEIGHT)
+        .clamp(TASK_INTERVENE_MIN_HEIGHT, TASK_INTERVENE_MAX_HEIGHT)
+}
+
+fn focused_task_activity_indicator(task_pane: Option<&AgentPane>) -> Option<(String, Color)> {
+    let pane = task_pane.filter(|pane| pane_status_active(pane.status))?;
+    let frame = animation_frame_now();
+    let (activity, color) = status_activity(pane.status, frame)?;
+    Some((format!("{} {activity}", pane.instance_id), color))
+}
+
+fn render_task_intervene_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    task_pane: Option<&AgentPane>,
+) {
+    let mut lines = Vec::new();
+    let mut status_spans = Vec::new();
+    status_spans.push(Span::styled(" ", Style::default().fg(DIM)));
+    if let Some((activity, color)) = focused_task_activity_indicator(task_pane) {
+        status_spans.push(Span::styled("thinking: ", Style::default().fg(DIM)));
+        status_spans.push(Span::styled(
+            activity,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        status_spans.push(Span::styled("thinking: idle", Style::default().fg(DIM)));
+    }
+    status_spans.push(Span::styled("  ", Style::default().fg(DIM)));
+    if app.task_intervene_prompt().is_some() {
+        status_spans.push(Span::styled(
+            "Enter=send Esc=cancel",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        status_spans.push(Span::styled("i=intervene", Style::default().fg(DIM)));
+    }
+    lines.push(Line::from(status_spans));
+
+    if let Some(prompt) = app.task_intervene_prompt() {
+        let prompt_lines: Vec<&str> = prompt.split('\n').collect();
+        for (idx, prompt_line) in prompt_lines.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(" ", Style::default().fg(DIM)),
+                Span::styled(*prompt_line, Style::default().fg(HEADER_FG)),
+            ];
+            if idx + 1 == prompt_lines.len() {
+                spans.push(Span::styled("_", Style::default().fg(ACCENT)));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" ", Style::default().fg(DIM)),
+            Span::styled(
+                "type i to send guidance to this task",
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+
+    let block = if app.task_intervene_prompt().is_some() {
+        focused_block("Intervene")
+    } else {
+        normal_block("Intervene")
+    };
+    let widget = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -779,6 +871,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         spans.push(Span::raw(" "));
         let keys: &[(&str, &str)] = &[
             ("c", "chat"),
+            ("i", "intervene"),
             ("a", "approve"),
             ("g", "submit"),
             ("s", "start"),
@@ -815,12 +908,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Style::default().fg(DIM),
             ));
         }
-        if let Some((activity, color)) = footer_activity_indicator(app) {
-            spans.push(Span::styled(" | thinking: ", Style::default().fg(DIM)));
-            spans.push(Span::styled(
-                activity,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
+        if !app.state.focused_task {
+            if let Some((activity, color)) = footer_activity_indicator(app) {
+                spans.push(Span::styled(" | thinking: ", Style::default().fg(DIM)));
+                spans.push(Span::styled(
+                    activity,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         if !app.state.status_line.is_empty() {
             spans.push(Span::styled(" | status: ", Style::default().fg(DIM)));
@@ -1493,8 +1588,8 @@ mod tests {
 
     use super::{
         footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
-        status_activity, status_line_color, status_sidebar_lines, to_local_time,
-        wrapped_visual_line_count, OutputBlockState,
+        status_activity, status_line_color, status_sidebar_lines, task_intervene_bar_height,
+        to_local_time, wrapped_visual_line_count, OutputBlockState,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1612,6 +1707,24 @@ mod tests {
             buffer: "x".repeat(4000),
         };
         assert_eq!(footer_height(&app, 40), 12);
+    }
+
+    #[test]
+    fn task_intervene_bar_height_defaults_and_expands_for_multiline_prompt() {
+        use crate::app::InputMode;
+
+        let mut app = TuiApp::default();
+        assert_eq!(task_intervene_bar_height(&app, 100), 3);
+
+        app.input_mode = InputMode::TaskIntervenePrompt {
+            buffer: "short prompt".to_string(),
+        };
+        assert_eq!(task_intervene_bar_height(&app, 100), 3);
+
+        app.input_mode = InputMode::TaskIntervenePrompt {
+            buffer: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string(),
+        };
+        assert!(task_intervene_bar_height(&app, 30) > 3);
     }
 
     #[test]
