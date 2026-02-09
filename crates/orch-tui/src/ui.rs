@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, AgentPaneStatus, TaskOverviewRow};
+use crate::model::{AgentPane, AgentPaneStatus, DashboardTab, TaskOverviewRow};
 
 // -- Color palette ----------------------------------------------------------
 
@@ -354,6 +354,21 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .map(|pane| pane.instance_id.as_str())
         .unwrap_or("-");
 
+    let (tasks_tab_style, ready_tab_style) = match app.state.active_tab {
+        DashboardTab::Tasks => (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(DIM),
+        ),
+        DashboardTab::Ready => (
+            Style::default().fg(DIM),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
     let line = Line::from(vec![
         Span::styled(
             " Othala ",
@@ -361,7 +376,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .fg(HEADER_TITLE)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" tasks:", Style::default().fg(DIM)),
+        Span::styled("[Tasks]", tasks_tab_style),
+        Span::styled(" ", Style::default().fg(DIM)),
+        Span::styled("[Ready]", ready_tab_style),
+        Span::styled("  tasks:", Style::default().fg(DIM)),
         Span::styled(
             format!("{}", app.state.tasks.len()),
             Style::default().fg(HEADER_FG),
@@ -388,6 +406,42 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
 
+    // Tab bar
+    let tasks_count = app
+        .state
+        .tasks
+        .iter()
+        .filter(|t| !crate::model::DashboardState::is_ready_state(t.state))
+        .count();
+    let ready_count = app
+        .state
+        .tasks
+        .iter()
+        .filter(|t| crate::model::DashboardState::is_ready_state(t.state))
+        .count();
+
+    let (tasks_style, ready_style) = match app.state.active_tab {
+        DashboardTab::Tasks => (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(DIM),
+        ),
+        DashboardTab::Ready => (
+            Style::default().fg(DIM),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!(" Tasks ({tasks_count})"), tasks_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(format!("Ready ({ready_count})"), ready_style),
+        Span::styled("  Shift+Tab=switch", Style::default().fg(DIM)),
+    ]));
+
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
         " repo | task | title | state | verify | review | activity",
@@ -400,20 +454,29 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Style::default().fg(DIM),
     )));
 
-    for (idx, task) in app.state.tasks.iter().enumerate() {
-        let is_selected = idx == app.state.selected_task_idx;
+    let visible = app.state.visible_task_indices();
+    let tab_idx = app.state.selected_tab_idx();
+
+    for (view_idx, &task_idx) in visible.iter().enumerate() {
+        let task = &app.state.tasks[task_idx];
+        let is_selected = view_idx == tab_idx;
         lines.push(format_task_row(is_selected, task));
     }
 
-    if app.state.tasks.is_empty() {
+    if visible.is_empty() {
         lines.push(Line::from(Span::styled(
             " no tasks",
             Style::default().fg(DIM),
         )));
     }
 
+    let block_title = match app.state.active_tab {
+        DashboardTab::Tasks => "Tasks",
+        DashboardTab::Ready => "Ready",
+    };
+
     let widget = Paragraph::new(lines)
-        .block(normal_block("Tasks"))
+        .block(normal_block(block_title))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -540,9 +603,23 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let viewport_height = cols[1].height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
 
-    // Left: task status checklist
-    let status_title = format!("Status ({task_id_str})");
-    let status_widget = Paragraph::new(status_sidebar_lines(selected_task, &app.state.selected_task_activity))
+    // Left: task status checklist (Tasks tab) or graphite stack (Ready tab)
+    let (status_title, sidebar_lines) = match app.state.active_tab {
+        DashboardTab::Ready => (
+            format!("Stack ({task_id_str})"),
+            graphite_sidebar_lines(
+                selected_task,
+                &app.state.graphite_stack_lines,
+                &app.state.graphite_status_lines,
+                &app.state.selected_task_activity,
+            ),
+        ),
+        DashboardTab::Tasks => (
+            format!("Status ({task_id_str})"),
+            status_sidebar_lines(selected_task, &app.state.selected_task_activity),
+        ),
+    };
+    let status_widget = Paragraph::new(sidebar_lines)
         .block(focused_block(&status_title))
         .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
@@ -703,12 +780,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         if app.state.focused_task || app.state.focused_pane_idx.is_some() {
             spans.push(Span::styled(
-                "| \u{2191}\u{2193}=scroll PgUp/Dn=page Home/End=top/bottom esc=back",
+                "| \u{2191}\u{2193}=scroll PgUp/Dn=page Home/End=top/bottom Shift+Tab=tab esc=back",
                 Style::default().fg(DIM),
             ));
         } else {
             spans.push(Span::styled(
-                "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
+                "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail Shift+Tab=tab esc=quit",
                 Style::default().fg(DIM),
             ));
         }
@@ -1263,6 +1340,114 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> 
     lines
 }
 
+pub fn graphite_sidebar_lines(
+    task: Option<&TaskOverviewRow>,
+    stack_lines: &[String],
+    status_lines: &[String],
+    activity: &[String],
+) -> Vec<Line<'static>> {
+    let Some(task) = task else {
+        return vec![Line::from(Span::styled(
+            "no task selected",
+            Style::default().fg(DIM),
+        ))];
+    };
+
+    let mut lines = Vec::new();
+
+    // Section 1: branch name + state
+    lines.push(Line::from(vec![
+        Span::styled("branch: ", Style::default().fg(DIM)),
+        Span::styled(task.branch.clone(), Style::default().fg(ACCENT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("state: ", Style::default().fg(DIM)),
+        Span::styled(
+            task.display_state.clone(),
+            Style::default()
+                .fg(display_state_color(task.state, &task.display_state))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Section 2: graphite stack
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "graphite stack",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    if stack_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no stack data",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for raw_line in stack_lines {
+            let color = if raw_line.contains(&task.branch) {
+                Color::Green
+            } else {
+                MUTED
+            };
+            lines.push(Line::from(Span::styled(
+                raw_line.clone(),
+                Style::default().fg(color),
+            )));
+        }
+    }
+
+    // Section 3: graphite status
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "graphite status",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    if status_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no status data",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for raw_line in status_lines {
+            lines.push(Line::from(Span::styled(
+                raw_line.clone(),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    // Section 4: condensed activity tail (last 6 entries)
+    if !activity.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "activity",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        let tail = if activity.len() > 6 {
+            &activity[activity.len() - 6..]
+        } else {
+            activity
+        };
+        for entry in tail {
+            let lower = entry.to_lowercase();
+            let color = if lower.contains("error") {
+                Color::Red
+            } else if lower.contains("submit") {
+                Color::Yellow
+            } else if lower.contains("restack") {
+                Color::Cyan
+            } else {
+                DIM
+            };
+            lines.push(Line::from(Span::styled(
+                entry.clone(),
+                Style::default().fg(color),
+            )));
+        }
+    }
+
+    lines
+}
+
 fn to_local_time(value: DateTime<Utc>) -> String {
     value
         .with_timezone(&Local)
@@ -1754,5 +1939,73 @@ mod tests {
         let default_state = OutputBlockState::default();
         let style = output_line_style("[agent exited code=0]", &default_state);
         assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn graphite_sidebar_lines_renders_stack_and_status_sections() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::AwaitingMerge;
+        row.display_state = "AwaitingMerge".to_string();
+        row.branch = "task/T1".to_string();
+
+        let stack = vec![
+            "  main".to_string(),
+            "* task/T1".to_string(),
+            "  task/T2".to_string(),
+        ];
+        let status = vec!["all branches submitted".to_string()];
+
+        let rendered = super::graphite_sidebar_lines(Some(&row), &stack, &status, &[]);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("branch: task/T1")));
+        assert!(text.iter().any(|line| line.contains("graphite stack")));
+        assert!(text.iter().any(|line| line.contains("* task/T1")));
+        assert!(text.iter().any(|line| line.contains("graphite status")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("all branches submitted")));
+    }
+
+    #[test]
+    fn graphite_sidebar_lines_highlights_current_branch() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::AwaitingMerge;
+        row.display_state = "AwaitingMerge".to_string();
+        row.branch = "task/T1".to_string();
+
+        let stack = vec![
+            "  main".to_string(),
+            "* task/T1".to_string(),
+        ];
+
+        let rendered = super::graphite_sidebar_lines(Some(&row), &stack, &[], &[]);
+        // Find the line containing task/T1 and verify it's green
+        for line in &rendered {
+            for span in &line.spans {
+                if span.content.contains("* task/T1") {
+                    assert_eq!(span.style.fg, Some(Color::Green));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graphite_sidebar_lines_with_empty_data_shows_no_stack_data() {
+        let mut row = mk_row("T1");
+        row.state = TaskState::AwaitingMerge;
+        row.display_state = "AwaitingMerge".to_string();
+
+        let rendered = super::graphite_sidebar_lines(Some(&row), &[], &[], &[]);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("no stack data")));
+        assert!(text.iter().any(|line| line.contains("no status data")));
     }
 }

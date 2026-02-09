@@ -20,8 +20,8 @@ use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orch_git::{discover_repo, GitCli, GitError, WorktreeManager};
 use orch_graphite::GraphiteClient;
 use orch_tui::{
-    normalize_pane_line, run_tui_with_hook, AgentPane, AgentPaneStatus, TuiApp, TuiError, TuiEvent,
-    UiAction,
+    normalize_pane_line, run_tui_with_hook, AgentPane, AgentPaneStatus, DashboardTab, TuiApp,
+    TuiError, TuiEvent, UiAction,
 };
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -680,6 +680,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
         }
 
         refresh_selected_task_activity(app, &service);
+        refresh_graphite_info(app, &repo_config_by_id);
     });
     agent_supervisor.stop_all();
     tui_result?;
@@ -2365,6 +2366,52 @@ fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
     };
 
     app.state.selected_task_activity = build_task_activity_lines(&events);
+}
+
+fn refresh_graphite_info(
+    app: &mut TuiApp,
+    repo_config_by_id: &HashMap<String, RepoConfig>,
+) {
+    if app.state.active_tab != DashboardTab::Ready {
+        app.state.graphite_stack_lines.clear();
+        app.state.graphite_status_lines.clear();
+        return;
+    }
+
+    let Some(task) = app.state.selected_task() else {
+        app.state.graphite_stack_lines.clear();
+        app.state.graphite_status_lines.clear();
+        return;
+    };
+
+    let repo_id = task.repo_id.0.clone();
+    let Some(repo_cfg) = repo_config_by_id.get(&repo_id) else {
+        app.state.graphite_stack_lines = vec![format!("repo config not found: {repo_id}")];
+        app.state.graphite_status_lines.clear();
+        return;
+    };
+
+    let client = GraphiteClient::new(&repo_cfg.repo_path);
+
+    match client.log_short_snapshot() {
+        Ok(snapshot) => {
+            app.state.graphite_stack_lines =
+                snapshot.nodes.iter().map(|n| n.raw_line.clone()).collect();
+        }
+        Err(err) => {
+            app.state.graphite_stack_lines = vec![format!("gt log short error: {err}")];
+        }
+    }
+
+    match client.status_snapshot() {
+        Ok(snapshot) => {
+            app.state.graphite_status_lines =
+                snapshot.raw.lines().map(|l| l.to_string()).collect();
+        }
+        Err(err) => {
+            app.state.graphite_status_lines = vec![format!("gt status error: {err}")];
+        }
+    }
 }
 
 fn build_task_activity_lines(events: &[Event]) -> Vec<String> {

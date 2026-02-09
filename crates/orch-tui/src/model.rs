@@ -4,6 +4,13 @@ use orch_core::types::{ModelKind, RepoId, Task, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DashboardTab {
+    #[default]
+    Tasks,
+    Ready,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOverviewRow {
     pub task_id: TaskId,
@@ -249,6 +256,12 @@ pub struct DashboardState {
     pub status_line: String,
     /// Lines scrolled back from the bottom in focused views. 0 = latest output.
     pub scroll_back: usize,
+    pub active_tab: DashboardTab,
+    pub ready_tab_selected_idx: usize,
+    /// Raw lines from `gt log short` for the graphite stack sidebar.
+    pub graphite_stack_lines: Vec<String>,
+    /// Raw lines from `gt status` for the graphite stack sidebar.
+    pub graphite_status_lines: Vec<String>,
 }
 
 impl Default for DashboardState {
@@ -263,6 +276,10 @@ impl Default for DashboardState {
             focused_task: false,
             status_line: "ready".to_string(),
             scroll_back: 0,
+            active_tab: DashboardTab::default(),
+            ready_tab_selected_idx: 0,
+            graphite_stack_lines: Vec::new(),
+            graphite_status_lines: Vec::new(),
         }
     }
 }
@@ -276,8 +293,64 @@ impl DashboardState {
         }
     }
 
+    /// Whether a task state belongs in the Ready tab.
+    pub fn is_ready_state(state: TaskState) -> bool {
+        matches!(state, TaskState::AwaitingMerge | TaskState::Merged)
+    }
+
+    /// Return indices of `self.tasks` that are visible in the current tab.
+    pub fn visible_task_indices(&self) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| match self.active_tab {
+                DashboardTab::Tasks => !Self::is_ready_state(task.state),
+                DashboardTab::Ready => Self::is_ready_state(task.state),
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Resolve the selected task through the filtered view of the current tab.
+    pub fn selected_tab_task(&self) -> Option<&TaskOverviewRow> {
+        let visible = self.visible_task_indices();
+        let tab_idx = self.selected_tab_idx();
+        visible.get(tab_idx).and_then(|&i| self.tasks.get(i))
+    }
+
+    /// Get the per-tab selection index.
+    pub fn selected_tab_idx(&self) -> usize {
+        match self.active_tab {
+            DashboardTab::Tasks => self.selected_task_idx,
+            DashboardTab::Ready => self.ready_tab_selected_idx,
+        }
+    }
+
+    /// Get a mutable reference to the per-tab selection index.
+    pub fn selected_tab_idx_mut(&mut self) -> &mut usize {
+        match self.active_tab {
+            DashboardTab::Tasks => &mut self.selected_task_idx,
+            DashboardTab::Ready => &mut self.ready_tab_selected_idx,
+        }
+    }
+
+    /// Switch to a different tab, clamping the selection index.
+    pub fn switch_tab(&mut self, tab: DashboardTab) {
+        self.active_tab = tab;
+        let visible = self.visible_task_indices();
+        let idx = self.selected_tab_idx_mut();
+        if visible.is_empty() {
+            *idx = 0;
+        } else if *idx >= visible.len() {
+            *idx = visible.len() - 1;
+        }
+    }
+
+    /// Returns the currently selected task, filtered through the active tab.
+    /// All call sites (push_action, delete confirm, focused task, header) use
+    /// this and automatically work with the filtered view.
     pub fn selected_task(&self) -> Option<&TaskOverviewRow> {
-        self.tasks.get(self.selected_task_idx)
+        self.selected_tab_task()
     }
 
     pub fn selected_pane(&self) -> Option<&AgentPane> {
@@ -289,22 +362,26 @@ impl DashboardState {
     }
 
     pub fn move_task_selection_next(&mut self) {
-        if self.tasks.is_empty() {
-            self.selected_task_idx = 0;
+        let visible = self.visible_task_indices();
+        let idx = self.selected_tab_idx_mut();
+        if visible.is_empty() {
+            *idx = 0;
             return;
         }
-        self.selected_task_idx = (self.selected_task_idx + 1) % self.tasks.len();
+        *idx = (*idx + 1) % visible.len();
     }
 
     pub fn move_task_selection_previous(&mut self) {
-        if self.tasks.is_empty() {
-            self.selected_task_idx = 0;
+        let visible = self.visible_task_indices();
+        let idx = self.selected_tab_idx_mut();
+        if visible.is_empty() {
+            *idx = 0;
             return;
         }
-        self.selected_task_idx = if self.selected_task_idx == 0 {
-            self.tasks.len() - 1
+        *idx = if *idx == 0 {
+            visible.len() - 1
         } else {
-            self.selected_task_idx - 1
+            *idx - 1
         };
     }
 
@@ -405,7 +482,7 @@ mod tests {
     };
     use orch_core::types::{ModelKind, RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
 
-    use super::{normalize_pane_line, AgentPane, DashboardState, TaskOverviewRow};
+    use super::{normalize_pane_line, AgentPane, DashboardState, DashboardTab, TaskOverviewRow};
 
     fn mk_task(id: &str) -> Task {
         Task {
@@ -651,5 +728,97 @@ mod tests {
         pane.append_line("\u{1b}[2K\u{1b}[0m");
 
         assert_eq!(pane.tail(10), vec!["updated src/lib.rs".to_string()]);
+    }
+
+    fn mk_row_with_state(id: &str, state: TaskState) -> TaskOverviewRow {
+        let mut task = mk_task(id);
+        task.state = state;
+        TaskOverviewRow::from_task(&task)
+    }
+
+    #[test]
+    fn visible_task_indices_returns_correct_subsets_for_each_tab() {
+        let mut state = DashboardState::default();
+        state.tasks = vec![
+            mk_row_with_state("T1", TaskState::Running),
+            mk_row_with_state("T2", TaskState::AwaitingMerge),
+            mk_row_with_state("T3", TaskState::Merged),
+            mk_row_with_state("T4", TaskState::Reviewing),
+        ];
+
+        state.active_tab = DashboardTab::Tasks;
+        assert_eq!(state.visible_task_indices(), vec![0, 3]);
+
+        state.active_tab = DashboardTab::Ready;
+        assert_eq!(state.visible_task_indices(), vec![1, 2]);
+    }
+
+    #[test]
+    fn switch_tab_clamps_out_of_bounds_selection() {
+        let mut state = DashboardState::default();
+        state.tasks = vec![
+            mk_row_with_state("T1", TaskState::Running),
+            mk_row_with_state("T2", TaskState::AwaitingMerge),
+        ];
+        state.ready_tab_selected_idx = 10;
+        state.switch_tab(DashboardTab::Ready);
+        assert_eq!(state.ready_tab_selected_idx, 0); // only 1 ready task
+        assert_eq!(state.active_tab, DashboardTab::Ready);
+    }
+
+    #[test]
+    fn move_task_selection_wraps_within_filtered_view() {
+        let mut state = DashboardState::default();
+        state.tasks = vec![
+            mk_row_with_state("T1", TaskState::Running),
+            mk_row_with_state("T2", TaskState::AwaitingMerge),
+            mk_row_with_state("T3", TaskState::Merged),
+            mk_row_with_state("T4", TaskState::Reviewing),
+        ];
+
+        state.active_tab = DashboardTab::Ready;
+        state.ready_tab_selected_idx = 0;
+
+        // Next wraps: 0 -> 1
+        state.move_task_selection_next();
+        assert_eq!(state.ready_tab_selected_idx, 1);
+
+        // Next wraps: 1 -> 0
+        state.move_task_selection_next();
+        assert_eq!(state.ready_tab_selected_idx, 0);
+
+        // Previous wraps: 0 -> 1
+        state.move_task_selection_previous();
+        assert_eq!(state.ready_tab_selected_idx, 1);
+    }
+
+    #[test]
+    fn selected_task_returns_correct_task_per_tab() {
+        let mut state = DashboardState::default();
+        state.tasks = vec![
+            mk_row_with_state("T1", TaskState::Running),
+            mk_row_with_state("T2", TaskState::AwaitingMerge),
+            mk_row_with_state("T3", TaskState::Reviewing),
+        ];
+
+        state.active_tab = DashboardTab::Tasks;
+        state.selected_task_idx = 0;
+        assert_eq!(
+            state.selected_task().map(|t| t.task_id.0.as_str()),
+            Some("T1")
+        );
+
+        state.selected_task_idx = 1;
+        assert_eq!(
+            state.selected_task().map(|t| t.task_id.0.as_str()),
+            Some("T3")
+        );
+
+        state.active_tab = DashboardTab::Ready;
+        state.ready_tab_selected_idx = 0;
+        assert_eq!(
+            state.selected_task().map(|t| t.task_id.0.as_str()),
+            Some("T2")
+        );
     }
 }

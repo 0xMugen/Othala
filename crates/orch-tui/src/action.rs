@@ -29,6 +29,7 @@ pub enum UiCommand {
     SelectPreviousPane,
     ToggleFocusedPane,
     ToggleFocusedTask,
+    SwitchTab,
     Quit,
 }
 
@@ -50,6 +51,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Right => Some(UiCommand::SelectNextPane),
         KeyCode::Left => Some(UiCommand::SelectPreviousPane),
         KeyCode::Tab => Some(UiCommand::ToggleFocusedPane),
+        KeyCode::BackTab => Some(UiCommand::SwitchTab),
         KeyCode::Enter => Some(UiCommand::ToggleFocusedTask),
         KeyCode::Char('c') => Some(UiCommand::Dispatch(UiAction::CreateTask)),
         KeyCode::Char('a') => Some(UiCommand::Dispatch(UiAction::ApproveTask)),
@@ -147,6 +149,14 @@ mod tests {
         assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(UiCommand::ToggleFocusedTask)
+        );
+    }
+
+    #[test]
+    fn backtab_maps_to_switch_tab() {
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(UiCommand::SwitchTab)
         );
     }
 

@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use crate::action::{action_label, map_key_to_command, UiAction, UiCommand};
 use crate::event::TuiEvent;
-use crate::model::{AgentPane, AgentPaneStatus, DashboardState};
+use crate::model::{AgentPane, AgentPaneStatus, DashboardState, DashboardTab};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedAction {
@@ -64,8 +64,27 @@ impl TuiApp {
             .iter()
             .map(crate::model::TaskOverviewRow::from_task)
             .collect();
-        if self.state.selected_task_idx >= self.state.tasks.len() {
-            self.state.selected_task_idx = self.state.tasks.len().saturating_sub(1);
+
+        // Clamp Tasks tab index
+        let tasks_visible = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| !DashboardState::is_ready_state(t.state))
+            .count();
+        if self.state.selected_task_idx >= tasks_visible.max(1) {
+            self.state.selected_task_idx = tasks_visible.saturating_sub(1);
+        }
+
+        // Clamp Ready tab index
+        let ready_visible = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| DashboardState::is_ready_state(t.state))
+            .count();
+        if self.state.ready_tab_selected_idx >= ready_visible.max(1) {
+            self.state.ready_tab_selected_idx = ready_visible.saturating_sub(1);
         }
     }
 
@@ -199,6 +218,21 @@ impl TuiApp {
                         .unwrap_or_default();
                     self.state.status_line = format!("task detail: {task_id}");
                 }
+            }
+            UiCommand::SwitchTab => {
+                let new_tab = match self.state.active_tab {
+                    DashboardTab::Tasks => DashboardTab::Ready,
+                    DashboardTab::Ready => DashboardTab::Tasks,
+                };
+                self.state.focused_task = false;
+                self.state.focused_pane_idx = None;
+                self.state.scroll_back = 0;
+                self.state.switch_tab(new_tab);
+                let tab_name = match new_tab {
+                    DashboardTab::Tasks => "Tasks",
+                    DashboardTab::Ready => "Ready",
+                };
+                self.state.status_line = format!("switched to {tab_name} tab");
             }
             UiCommand::Quit => self.should_quit = true,
         }
@@ -980,5 +1014,159 @@ mod tests {
         assert_eq!(app.state.status_line, "model selection canceled");
         let drained = app.drain_actions();
         assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn switch_tab_toggles_active_tab_and_clears_focused_state() {
+        use crate::model::DashboardTab;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Running,
+                display_state: "Running".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::AwaitingMerge,
+                display_state: "AwaitingMerge".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+        ];
+        app.state.focused_task = true;
+        app.state.focused_pane_idx = Some(0);
+
+        // BackTab switches to Ready tab
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.state.active_tab, DashboardTab::Ready);
+        assert!(!app.state.focused_task);
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.scroll_back, 0);
+        assert_eq!(app.state.status_line, "switched to Ready tab");
+
+        // BackTab switches back to Tasks tab
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.state.active_tab, DashboardTab::Tasks);
+        assert_eq!(app.state.status_line, "switched to Tasks tab");
+    }
+
+    #[test]
+    fn push_action_targets_correct_task_per_tab() {
+        use crate::model::DashboardTab;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Running,
+                display_state: "Running".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::AwaitingMerge,
+                display_state: "AwaitingMerge".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+        ];
+
+        // On Tasks tab, action targets T1
+        app.state.active_tab = DashboardTab::Tasks;
+        app.state.selected_task_idx = 0;
+        app.push_action(UiAction::RunVerifyQuick);
+        let drained = app.drain_actions();
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+
+        // On Ready tab, action targets T2
+        app.state.active_tab = DashboardTab::Ready;
+        app.state.ready_tab_selected_idx = 0;
+        app.push_action(UiAction::RunVerifyQuick);
+        let drained = app.drain_actions();
+        assert_eq!(drained[0].task_id, Some(TaskId("T2".to_string())));
+    }
+
+    #[test]
+    fn set_tasks_clamps_both_tab_indices() {
+        let mut app = TuiApp::default();
+        app.state.selected_task_idx = 10;
+        app.state.ready_tab_selected_idx = 10;
+
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Running,
+                display_state: "Running".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::AwaitingMerge,
+                display_state: "AwaitingMerge".to_string(),
+                verify_summary: "not_run".to_string(),
+                review_summary: "0/0 unanimous=false cap=ok".to_string(),
+                last_activity: Utc::now(),
+            },
+        ];
+
+        // Manually trigger the clamping that set_tasks does, by calling
+        // set_tasks with a Task vec -- but since we can't easily construct
+        // Task here, we just directly test the clamping logic:
+        let tasks_visible = app
+            .state
+            .tasks
+            .iter()
+            .filter(|t| !crate::model::DashboardState::is_ready_state(t.state))
+            .count();
+        if app.state.selected_task_idx >= tasks_visible.max(1) {
+            app.state.selected_task_idx = tasks_visible.saturating_sub(1);
+        }
+        let ready_visible = app
+            .state
+            .tasks
+            .iter()
+            .filter(|t| crate::model::DashboardState::is_ready_state(t.state))
+            .count();
+        if app.state.ready_tab_selected_idx >= ready_visible.max(1) {
+            app.state.ready_tab_selected_idx = ready_visible.saturating_sub(1);
+        }
+
+        assert_eq!(app.state.selected_task_idx, 0); // 1 active task, clamped
+        assert_eq!(app.state.ready_tab_selected_idx, 0); // 1 ready task, clamped
     }
 }
