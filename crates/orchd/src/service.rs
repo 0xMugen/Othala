@@ -707,7 +707,7 @@ impl OrchdService {
         let current_state = task.state;
         if !matches!(
             current_state,
-            TaskState::RestackConflict | TaskState::Restacking
+            TaskState::RestackConflict | TaskState::Restacking | TaskState::Failed
         ) {
             return Err(ServiceError::StateMachine(
                 StateMachineError::InvalidTransition {
@@ -717,7 +717,10 @@ impl OrchdService {
             ));
         }
 
-        if current_state == TaskState::RestackConflict {
+        if matches!(
+            current_state,
+            TaskState::RestackConflict | TaskState::Failed
+        ) {
             self.apply_transition_with_state_event(
                 &mut task,
                 TaskState::Restacking,

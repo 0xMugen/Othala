@@ -552,11 +552,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                                 format!("conflict resolved for {}; restack continuing", task_id.0);
                         }
                         Err(reason) => {
-                            app.state.status_line = format!(
-                                "conflict resolution post-steps failed for {}: {reason}",
-                                task_id.0
-                            );
-                            let _ = service.mark_needs_human(
+                            match service.mark_needs_human(
                                 &task_id,
                                 &format!("conflict resolution failed: {reason}"),
                                 orchd::MarkNeedsHumanEventIds {
@@ -566,7 +562,20 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                                     needs_human_event: tui_event_id(&task_id, "CR-NH-E", at),
                                 },
                                 at,
-                            );
+                            ) {
+                                Ok(_) => {
+                                    app.state.status_line = format!(
+                                        "conflict resolution failed for {}: {reason}; marked needs-human",
+                                        task_id.0
+                                    );
+                                }
+                                Err(nh_err) => {
+                                    app.state.status_line = format!(
+                                        "conflict resolution failed for {}: {reason} (also failed to mark needs-human: {nh_err})",
+                                        task_id.0
+                                    );
+                                }
+                            }
                         }
                     }
                 }
