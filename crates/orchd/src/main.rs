@@ -4947,6 +4947,7 @@ Fix flaky task scheduling by debouncing tick updates";
         );
 
         assert!(prompt.contains("Global context (shared across all tasks in this repo):"));
+        assert!(prompt.contains(".orch/context/global.md"));
         assert!(prompt.contains(".orch/context/core.md"));
         assert!(prompt.contains("Use compartment-based loading:"));
         assert!(prompt.contains("main-diff-latest.md"));

@@ -10,6 +10,7 @@ use orch_git::{GitCli, GitError};
 const CONTEXT_ROOT: &str = ".orch/context";
 const COMPARTMENTS_DIR: &str = "compartments";
 const UPDATES_DIR: &str = "updates";
+const GLOBAL_FILE: &str = "global.md";
 const CORE_FILE: &str = "core.md";
 const LATEST_MAIN_DIFF_FILE: &str = "main-diff-latest.md";
 
@@ -44,6 +45,7 @@ pub enum GlobalContextError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalContextPaths {
     pub context_root: PathBuf,
+    pub global_path: PathBuf,
     pub core_path: PathBuf,
     pub compartments_dir: PathBuf,
     pub updates_dir: PathBuf,
@@ -116,6 +118,7 @@ pub fn ensure_global_context_layout(
     let context_root = repo_root.join(CONTEXT_ROOT);
     let compartments_dir = context_root.join(COMPARTMENTS_DIR);
     let updates_dir = context_root.join(UPDATES_DIR);
+    let global_path = context_root.join(GLOBAL_FILE);
     let core_path = context_root.join(CORE_FILE);
     let latest_main_diff_path = updates_dir.join(LATEST_MAIN_DIFF_FILE);
     let branch_head_marker = context_root.join(format!(
@@ -127,7 +130,9 @@ pub fn ensure_global_context_layout(
     ensure_dir(&compartments_dir)?;
     ensure_dir(&updates_dir)?;
 
-    write_if_missing(&core_path, &render_core(base_branch))?;
+    let core_content = render_core(base_branch);
+    write_if_missing(&global_path, &core_content)?;
+    write_if_missing(&core_path, &core_content)?;
     for compartment in ContextCompartment::all() {
         let path = compartments_dir.join(compartment.file_name());
         write_if_missing(&path, &render_compartment(*compartment))?;
@@ -139,6 +144,7 @@ pub fn ensure_global_context_layout(
 
     Ok(GlobalContextPaths {
         context_root,
+        global_path,
         core_path,
         compartments_dir,
         updates_dir,
@@ -303,12 +309,14 @@ pub fn build_task_context_prompt(
 
     Ok(format!(
         "Global context (shared across all tasks in this repo):\n\
-Core file: {}\n\
+Global file: {}\n\
+Core file (legacy alias): {}\n\
 Use compartment-based loading:\n\
-1. Read the core file first.\n\
+1. Read the global file first.\n\
 2. Only read the compartment files below unless you discover a concrete need.\n\
 {}\n\
 3. If base-branch changes are relevant, read: {}",
+        paths.global_path.display(),
         paths.core_path.display(),
         selected_lines,
         paths.latest_main_diff_path.display()
@@ -722,6 +730,7 @@ mod tests {
         let root = unique_temp_dir("layout");
         let paths = ensure_global_context_layout(&root, "main").expect("ensure layout");
 
+        assert!(paths.global_path.exists());
         assert!(paths.core_path.exists());
         assert!(paths.compartments_dir.join("repo-map.md").exists());
         assert!(paths.compartments_dir.join("architecture.md").exists());
@@ -729,6 +738,10 @@ mod tests {
         assert!(paths.compartments_dir.join("quality.md").exists());
         assert!(paths.compartments_dir.join("main-diff.md").exists());
         assert!(paths.latest_main_diff_path.exists());
+
+        let global = fs::read_to_string(&paths.global_path).expect("read global");
+        assert!(global.contains("compartments/repo-map.md"));
+        assert!(global.contains("updates/main-diff-latest.md"));
 
         let core = fs::read_to_string(&paths.core_path).expect("read core");
         assert!(core.contains("compartments/repo-map.md"));
@@ -798,7 +811,9 @@ mod tests {
         )
         .expect("build task context prompt");
 
-        assert!(section.contains("Core file:"));
+        assert!(section.contains("Core file (legacy alias):"));
+        assert!(section.contains("Global file:"));
+        assert!(section.contains("global.md"));
         assert!(section.contains("repo-map.md"));
         assert!(section.contains("architecture.md"));
         assert!(section.contains("main-diff-latest.md"));
