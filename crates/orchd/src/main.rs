@@ -2367,109 +2367,7 @@ fn create_tui_task(
 }
 
 fn summarize_prompt_as_title(prompt: &str) -> String {
-    let lines = prompt.lines().map(str::trim).collect::<Vec<_>>();
-    let chosen = extract_requested_work_title(&lines)
-        .or_else(|| first_actionable_prompt_line(&lines))
-        .or_else(|| lines.iter().copied().find(|line| !line.is_empty()))
-        .unwrap_or("TUI task");
-    truncate_title(chosen)
-}
-
-fn extract_requested_work_title<'a>(lines: &'a [&'a str]) -> Option<&'a str> {
-    for (idx, line) in lines.iter().copied().enumerate() {
-        let Some(rest) = strip_prefix_ignore_ascii_case(line, "requested work:") else {
-            continue;
-        };
-        let inline = strip_common_list_prefix(rest.trim());
-        if !inline.is_empty() {
-            return Some(inline);
-        }
-        for candidate in lines.iter().copied().skip(idx + 1) {
-            let normalized = strip_common_list_prefix(candidate);
-            if normalized.is_empty() || title_is_boilerplate(normalized) {
-                continue;
-            }
-            if line_looks_like_section_header(normalized) {
-                break;
-            }
-            return Some(normalized);
-        }
-    }
-    None
-}
-
-fn first_actionable_prompt_line<'a>(lines: &'a [&'a str]) -> Option<&'a str> {
-    lines.iter().copied().find_map(|line| {
-        let normalized = strip_common_list_prefix(line);
-        if normalized.is_empty() || title_is_boilerplate(normalized) {
-            return None;
-        }
-        Some(normalized)
-    })
-}
-
-fn strip_common_list_prefix(line: &str) -> &str {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("- ") {
-        return rest.trim_start();
-    }
-    if let Some(rest) = trimmed.strip_prefix("* ") {
-        return rest.trim_start();
-    }
-
-    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    if digit_count > 0 {
-        let suffix = &trimmed[digit_count..];
-        if let Some(rest) = suffix
-            .strip_prefix(". ")
-            .or_else(|| suffix.strip_prefix(") "))
-        {
-            return rest.trim_start();
-        }
-    }
-    trimmed
-}
-
-fn title_is_boilerplate(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("you are working on task ")
-        || lower.starts_with("you are resolving git merge/rebase conflicts")
-        || lower.starts_with("state:")
-        || lower.starts_with("role:")
-        || lower.starts_with("type:")
-        || lower.starts_with("requested work:")
-        || lower.starts_with("work in this task worktree")
-        || lower.starts_with("when implementation is complete")
-        || lower.starts_with("if blocked and human input is required")
-        || lower.starts_with("requested work")
-}
-
-fn line_looks_like_section_header(line: &str) -> bool {
-    let Some(prefix) = line.strip_suffix(':') else {
-        return false;
-    };
-    !prefix.is_empty()
-        && prefix.len() <= 48
-        && prefix
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '-' || ch == '_')
-}
-
-fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = value.get(..prefix.len())?;
-    if !head.eq_ignore_ascii_case(prefix) {
-        return None;
-    }
-    value.get(prefix.len()..)
-}
-
-fn truncate_title(value: &str) -> String {
-    let mut title = value.trim().to_string();
-    if title.len() > 96 {
-        title.truncate(93);
-        title.push_str("...");
-    }
-    title
+    orchd::summarize_prompt_as_title(prompt)
 }
 
 fn run_single_orchestrator_tick(
@@ -4861,7 +4759,7 @@ submit_mode = "single"
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].state, TaskState::Queued);
         assert_eq!(tasks[0].repo_id.0, "example");
-        assert_eq!(tasks[0].title, "Build OAuth login with callback flow");
+        assert_eq!(tasks[0].title, "Build OAuth Login with Callback Flow");
         assert_eq!(tasks[0].preferred_model, Some(ModelKind::Claude));
         assert_eq!(agent_supervisor.pending_start_by_task.len(), 1);
         assert!(agent_supervisor
@@ -4883,7 +4781,7 @@ Work in this task worktree, make focused changes, and report progress.";
         let title = summarize_prompt_as_title(prompt);
         assert_eq!(
             title,
-            "better naming in the task display based on the prompt so we know what it's working on"
+            "Improve Naming in the Task Display Based on the Prompt"
         );
     }
 
@@ -4891,7 +4789,7 @@ Work in this task worktree, make focused changes, and report progress.";
     fn summarize_prompt_as_title_supports_inline_requested_work() {
         let prompt = "Requested work: tighten retry behavior when Graphite returns 429";
         let title = summarize_prompt_as_title(prompt);
-        assert_eq!(title, "tighten retry behavior when Graphite returns 429");
+        assert_eq!(title, "Tighten Retry Behavior when Graphite Returns 429");
     }
 
     #[test]
@@ -4903,7 +4801,7 @@ Fix flaky task scheduling by debouncing tick updates";
         let title = summarize_prompt_as_title(prompt);
         assert_eq!(
             title,
-            "Fix flaky task scheduling by debouncing tick updates"
+            "Fix Flaky Task Scheduling by Debouncing Tick Updates"
         );
     }
 

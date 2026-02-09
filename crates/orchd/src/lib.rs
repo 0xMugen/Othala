@@ -7,6 +7,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod service;
 pub mod state_machine;
+pub mod title;
 pub mod types;
 
 pub use dependency_graph::*;
@@ -18,6 +19,7 @@ pub use runtime::*;
 pub use scheduler::*;
 pub use service::*;
 pub use state_machine::*;
+pub use title::*;
 pub use types::*;
 
 #[cfg(test)]
