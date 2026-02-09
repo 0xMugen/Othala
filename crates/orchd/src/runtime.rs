@@ -534,31 +534,56 @@ impl RuntimeEngine {
         let graphite_title = normalize_task_title(&task.title);
 
         // Commit any uncommitted changes in the worktree before submitting.
-        let _ = client.commit_pending(&graphite_title);
+        if let Err(err) = client.commit_pending(&graphite_title) {
+            service.record_event(&Event {
+                id: event_id(&task.id, "SUBMIT-COMMIT-WARN", at),
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::Error {
+                    code: "submit_commit_pending_failed".to_string(),
+                    message: format!(
+                        "failed to commit pending changes for {}: {err}",
+                        task.id.0
+                    ),
+                },
+            })?;
+        }
 
         // Sync trunk from remote before submitting so gt submit sees an up-to-date trunk.
         let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
-        let _ = repo_client.sync_trunk();
+        if let Err(err) = repo_client.sync_trunk() {
+            service.record_event(&Event {
+                id: event_id(&task.id, "SUBMIT-SYNC-WARN", at),
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::Error {
+                    code: "submit_sync_trunk_failed".to_string(),
+                    message: format!(
+                        "failed to sync trunk before submit for {}: {err}",
+                        task.id.0
+                    ),
+                },
+            })?;
+        }
 
         // Move onto the stack anchor BEFORE submitting so the PR is created as stacked.
         if let Some(anchor_branch) =
             select_stack_anchor_branch(&service.list_tasks()?, task)
         {
             if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
-                service.record_event(&Event {
-                    id: event_id(&task.id, "SUBMIT-MOVE-ERROR", at),
-                    task_id: Some(task.id.clone()),
-                    repo_id: Some(task.repo_id.clone()),
+                self.mark_task_failed(
+                    service,
+                    task,
+                    "submit_move_onto_failed",
+                    format!(
+                        "failed to stack {} onto {}: {err}",
+                        task.id.0, anchor_branch
+                    ),
                     at,
-                    kind: EventKind::Error {
-                        code: "submit_move_onto_failed".to_string(),
-                        message: format!(
-                            "failed to move {} onto {} before submit: {err}",
-                            task.id.0, anchor_branch
-                        ),
-                    },
-                })?;
-                // Continue with submit anyway — the PR will be standalone.
+                )?;
+                return Ok(false);
             }
         }
 

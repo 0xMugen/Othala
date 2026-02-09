@@ -1342,7 +1342,7 @@ fn resolve_submit_mode_for_task(
         .unwrap_or(task.submit_mode)
 }
 
-/// Try to auto-submit a task, routing through Running if needed.
+/// Try to auto-submit a task.
 /// Returns Ok(true) on success, Ok(false) if the task doesn't exist,
 /// or Err with a reason string on failure.
 fn try_auto_submit(
@@ -1360,7 +1360,6 @@ fn try_auto_submit(
 
     let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
 
-    // Try start_submit directly first — it loads the task fresh from the DB.
     match service.start_submit(
         task_id,
         mode,
@@ -1370,52 +1369,11 @@ fn try_auto_submit(
         },
         at,
     ) {
-        Ok(_) => return Ok(true),
-        Err(_first_err) => {
-            // Direct submit failed — try routing through Running first.
-            if orchd::is_transition_allowed(task.state, TaskState::Running) {
-                if let Err(err) = service.transition_task_state(
-                    task_id,
-                    TaskState::Running,
-                    tui_event_id(task_id, &format!("{event_prefix}-RUNNING"), at),
-                    at,
-                ) {
-                    return Err(format!(
-                        "can't submit from {} (hop to Running also failed: {err})",
-                        orchd::task_state_tag(task.state)
-                    ));
-                }
-                // Now retry start_submit from Running.
-                match service.start_submit(
-                    task_id,
-                    mode,
-                    orchd::StartSubmitEventIds {
-                        submit_state_changed: tui_event_id(
-                            task_id,
-                            &format!("{event_prefix}-SUBMIT-S"),
-                            at,
-                        ),
-                        submit_started: tui_event_id(
-                            task_id,
-                            &format!("{event_prefix}-SUBMIT-E"),
-                            at,
-                        ),
-                    },
-                    at,
-                ) {
-                    Ok(_) => Ok(true),
-                    Err(err) => Err(format!(
-                        "submit failed after hop to Running from {}: {err}",
-                        orchd::task_state_tag(task.state)
-                    )),
-                }
-            } else {
-                Err(format!(
-                    "can't submit from {} (no valid path to Submitting)",
-                    orchd::task_state_tag(task.state)
-                ))
-            }
-        }
+        Ok(_) => Ok(true),
+        Err(err) => Err(format!(
+            "can't submit from {}: {err}",
+            orchd::task_state_tag(task.state)
+        )),
     }
 }
 
@@ -1790,19 +1748,8 @@ fn execute_tui_action(
                     events: Vec::new(),
                 }
             } else {
-                // Route through Running if direct transition to Submitting isn't allowed.
-                if !orchd::is_transition_allowed(task.state, TaskState::Submitting)
-                    && orchd::is_transition_allowed(task.state, TaskState::Running)
-                {
-                    service.transition_task_state(
-                        &selected_task_id,
-                        TaskState::Running,
-                        tui_event_id(&selected_task_id, "SUBMIT-VIA-RUNNING", at),
-                        at,
-                    )?;
-                }
                 let mode = resolve_submit_mode_for_task(&task, repo_config_by_id);
-                let _ = service.start_submit(
+                service.start_submit(
                     &selected_task_id,
                     mode,
                     orchd::StartSubmitEventIds {

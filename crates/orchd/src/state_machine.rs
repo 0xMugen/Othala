@@ -41,24 +41,24 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
     match (from, to) {
         (Queued, Initializing) => true,
         (Initializing, DraftPrOpen | Failed | Paused) => true,
-        (DraftPrOpen, Running | Failed | Paused) => true,
+        (DraftPrOpen, Running | Submitting | Failed | Paused) => true,
         (
             Running,
             Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Submitting | Failed | Paused,
         ) => true,
         (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
         (RestackConflict, Restacking | NeedsHuman | Submitting | Failed | Paused) => true,
-        (VerifyingQuick, Reviewing | Running | Failed | NeedsHuman | Paused) => true,
+        (VerifyingQuick, Reviewing | Running | Submitting | Failed | NeedsHuman | Paused) => true,
         (
             VerifyingFull,
-            Running | Reviewing | Ready | AwaitingMerge | Failed | NeedsHuman | Paused,
+            Running | Reviewing | Ready | Submitting | AwaitingMerge | Failed | NeedsHuman | Paused,
         ) => true,
-        (Reviewing, Ready | Running | VerifyingFull | NeedsHuman | Failed | Paused) => true,
+        (Reviewing, Ready | Running | Submitting | VerifyingFull | NeedsHuman | Failed | Paused) => true,
         (Ready, VerifyingFull | Submitting | AwaitingMerge | Failed | Paused) => true,
         (Submitting, AwaitingMerge | Failed | Paused) => true,
         (AwaitingMerge, VerifyingFull | Submitting | Merged | Running | Failed | Paused) => true,
-        (NeedsHuman, Running | Paused | Failed) => true,
-        (Paused, Running | Failed) => true,
+        (NeedsHuman, Running | Submitting | Paused | Failed) => true,
+        (Paused, Running | Submitting | Failed) => true,
         (Failed, Running | Restacking | NeedsHuman | Submitting | Paused) => true,
         _ => false,
     }
@@ -265,6 +265,34 @@ mod tests {
         assert!(!is_transition_allowed(
             TaskState::Merged,
             TaskState::Running
+        ));
+    }
+
+    #[test]
+    fn allows_direct_submit_from_intermediate_states() {
+        assert!(is_transition_allowed(
+            TaskState::DraftPrOpen,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::VerifyingQuick,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::VerifyingFull,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Reviewing,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::NeedsHuman,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Paused,
+            TaskState::Submitting
         ));
     }
 
