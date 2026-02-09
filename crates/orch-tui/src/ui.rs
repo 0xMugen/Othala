@@ -264,13 +264,55 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let selected_task = app
-        .state
-        .selected_task()
+    let selected_task = app.state.selected_task();
+    let task_id_str = selected_task
         .map(|t| t.task_id.0.clone())
         .unwrap_or_else(|| "-".to_string());
 
-    let lines: Vec<Line<'_>> = if app.state.selected_task_activity.is_empty() {
+    // Find the agent pane for this task
+    let task_pane = selected_task.and_then(|task| {
+        app.state
+            .panes
+            .iter()
+            .find(|p| p.task_id == task.task_id)
+    });
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+
+    // Left: agent PTY output
+    let (pty_title, pty_lines) = if let Some(pane) = task_pane {
+        (
+            format!(
+                "Agent {} ({:?}, task={})",
+                pane.instance_id, pane.model, pane.task_id.0
+            ),
+            pane.tail(200)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            format!("Agent (task={task_id_str})"),
+            vec![Line::from("no agent running for this task")],
+        )
+    };
+
+    let pty_widget = Paragraph::new(pty_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(pty_title)
+                .border_style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(pty_widget, cols[0]);
+
+    // Right: task metadata (state, verify, review, events)
+    let activity_lines: Vec<Line<'_>> = if app.state.selected_task_activity.is_empty() {
         vec![Line::from("no task activity yet")]
     } else {
         app.state
@@ -285,7 +327,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let widget = Paragraph::new(lines)
         .block(focused_block(&title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(widget, area);
+    frame.render_widget(activity_widget, cols[1]);
 }
 
 // -- Footer -----------------------------------------------------------------

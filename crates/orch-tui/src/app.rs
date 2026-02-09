@@ -102,6 +102,21 @@ impl TuiApp {
             return;
         }
 
+        if key.code == KeyCode::Esc {
+            if self.state.focused_task {
+                self.state.focused_task = false;
+                self.state.status_line = "task detail closed".to_string();
+                return;
+            }
+            if self.state.focused_pane_idx.is_some() {
+                self.state.focused_pane_idx = None;
+                self.state.status_line = "pane focus cleared".to_string();
+                return;
+            }
+            self.should_quit = true;
+            return;
+        }
+
         let Some(command) = map_key_to_command(key) else {
             return;
         };
@@ -471,6 +486,54 @@ mod tests {
         assert_eq!(app.state.focused_pane_idx, None);
         assert_eq!(app.state.status_line, "pane focus cleared");
 
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handle_key_event_esc_closes_focused_task_before_quitting() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Running,
+            verify_summary: "not_run".to_string(),
+            review_summary: "0/0 unanimous=false cap=ok".to_string(),
+            last_activity: Utc::now(),
+        }];
+        app.state.focused_task = true;
+
+        // First Esc closes the focused task
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.state.focused_task);
+        assert!(!app.should_quit);
+        assert_eq!(app.state.status_line, "task detail closed");
+
+        // Second Esc quits
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handle_key_event_esc_closes_focused_pane_before_quitting() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["boot".to_string()],
+        });
+        app.state.focused_pane_idx = Some(0);
+
+        // First Esc closes the focused pane
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert!(!app.should_quit);
+        assert_eq!(app.state.status_line, "pane focus cleared");
+
+        // Second Esc quits
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.should_quit);
     }
