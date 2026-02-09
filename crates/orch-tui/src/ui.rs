@@ -24,8 +24,8 @@ const OUTPUT_FG: Color = Color::White;
 const FOOTER_DEFAULT_HEIGHT: u16 = 3;
 const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
 const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
-const TASK_INTERVENE_MIN_HEIGHT: u16 = 3;
-const TASK_INTERVENE_MAX_HEIGHT: u16 = 8;
+const TASK_INTERVENE_MIN_HEIGHT: u16 = 4;
+const TASK_INTERVENE_MAX_HEIGHT: u16 = 9;
 const THINKING_FRAMES: [&str; 4] = ["o..", ".o.", "..o", ".o."];
 
 fn state_color(state: TaskState) -> Color {
@@ -731,12 +731,13 @@ fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
 }
 
 fn task_intervene_bar_height(app: &TuiApp, width: u16) -> u16 {
-    let Some(prompt) = app.task_intervene_prompt() else {
-        return TASK_INTERVENE_MIN_HEIGHT;
-    };
     let content_width = width.saturating_sub(4).max(1);
-    let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width);
-    let total_height = prompt_visual_lines.saturating_add(2);
+    let prompt_visual_lines = app
+        .task_intervene_prompt()
+        .map(|prompt| wrapped_visual_line_count(prompt, content_width))
+        .unwrap_or(1);
+    // status row + prompt/help row(s) + top/bottom borders
+    let total_height = prompt_visual_lines.saturating_add(3);
     u16::try_from(total_height)
         .unwrap_or(TASK_INTERVENE_MAX_HEIGHT)
         .clamp(TASK_INTERVENE_MIN_HEIGHT, TASK_INTERVENE_MAX_HEIGHT)
@@ -1714,17 +1715,17 @@ mod tests {
         use crate::app::InputMode;
 
         let mut app = TuiApp::default();
-        assert_eq!(task_intervene_bar_height(&app, 100), 3);
+        assert_eq!(task_intervene_bar_height(&app, 100), 4);
 
         app.input_mode = InputMode::TaskIntervenePrompt {
             buffer: "short prompt".to_string(),
         };
-        assert_eq!(task_intervene_bar_height(&app, 100), 3);
+        assert_eq!(task_intervene_bar_height(&app, 100), 4);
 
         app.input_mode = InputMode::TaskIntervenePrompt {
             buffer: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string(),
         };
-        assert!(task_intervene_bar_height(&app, 30) > 3);
+        assert!(task_intervene_bar_height(&app, 30) > 4);
     }
 
     #[test]
