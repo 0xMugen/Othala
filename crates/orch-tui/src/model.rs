@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 pub struct TaskOverviewRow {
     pub task_id: TaskId,
     pub repo_id: RepoId,
+    #[serde(default)]
+    pub title: String,
     pub branch: String,
     pub stack_position: Option<String>,
     pub state: TaskState,
@@ -47,6 +49,7 @@ impl TaskOverviewRow {
         Self {
             task_id: task.id.clone(),
             repo_id: task.repo_id.clone(),
+            title: summarize(&task.title, 64),
             branch: task.branch_name.clone().unwrap_or_else(|| "-".to_string()),
             stack_position: None,
             state: task.state,
