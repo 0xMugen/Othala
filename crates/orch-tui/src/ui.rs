@@ -812,6 +812,30 @@ fn render_task_intervene_bar(
     frame.render_widget(widget, area);
 }
 
+fn footer_action_keys(focused_task: bool) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("c", "chat")];
+    if focused_task {
+        keys.push(("i", "intervene"));
+    }
+    keys.extend([
+        ("a", "approve"),
+        ("g", "submit"),
+        ("s", "start"),
+        ("x", "stop"),
+        ("r", "restart"),
+        ("d", "delete"),
+        ("q", "quick"),
+        ("f", "full"),
+        ("t", "restack/submit"),
+        ("n", "human"),
+        ("w", "web"),
+        ("p", "pause"),
+        ("u", "resume"),
+        ("l", "linearize"),
+    ]);
+    keys
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let (lines, wrap_trim) = if let Some((task_id, branch)) = app.delete_confirm_display() {
         let branch_label = branch.unwrap_or("-");
@@ -870,27 +894,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         let mut spans: Vec<Span<'_>> = Vec::new();
         spans.push(Span::raw(" "));
-        let keys: &[(&str, &str)] = &[
-            ("c", "chat"),
-            ("i", "intervene"),
-            ("a", "approve"),
-            ("g", "submit"),
-            ("s", "start"),
-            ("x", "stop"),
-            ("r", "restart"),
-            ("d", "delete"),
-            ("q", "quick"),
-            ("f", "full"),
-            ("t", "restack/submit"),
-            ("n", "human"),
-            ("w", "web"),
-            ("p", "pause"),
-            ("u", "resume"),
-            ("l", "linearize"),
-        ];
-        for (key, label) in keys {
+        for (key, label) in footer_action_keys(app.state.focused_task) {
             spans.push(Span::styled(
-                *key,
+                key,
                 Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
@@ -1588,9 +1594,9 @@ mod tests {
     use crate::TuiApp;
 
     use super::{
-        footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
-        status_activity, status_line_color, status_sidebar_lines, task_intervene_bar_height,
-        to_local_time, wrapped_visual_line_count, OutputBlockState,
+        footer_action_keys, footer_height, format_pane_tabs, format_task_row, output_line_style,
+        pane_status_tag, status_activity, status_line_color, status_sidebar_lines,
+        task_intervene_bar_height, to_local_time, wrapped_visual_line_count, OutputBlockState,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1708,6 +1714,17 @@ mod tests {
             buffer: "x".repeat(4000),
         };
         assert_eq!(footer_height(&app, 40), 12);
+    }
+
+    #[test]
+    fn footer_action_keys_only_show_intervene_in_focused_task_view() {
+        let normal = footer_action_keys(false);
+        let focused = footer_action_keys(true);
+
+        assert!(!normal.iter().any(|(key, _)| *key == "i"));
+        assert!(focused
+            .iter()
+            .any(|(key, label)| *key == "i" && *label == "intervene"));
     }
 
     #[test]
