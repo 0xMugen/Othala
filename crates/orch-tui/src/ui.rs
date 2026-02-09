@@ -749,48 +749,98 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
         ))];
     };
 
-    let thinking = if matches!(task.state, TaskState::Queued | TaskState::Initializing) {
-        ChecklistState::Pending
-    } else {
-        ChecklistState::Done
+    // -- coding: Active during initial work, Done once past Running --
+    let coding = match task.state {
+        TaskState::Failed => ChecklistState::Blocked,
+        TaskState::Queued | TaskState::Paused => ChecklistState::Pending,
+        TaskState::Initializing | TaskState::DraftPrOpen => ChecklistState::Active,
+        TaskState::Running if task.display_state == "Running" => ChecklistState::Active,
+        _ => ChecklistState::Done,
     };
-    let pushing = if matches!(task.state, TaskState::Queued | TaskState::Initializing) {
-        ChecklistState::Pending
-    } else {
+
+    // -- verifying: tracks verify lifecycle via display_state --
+    let verifying = if task.display_state == "VerifyFail" {
+        ChecklistState::Blocked
+    } else if matches!(
+        task.state,
+        TaskState::VerifyingQuick | TaskState::VerifyingFull
+    ) || task.display_state == "Verifying"
+    {
+        ChecklistState::Active
+    } else if task.display_state == "Verified"
+        || matches!(
+            task.state,
+            TaskState::Reviewing
+                | TaskState::NeedsHuman
+                | TaskState::Ready
+                | TaskState::Submitting
+                | TaskState::AwaitingMerge
+                | TaskState::Merged
+        )
+    {
         ChecklistState::Done
+    } else {
+        ChecklistState::Pending
     };
-    let reviewing = ChecklistState::Skipped;
+
+    // -- reviewing: tracks code-review phase --
+    let reviewing = match task.state {
+        TaskState::Reviewing => ChecklistState::Active,
+        TaskState::NeedsHuman => ChecklistState::Blocked,
+        TaskState::Ready
+        | TaskState::Submitting
+        | TaskState::AwaitingMerge
+        | TaskState::Merged => ChecklistState::Done,
+        _ => ChecklistState::Pending,
+    };
+
+    // -- restacking: optional, Skipped unless entered --
     let restacking = match task.state {
         TaskState::Restacking => ChecklistState::Active,
         TaskState::RestackConflict => ChecklistState::Blocked,
         _ => ChecklistState::Skipped,
     };
-    let ready_to_merge = if matches!(
-        task.state,
-        TaskState::Ready | TaskState::AwaitingMerge | TaskState::Merged
-    ) {
-        ChecklistState::Done
-    } else {
-        ChecklistState::Pending
+
+    // -- ready to merge --
+    let ready_to_merge = match task.state {
+        TaskState::Submitting | TaskState::AwaitingMerge => ChecklistState::Active,
+        TaskState::Merged => ChecklistState::Done,
+        _ => ChecklistState::Pending,
     };
 
-    let plan_complete = if ready_to_merge == ChecklistState::Done {
-        "yes"
+    // -- plan complete (only at Merged) / current phase label --
+    let (plan_label, plan_value, plan_color) = if task.state == TaskState::Merged {
+        ("plan complete: ", "yes", Color::Green)
     } else {
-        "no"
+        let phase = match task.state {
+            TaskState::Queued => "queued",
+            TaskState::Paused => "paused",
+            TaskState::Initializing | TaskState::DraftPrOpen => "coding",
+            TaskState::Running => match task.display_state.as_str() {
+                "Verifying" => "verifying",
+                "VerifyFail" => "verify failed",
+                "Verified" => "verified",
+                _ => "coding",
+            },
+            TaskState::VerifyingQuick | TaskState::VerifyingFull => "verifying",
+            TaskState::Reviewing => "reviewing",
+            TaskState::NeedsHuman => "needs human",
+            TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge => "ready",
+            TaskState::Restacking => "restacking",
+            TaskState::RestackConflict => "restack conflict",
+            TaskState::Failed => "failed",
+            TaskState::Merged => unreachable!(),
+        };
+        ("phase: ", phase, Color::Yellow)
     };
 
-    vec![
+    let mut lines = vec![
         Line::from(vec![
-            Span::styled("plan complete: ", Style::default().fg(DIM)),
+            Span::styled(plan_label, Style::default().fg(DIM)),
             Span::styled(
-                plan_complete.to_string(),
+                plan_value.to_string(),
                 Style::default()
-                    .fg(if plan_complete == "yes" {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    })
+                    .fg(plan_color)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -808,12 +858,38 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             "checklist",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        checklist_line("thinking", thinking),
-        checklist_line("pushing", pushing),
-        checklist_line("reviewing (skipped for now)", reviewing),
+        checklist_line("coding", coding),
+        checklist_line("verifying", verifying),
+        checklist_line("reviewing", reviewing),
         checklist_line("restacking (if needed)", restacking),
         checklist_line("ready to merge", ready_to_merge),
-    ]
+    ];
+
+    // -- verify / review detail lines --
+    if task.verify_summary != "not_run" {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("verify: ", Style::default().fg(DIM)),
+            Span::styled(
+                task.verify_summary.clone(),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    if task.review_summary != "0/0 unanimous=false cap=ok" {
+        if task.verify_summary == "not_run" {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("review: ", Style::default().fg(DIM)),
+            Span::styled(
+                task.review_summary.clone(),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
+    lines
 }
 
 fn to_local_time(value: DateTime<Utc>) -> String {
@@ -981,13 +1057,11 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
 
-        assert!(text.iter().any(|line| line.contains("plan complete: no")));
+        assert!(text.iter().any(|line| line.contains("phase: coding")));
         assert!(text.iter().any(|line| line.contains("status: Running")));
-        assert!(text.iter().any(|line| line.contains("[x] thinking")));
-        assert!(text.iter().any(|line| line.contains("[x] pushing")));
-        assert!(text
-            .iter()
-            .any(|line| line.contains("reviewing (skipped for now)")));
+        assert!(text.iter().any(|line| line.contains("[~] coding")));
+        assert!(text.iter().any(|line| line.contains("[ ] verifying")));
+        assert!(text.iter().any(|line| line.contains("[ ] reviewing")));
         assert!(text
             .iter()
             .any(|line| line.contains("restacking (if needed)")));
@@ -997,8 +1071,8 @@ mod tests {
     #[test]
     fn status_sidebar_lines_marks_ready_plan_complete() {
         let mut row = mk_row("T2");
-        row.state = TaskState::Ready;
-        row.display_state = "Ready".to_string();
+        row.state = TaskState::Merged;
+        row.display_state = "Merged".to_string();
 
         let rendered = status_sidebar_lines(Some(&row));
         let text: Vec<String> = rendered
