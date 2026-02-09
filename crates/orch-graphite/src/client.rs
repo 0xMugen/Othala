@@ -56,6 +56,15 @@ impl GraphiteClient {
         Ok(())
     }
 
+    pub fn sync_trunk(&self) -> Result<(), GraphiteError> {
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::Sync,
+            ["sync", "--no-restack", "--force", "--no-interactive"],
+        )?;
+        Ok(())
+    }
+
     pub fn restack(&self) -> Result<(), GraphiteError> {
         self.cli.run_allowed(
             self.repo_root.as_path(),

@@ -8,6 +8,7 @@ use crate::error::GraphiteError;
 pub enum AllowedAutoCommand {
     Create,
     Restack,
+    Sync,
     AddAllForConflict,
     ContinueConflict,
     LogShort,
@@ -116,6 +117,13 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
         AllowedAutoCommand::Restack => {
             args.len() == 2 && arg_eq(args, 0, "restack") && arg_eq(args, 1, "--no-interactive")
         }
+        AllowedAutoCommand::Sync => {
+            args.len() == 4
+                && arg_eq(args, 0, "sync")
+                && arg_eq(args, 1, "--no-restack")
+                && arg_eq(args, 2, "--force")
+                && arg_eq(args, 3, "--no-interactive")
+        }
         AllowedAutoCommand::AddAllForConflict => {
             args.len() == 2 && arg_eq(args, 0, "add") && arg_eq(args, 1, "-A")
         }
@@ -222,6 +230,11 @@ mod tests {
         assert!(validate_contract(
             AllowedAutoCommand::RepoInit,
             &os(&["init", "--trunk", "main", "--no-interactive"])
+        )
+        .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Sync,
+            &os(&["sync", "--no-restack", "--force", "--no-interactive"])
         )
         .is_ok());
     }
