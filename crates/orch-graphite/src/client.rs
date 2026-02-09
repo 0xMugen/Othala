@@ -60,7 +60,7 @@ impl GraphiteClient {
         self.cli.run_allowed(
             self.repo_root.as_path(),
             AllowedAutoCommand::Restack,
-            ["restack"],
+            ["restack", "--no-interactive"],
         )?;
         Ok(())
     }
@@ -69,7 +69,7 @@ impl GraphiteClient {
         let result = self.cli.run_allowed(
             self.repo_root.as_path(),
             AllowedAutoCommand::Restack,
-            ["restack"],
+            ["restack", "--no-interactive"],
         );
         classify_restack_result(result)
     }
@@ -147,13 +147,13 @@ impl GraphiteClient {
     pub fn repo_init(&self, trunk: &str) -> Result<(), GraphiteError> {
         if trunk.trim().is_empty() {
             return Err(GraphiteError::ContractViolation {
-                message: "trunk branch for gt repo init must not be empty".to_string(),
+                message: "trunk branch for gt init must not be empty".to_string(),
             });
         }
         self.cli.run_allowed(
             self.repo_root.as_path(),
             AllowedAutoCommand::RepoInit,
-            ["repo", "init", "--trunk", trunk, "--no-interactive"],
+            ["init", "--trunk", trunk, "--no-interactive"],
         )?;
         Ok(())
     }
@@ -328,7 +328,6 @@ mod tests {
             .expect_err("missing binary should surface io error");
         match err {
             GraphiteError::Io { command, .. } => {
-                assert!(command.contains("repo"));
                 assert!(command.contains("init"));
                 assert!(command.contains("--trunk"));
                 assert!(command.contains("main"));
