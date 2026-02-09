@@ -233,7 +233,7 @@ pub fn validate_setup_selection(
         let Some(probe) = probe_by_model.get(model) else {
             return Err(SetupError::SelectedModelUnknown { model: *model });
         };
-        if !probe.healthy {
+        if !is_probe_selectable(probe) {
             return Err(SetupError::SelectedModelUnavailable { model: *model });
         }
         if dedup.insert(*model) {
@@ -242,6 +242,10 @@ pub fn validate_setup_selection(
     }
 
     Ok(ValidatedSetupSelection { enabled_models })
+}
+
+fn is_probe_selectable(probe: &ModelProbeResult) -> bool {
+    probe.installed && probe.version_ok
 }
 
 pub fn summarize_setup(
@@ -395,7 +399,7 @@ mod tests {
             models: vec![ModelProbeResult {
                 model: ModelKind::Gemini,
                 executable: "gemini".to_string(),
-                installed: true,
+                installed: false,
                 version_ok: true,
                 version_output: Some("gemini 0.1".to_string()),
                 env_status: vec![],
@@ -660,5 +664,29 @@ mod tests {
             model_order,
             vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini]
         );
+    }
+
+    #[test]
+    fn validate_selection_allows_subscription_style_when_env_is_missing() {
+        let report = super::SetupProbeReport {
+            models: vec![ModelProbeResult {
+                model: ModelKind::Codex,
+                executable: "codex".to_string(),
+                installed: true,
+                version_ok: true,
+                version_output: Some("codex 1".to_string()),
+                env_status: vec![super::EnvRequirementStatus {
+                    any_of: vec!["OPENAI_API_KEY".to_string()],
+                    satisfied: false,
+                }],
+                healthy: false,
+            }],
+        };
+
+        let selection = ModelSetupSelection {
+            enabled_models: vec![ModelKind::Codex],
+        };
+        let validated = validate_setup_selection(&report, &selection).expect("valid selection");
+        assert_eq!(validated.enabled_models, vec![ModelKind::Codex]);
     }
 }

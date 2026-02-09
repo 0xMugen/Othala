@@ -331,14 +331,14 @@ fn run_setup(args: SetupCliArgs) -> Result<(), MainError> {
         report
             .models
             .iter()
-            .filter(|probe| probe.healthy)
+            .filter(|probe| probe.installed && probe.version_ok)
             .map(|probe| probe.model)
             .collect::<Vec<_>>()
     };
 
     if selected_models.is_empty() {
         return Err(MainError::Args(
-            "no healthy models detected; pass --enable with explicit models".to_string(),
+            "no runnable model CLIs detected; pass --enable with explicit models".to_string(),
         ));
     }
 
@@ -387,10 +387,10 @@ fn run_wizard(args: WizardCliArgs) -> Result<(), MainError> {
 
     println!("detected model CLI health:");
     for probe in &report.models {
-        let status = if probe.healthy {
-            "healthy"
+        let status = if probe.installed && probe.version_ok {
+            "runnable"
         } else {
-            "unhealthy"
+            "unavailable"
         };
         let installed = if probe.installed {
             "detected"
@@ -485,12 +485,12 @@ fn prompt_wizard_model_selection(
     let default_models = report
         .models
         .iter()
-        .filter(|probe| probe.healthy)
+        .filter(|probe| probe.installed && probe.version_ok)
         .map(|probe| probe.model)
         .collect::<Vec<_>>();
     if default_models.is_empty() {
         return Err(MainError::Args(
-            "wizard found no healthy models; configure API keys and rerun".to_string(),
+            "wizard found no runnable model CLIs; install/log in and rerun".to_string(),
         ));
     }
 
@@ -776,7 +776,13 @@ fn print_setup_summary(summary: &SetupSummary, per_model_concurrency: usize, pat
     );
 
     for item in &summary.items {
-        let healthy = if item.healthy { "healthy" } else { "unhealthy" };
+        let status = if item.healthy {
+            "healthy"
+        } else if item.detected && !item.missing_env_any_of.is_empty() {
+            "runnable (API env optional/missing)"
+        } else {
+            "unhealthy"
+        };
         let detected = if item.detected {
             "detected"
         } else {
@@ -786,7 +792,7 @@ fn print_setup_summary(summary: &SetupSummary, per_model_concurrency: usize, pat
             "- {}: {} {} selected={}",
             model_kind_tag(&item.model),
             detected,
-            healthy,
+            status,
             item.selected
         );
     }
@@ -1362,7 +1368,7 @@ fn setup_usage(program: &str) -> String {
     format!(
         "Usage: {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n\
 \nExamples:\n  {program} setup\n  {program} setup --enable claude,codex --per-model-concurrency 5\n\
-\nNotes:\n  --enable accepts comma-separated values from claude|codex|gemini\n  if --enable is omitted, all healthy detected models are selected"
+\nNotes:\n  --enable accepts comma-separated values from claude|codex|gemini\n  if --enable is omitted, all runnable detected model CLIs are selected"
     )
 }
 
@@ -1370,7 +1376,7 @@ fn wizard_usage(program: &str) -> String {
     format!(
         "Usage: {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n\
 \nExamples:\n  {program} wizard\n  {program} wizard --org-config ~/.config/othala/org.toml\n\
-\nNotes:\n  wizard is interactive and requires a TTY\n  prompts for enabled models from detected healthy CLIs"
+\nNotes:\n  wizard is interactive and requires a TTY\n  prompts for enabled models from detected runnable CLIs"
     )
 }
 
