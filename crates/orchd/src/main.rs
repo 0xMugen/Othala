@@ -1,18 +1,18 @@
 use chrono::Utc;
 use orch_agents::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupError,
-    SetupProbeConfig, SetupSummary,
+    SetupProbeConfig, SetupProbeReport, SetupSummary, ValidatedSetupSelection,
 };
 use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, load_repo_config, save_org_config,
-    ConfigError, RepoConfig, SetupApplyError,
+    ConfigError, MovePolicy, OrgConfig, RepoConfig, SetupApplyError,
 };
 use orch_core::events::{
     Event, EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
 };
-use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
-use orch_core::types::ModelKind;
+use orch_core::state::{ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskState, VerifyStatus};
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
+use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
@@ -21,6 +21,7 @@ use orchd::{
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -43,6 +44,12 @@ struct RunCliArgs {
 struct SetupCliArgs {
     org_config_path: PathBuf,
     enabled_models: Option<Vec<ModelKind>>,
+    per_model_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WizardCliArgs {
+    org_config_path: PathBuf,
     per_model_concurrency: Option<usize>,
 }
 
@@ -76,6 +83,7 @@ struct ReviewApproveCliArgs {
 enum CliCommand {
     Run(RunCliArgs),
     Setup(SetupCliArgs),
+    Wizard(WizardCliArgs),
     CreateTask(CreateTaskCliArgs),
     ListTasks(ListTasksCliArgs),
     ReviewApprove(ReviewApproveCliArgs),
@@ -122,6 +130,18 @@ enum MainError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("wizard requires an interactive terminal")]
+    WizardNotInteractive,
+    #[error("failed to read wizard input: {source}")]
+    WizardRead {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write wizard output: {source}")]
+    WizardWrite {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to serialize task list as json: {source}")]
     SerializeTaskList {
         #[source]
@@ -143,14 +163,14 @@ enum MainError {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("orchd startup failed: {err}");
+        eprintln!("othala startup failed: {err}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), MainError> {
     let mut argv = env::args();
-    let program = argv.next().unwrap_or_else(|| "orchd".to_string());
+    let program = argv.next().unwrap_or_else(|| "othala".to_string());
     let command = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
 
     match command {
@@ -160,6 +180,7 @@ fn run() -> Result<(), MainError> {
         }
         CliCommand::Run(args) => run_daemon(args),
         CliCommand::Setup(args) => run_setup(args),
+        CliCommand::Wizard(args) => run_wizard(args),
         CliCommand::CreateTask(args) => run_create_task(args),
         CliCommand::ListTasks(args) => run_list_tasks(args),
         CliCommand::ReviewApprove(args) => run_review_approve(args),
@@ -348,6 +369,193 @@ fn run_setup(args: SetupCliArgs) -> Result<(), MainError> {
     print_setup_summary(&summary, per_model_concurrency, &args.org_config_path);
 
     Ok(())
+}
+
+fn run_wizard(args: WizardCliArgs) -> Result<(), MainError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(MainError::WizardNotInteractive);
+    }
+
+    let mut org = load_or_default_org_config(&args.org_config_path)?;
+    validate_org_config(&org.validate())?;
+
+    println!("Othala setup wizard");
+    println!("config path: {}", args.org_config_path.display());
+
+    let probe_config = SetupProbeConfig::default();
+    let report = probe_models(&probe_config);
+
+    println!("detected model CLI health:");
+    for probe in &report.models {
+        let status = if probe.healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        };
+        let installed = if probe.installed {
+            "detected"
+        } else {
+            "not_detected"
+        };
+        println!(
+            "- {}: {} {}",
+            model_kind_tag(&probe.model),
+            installed,
+            status
+        );
+
+        if !probe.env_status.is_empty() {
+            for env_status in probe.env_status.iter().filter(|status| !status.satisfied) {
+                println!("  missing env any-of: {}", env_status.any_of.join("|"));
+            }
+        }
+
+        if let Some(version_output) = &probe.version_output {
+            println!("  version: {version_output}");
+        }
+    }
+
+    let validated = prompt_wizard_model_selection(&report)?;
+    let per_model_concurrency = match args.per_model_concurrency {
+        Some(value) => value,
+        None => {
+            let default_value = org.concurrency.codex.max(1);
+            prompt_wizard_per_model_concurrency(default_value)?
+        }
+    };
+
+    apply_setup_selection_to_org_config(
+        &mut org,
+        &validated.enabled_models,
+        per_model_concurrency,
+    )?;
+    validate_org_config(&org.validate())?;
+    save_org_config(&args.org_config_path, &org).map_err(|source| MainError::SaveConfig {
+        path: args.org_config_path.clone(),
+        source,
+    })?;
+
+    let summary = summarize_setup(&report, &validated);
+    print_setup_summary(&summary, per_model_concurrency, &args.org_config_path);
+    println!("next: run `othala --once` to execute one scheduler/runtime tick");
+
+    Ok(())
+}
+
+fn load_or_default_org_config(path: &Path) -> Result<OrgConfig, MainError> {
+    match load_org_config(path) {
+        Ok(cfg) => Ok(cfg),
+        Err(ConfigError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(default_org_config())
+        }
+        Err(source) => Err(MainError::LoadConfig {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn default_org_config() -> OrgConfig {
+    OrgConfig {
+        models: orch_core::config::ModelsConfig {
+            enabled: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+            policy: ReviewPolicy::Adaptive,
+            min_approvals: 2,
+        },
+        concurrency: orch_core::config::ConcurrencyConfig {
+            per_repo: 10,
+            claude: 10,
+            codex: 10,
+            gemini: 10,
+        },
+        graphite: orch_core::config::GraphiteOrgConfig {
+            auto_submit: true,
+            submit_mode_default: SubmitMode::Single,
+            allow_move: MovePolicy::Manual,
+        },
+        ui: orch_core::config::UiConfig {
+            web_bind: "127.0.0.1:9842".to_string(),
+        },
+    }
+}
+
+fn prompt_wizard_model_selection(
+    report: &SetupProbeReport,
+) -> Result<ValidatedSetupSelection, MainError> {
+    let default_models = report
+        .models
+        .iter()
+        .filter(|probe| probe.healthy)
+        .map(|probe| probe.model)
+        .collect::<Vec<_>>();
+    if default_models.is_empty() {
+        return Err(MainError::Args(
+            "wizard found no healthy models; configure API keys and rerun".to_string(),
+        ));
+    }
+
+    let default_text = default_models
+        .iter()
+        .map(model_kind_tag)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    loop {
+        let input = prompt_wizard_line(&format!(
+            "enable models (comma-separated claude,codex,gemini) [{}]: ",
+            default_text
+        ))?;
+
+        let selected = if input.trim().is_empty() {
+            default_models.clone()
+        } else {
+            match parse_enabled_models(input.trim()) {
+                Ok(models) => models,
+                Err(err) => {
+                    println!("{err}");
+                    continue;
+                }
+            }
+        };
+
+        let selection = ModelSetupSelection {
+            enabled_models: selected,
+        };
+        match validate_setup_selection(report, &selection) {
+            Ok(validated) => return Ok(validated),
+            Err(err) => {
+                println!("{err}");
+            }
+        }
+    }
+}
+
+fn prompt_wizard_per_model_concurrency(default_value: usize) -> Result<usize, MainError> {
+    loop {
+        let input =
+            prompt_wizard_line(&format!("per-model concurrency (>0) [{}]: ", default_value))?;
+        if input.trim().is_empty() {
+            return Ok(default_value);
+        }
+
+        match input.trim().parse::<usize>() {
+            Ok(value) if value > 0 => return Ok(value),
+            _ => println!("invalid value: expected positive integer"),
+        }
+    }
+}
+
+fn prompt_wizard_line(prompt: &str) -> Result<String, MainError> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|source| MainError::WizardWrite { source })?;
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|source| MainError::WizardRead { source })?;
+    Ok(line)
 }
 
 fn run_create_task(args: CreateTaskCliArgs) -> Result<(), MainError> {
@@ -724,6 +932,7 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
 
     match args[0].as_str() {
         "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
+        "wizard" => parse_wizard_cli_args(args[1..].to_vec(), program),
         "create-task" => parse_create_task_cli_args(args[1..].to_vec(), program),
         "list-tasks" => parse_list_tasks_cli_args(args[1..].to_vec(), program),
         "review-approve" => parse_review_approve_cli_args(args[1..].to_vec(), program),
@@ -843,6 +1052,54 @@ fn parse_setup_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, 
     }
 
     Ok(CliCommand::Setup(parsed))
+}
+
+fn parse_wizard_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = WizardCliArgs {
+        org_config_path: PathBuf::from(DEFAULT_ORG_CONFIG),
+        per_model_concurrency: None,
+    };
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(wizard_usage(program))),
+            "--org-config" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --org-config".to_string()))?;
+                parsed.org_config_path = PathBuf::from(value);
+            }
+            "--per-model-concurrency" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --per-model-concurrency".to_string())
+                })?;
+                let parsed_value = value.parse::<usize>().map_err(|_| {
+                    MainError::Args(format!(
+                        "invalid --per-model-concurrency value: {value} (expected usize > 0)"
+                    ))
+                })?;
+                if parsed_value == 0 {
+                    return Err(MainError::Args(
+                        "invalid --per-model-concurrency value: 0 (must be > 0)".to_string(),
+                    ));
+                }
+                parsed.per_model_concurrency = Some(parsed_value);
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown wizard argument: {other}\n\n{}",
+                    wizard_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(CliCommand::Wizard(parsed))
 }
 
 fn parse_create_task_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
@@ -1096,7 +1353,7 @@ fn default_run_args() -> RunCliArgs {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
 \nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
     )
 }
@@ -1106,6 +1363,14 @@ fn setup_usage(program: &str) -> String {
         "Usage: {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n\
 \nExamples:\n  {program} setup\n  {program} setup --enable claude,codex --per-model-concurrency 5\n\
 \nNotes:\n  --enable accepts comma-separated values from claude|codex|gemini\n  if --enable is omitted, all healthy detected models are selected"
+    )
+}
+
+fn wizard_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n\
+\nExamples:\n  {program} wizard\n  {program} wizard --org-config ~/.config/othala/org.toml\n\
+\nNotes:\n  wizard is interactive and requires a TTY\n  prompts for enabled models from detected healthy CLIs"
     )
 }
 
@@ -1132,8 +1397,8 @@ fn review_approve_usage(program: &str) -> String {
 mod tests {
     use super::{
         create_task_usage, list_tasks_usage, load_repo_configs, parse_cli_args,
-        parse_enabled_models, setup_usage, usage, CliCommand, CreateTaskCliArgs, ListTasksCliArgs,
-        ReviewApproveCliArgs, RunCliArgs, SetupCliArgs,
+        parse_enabled_models, setup_usage, usage, wizard_usage, CliCommand, CreateTaskCliArgs,
+        ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs, WizardCliArgs,
     };
     use orch_core::events::ReviewVerdict;
     use orch_core::types::{ModelKind, TaskId};
@@ -1266,6 +1531,47 @@ mod tests {
         let parsed = parse_cli_args(vec!["setup".to_string(), "--help".to_string()], "orchd")
             .expect("setup help");
         assert_eq!(parsed, CliCommand::Help(setup_usage("orchd")));
+    }
+
+    #[test]
+    fn parse_cli_args_wizard_defaults() {
+        let parsed = parse_cli_args(vec!["wizard".to_string()], "orchd").expect("wizard parse");
+        assert_eq!(
+            parsed,
+            CliCommand::Wizard(WizardCliArgs {
+                org_config_path: PathBuf::from("config/org.toml"),
+                per_model_concurrency: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_wizard_with_overrides() {
+        let parsed = parse_cli_args(
+            vec![
+                "wizard".to_string(),
+                "--org-config".to_string(),
+                "/tmp/org.toml".to_string(),
+                "--per-model-concurrency".to_string(),
+                "11".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("wizard parse");
+        assert_eq!(
+            parsed,
+            CliCommand::Wizard(WizardCliArgs {
+                org_config_path: PathBuf::from("/tmp/org.toml"),
+                per_model_concurrency: Some(11),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_wizard_help_returns_usage() {
+        let parsed = parse_cli_args(vec!["wizard".to_string(), "--help".to_string()], "orchd")
+            .expect("wizard help");
+        assert_eq!(parsed, CliCommand::Help(wizard_usage("orchd")));
     }
 
     #[test]

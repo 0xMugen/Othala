@@ -72,21 +72,21 @@ sqlite_path="$(mktemp -u /tmp/othala-e2e-XXXX.sqlite)"
 event_root="$(mktemp -d /tmp/othala-e2e-events-XXXX)"
 
 cd "$repo_root"
-nix develop -c cargo run -p orchd -- create-task \
+nix develop -c cargo run -p orchd --bin othala -- create-task \
   --org-config "$tmp_root/org.toml" \
   --repos-config-dir "$tmp_root/repos" \
   --spec "$tmp_root/task.json" \
   --sqlite-path "$sqlite_path" \
   --event-log-root "$event_root"
 
-nix develop -c cargo run -p orchd -- \
+nix develop -c cargo run -p orchd --bin othala -- \
   --org-config "$tmp_root/org.toml" \
   --repos-config-dir "$tmp_root/repos" \
   --once \
   --sqlite-path "$sqlite_path" \
   --event-log-root "$event_root"
 
-nix develop -c cargo run -p orchd -- review-approve \
+nix develop -c cargo run -p orchd --bin othala -- review-approve \
   --org-config "$tmp_root/org.toml" \
   --task-id "$task_id" \
   --reviewer codex \
@@ -94,7 +94,7 @@ nix develop -c cargo run -p orchd -- review-approve \
   --sqlite-path "$sqlite_path" \
   --event-log-root "$event_root"
 
-nix develop -c cargo run -p orchd -- \
+nix develop -c cargo run -p orchd --bin othala -- \
   --org-config "$tmp_root/org.toml" \
   --repos-config-dir "$tmp_root/repos" \
   --once \
@@ -103,7 +103,7 @@ nix develop -c cargo run -p orchd -- \
 
 echo
 echo "Final task state:"
-nix develop -c cargo run -p orchd -- list-tasks \
+nix develop -c cargo run -p orchd --bin othala -- list-tasks \
   --org-config "$tmp_root/org.toml" \
   --sqlite-path "$sqlite_path" \
   --event-log-root "$event_root"

@@ -32,7 +32,27 @@ Open gaps (before calling this production-ready):
 - Rust toolchain (provided by flake dev shell)
 - Optional model CLIs on PATH: `claude`, `codex`, `gemini`
 
-## Quick Start
+## Install (Latest Release)
+
+Install `othala` from the latest GitHub release tag:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0xMugen/Othala/main/scripts/install-latest.sh)
+```
+
+After install, start the interactive setup wizard:
+
+```bash
+othala wizard
+```
+
+Run one orchestration tick:
+
+```bash
+othala --once
+```
+
+## Dev Quick Start
 
 1. Enter dev shell:
 
@@ -48,40 +68,46 @@ cargo test -p orchd
 cargo check
 ```
 
-3. Start daemon once (bootstrap + one scheduler/runtime tick):
+3. Run `othala` from source (bootstrap + one scheduler/runtime tick):
 
 ```bash
-cargo run -p orchd -- --once
+cargo run -p orchd --bin othala -- --once
 ```
 
 4. Create a task:
 
 ```bash
-cargo run -p orchd -- create-task --spec templates/task-spec.example.json
+cargo run -p orchd --bin othala -- create-task --spec templates/task-spec.example.json
 ```
 
 5. List tasks:
 
 ```bash
-cargo run -p orchd -- list-tasks
+cargo run -p orchd --bin othala -- list-tasks
 ```
 
-## Daemon Commands
+## CLI Commands
 
 ### Run daemon
 
 ```bash
-cargo run -p orchd -- \
+othala \
   --org-config config/org.toml \
   --repos-config-dir config/repos \
   --sqlite-path .orch/state.sqlite \
   --event-log-root .orch/events
 ```
 
-### Setup model selection
+### Setup wizard (interactive)
 
 ```bash
-cargo run -p orchd -- setup --enable claude,codex --per-model-concurrency 5
+othala wizard
+```
+
+### Setup model selection (non-interactive)
+
+```bash
+othala setup --enable claude,codex --per-model-concurrency 5
 ```
 
 ### Record a manual review decision
@@ -89,7 +115,7 @@ cargo run -p orchd -- setup --enable claude,codex --per-model-concurrency 5
 Used to feed approvals into the review gate:
 
 ```bash
-cargo run -p orchd -- review-approve \
+othala review-approve \
   --task-id T123 \
   --reviewer codex \
   --verdict approve

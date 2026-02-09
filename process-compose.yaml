@@ -1,7 +1,7 @@
 version: "0.5"
 processes:
   orchd:
-    command: "nix develop -c cargo run -p orchd -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --event-log-root .orch/events"
+    command: "nix develop -c cargo run -p orchd --bin othala -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --event-log-root .orch/events"
   orch-web:
     command: "nix develop -c cargo run -p orch-web -- --org-config config/org.toml --sqlite-path .orch/state.sqlite --sync-interval-ms 1000"
     depends_on:
