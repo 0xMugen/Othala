@@ -99,25 +99,35 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
-    let lines = if let Some(pane) = app.state.selected_pane() {
-        pane.tail(20)
-            .into_iter()
-            .map(Line::from)
-            .collect::<Vec<_>>()
-    } else {
-        vec![Line::from("no running agent panes")]
-    };
-
-    let title = app
-        .state
-        .selected_pane()
-        .map(|pane| {
+    let (title, lines) = if let Some(pane) = app.state.selected_pane() {
+        (
             format!(
                 "PTY {} ({:?}, task={})",
                 pane.instance_id, pane.model, pane.task_id.0
-            )
-        })
-        .unwrap_or_else(|| "PTY".to_string());
+            ),
+            pane.tail(20)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let selected_task = app
+            .state
+            .selected_task()
+            .map(|task| task.task_id.0.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let lines = if app.state.selected_task_activity.is_empty() {
+            vec![Line::from("no task activity yet")]
+        } else {
+            app.state
+                .selected_task_activity
+                .iter()
+                .cloned()
+                .map(Line::from)
+                .collect::<Vec<_>>()
+        };
+        (format!("Task Activity ({selected_task})"), lines)
+    };
 
     let output = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))

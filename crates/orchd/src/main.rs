@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Local, Utc};
 use orch_agents::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupError,
     SetupProbeConfig, SetupProbeReport, SetupSummary, ValidatedSetupSelection,
@@ -297,6 +297,7 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                 app.state.status_line = format!("failed to refresh tasks: {err}");
             }
         }
+        refresh_selected_task_activity(app, &service);
     })?;
     Ok(())
 }
@@ -619,6 +620,204 @@ fn run_single_orchestrator_tick(
         runtime_tick.submit_failed,
         runtime_tick.errors
     )))
+}
+
+fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
+    let Some(task_id) = app.state.selected_task().map(|task| task.task_id.clone()) else {
+        app.state.selected_task_activity.clear();
+        return;
+    };
+
+    let task = match service.task(&task_id) {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            app.state.selected_task_activity = vec![format!("task {} not found", task_id.0)];
+            return;
+        }
+        Err(err) => {
+            app.state.selected_task_activity =
+                vec![format!("failed to load task {}: {err}", task_id.0)];
+            return;
+        }
+    };
+
+    let events = match service.task_events(&task_id) {
+        Ok(events) => events,
+        Err(err) => {
+            app.state.selected_task_activity =
+                vec![format!("failed to load events for {}: {err}", task_id.0)];
+            return;
+        }
+    };
+
+    let approvals = match service.task_approvals(&task_id) {
+        Ok(approvals) => approvals,
+        Err(err) => {
+            app.state.selected_task_activity =
+                vec![format!("failed to load approvals for {}: {err}", task_id.0)];
+            return;
+        }
+    };
+
+    app.state.selected_task_activity = build_task_activity_lines(&task, &events, &approvals);
+}
+
+fn build_task_activity_lines(
+    task: &Task,
+    events: &[Event],
+    approvals: &[orch_core::types::TaskApproval],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "task={} state={:?} repo={} branch={}",
+        task.id.0,
+        task.state,
+        task.repo_id.0,
+        task.branch_name.as_deref().unwrap_or("-")
+    ));
+    if let Some(pr) = &task.pr {
+        lines.push(format!(
+            "pr=#{} draft={} url={}",
+            pr.number, pr.draft, pr.url
+        ));
+    }
+    lines.push(format!(
+        "verify={} review={}/{} unanimous={} cap={:?}",
+        verify_summary(&task.verify_status),
+        task.review_status.approvals_received,
+        task.review_status.approvals_required,
+        task.review_status.unanimous,
+        task.review_status.capacity_state
+    ));
+    lines.push("".to_string());
+    lines.push("approvals:".to_string());
+    if approvals.is_empty() {
+        lines.push("  - none".to_string());
+    } else {
+        let mut sorted = approvals.to_vec();
+        sorted.sort_by_key(|approval| approval.issued_at);
+        sorted.reverse();
+        for approval in sorted {
+            lines.push(format!(
+                "  - {} {:?} at {}",
+                model_kind_tag(&approval.reviewer),
+                approval.verdict,
+                format_ts(approval.issued_at)
+            ));
+        }
+    }
+
+    lines.push("".to_string());
+    lines.push("events (latest first):".to_string());
+    for event in events.iter().rev().take(24) {
+        append_event_lines(&mut lines, event);
+    }
+
+    lines
+}
+
+fn append_event_lines(lines: &mut Vec<String>, event: &Event) {
+    let ts = format_ts(event.at);
+    match &event.kind {
+        EventKind::TaskCreated => {
+            lines.push(format!("{ts} task created"));
+        }
+        EventKind::TaskStateChanged { from, to } => {
+            lines.push(format!("{ts} state {from} -> {to}"));
+        }
+        EventKind::DraftPrCreated { number, url } => {
+            lines.push(format!("{ts} draft pr created #{number} {url}"));
+        }
+        EventKind::ParentHeadUpdated { parent_task_id } => {
+            lines.push(format!("{ts} parent head updated {}", parent_task_id.0));
+        }
+        EventKind::RestackStarted => {
+            lines.push(format!("{ts} restack started"));
+        }
+        EventKind::RestackCompleted => {
+            lines.push(format!("{ts} restack completed"));
+        }
+        EventKind::RestackConflict => {
+            lines.push(format!("{ts} restack conflict"));
+        }
+        EventKind::RestackResolved => {
+            lines.push(format!("{ts} restack resolved"));
+        }
+        EventKind::VerifyRequested { tier } => {
+            lines.push(format!("{ts} verify requested {:?}", tier));
+        }
+        EventKind::VerifyCompleted { tier, success } => {
+            lines.push(format!(
+                "{ts} verify completed {:?} success={success}",
+                tier
+            ));
+        }
+        EventKind::ReviewRequested { required_models } => {
+            let models = required_models
+                .iter()
+                .map(model_kind_tag)
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("{ts} review requested models={models}"));
+        }
+        EventKind::ReviewCompleted { reviewer, output } => {
+            lines.push(format!(
+                "{ts} review {} verdict={:?} issues={} risks={} hygiene_ok={} tests_ok={}",
+                model_kind_tag(reviewer),
+                output.verdict,
+                output.issues.len(),
+                output.risk_flags.len(),
+                output.graphite_hygiene.ok,
+                output.test_assessment.ok
+            ));
+            for issue in output.issues.iter().take(3) {
+                let line = issue
+                    .line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!(
+                    "    issue {:?} {}:{} {}",
+                    issue.severity, issue.file, line, issue.description
+                ));
+            }
+            if !output.risk_flags.is_empty() {
+                lines.push(format!("    risks {}", output.risk_flags.join(",")));
+            }
+        }
+        EventKind::ReadyReached => {
+            lines.push(format!("{ts} ready reached"));
+        }
+        EventKind::SubmitStarted { mode } => {
+            lines.push(format!("{ts} submit started mode={:?}", mode));
+        }
+        EventKind::SubmitCompleted => {
+            lines.push(format!("{ts} submit completed"));
+        }
+        EventKind::NeedsHuman { reason } => {
+            lines.push(format!("{ts} needs human {}", reason));
+        }
+        EventKind::Error { code, message } => {
+            lines.push(format!("{ts} error code={code} msg={message}"));
+        }
+    }
+}
+
+fn verify_summary(status: &VerifyStatus) -> String {
+    match status {
+        VerifyStatus::NotRun => "not_run".to_string(),
+        VerifyStatus::Running { tier } => format!("running:{tier:?}").to_ascii_lowercase(),
+        VerifyStatus::Passed { tier } => format!("passed:{tier:?}").to_ascii_lowercase(),
+        VerifyStatus::Failed { tier, summary } => {
+            format!("failed:{tier:?}:{}", summary.replace('\n', " ")).to_ascii_lowercase()
+        }
+    }
+}
+
+fn format_ts(value: chrono::DateTime<Utc>) -> String {
+    value
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 fn tui_event_id(task_id: &TaskId, stage: &str, at: chrono::DateTime<Utc>) -> EventId {
@@ -1936,14 +2135,15 @@ fn review_approve_usage(program: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_task_usage, execute_tui_action, list_tasks_usage, load_repo_configs, parse_cli_args,
-        parse_enabled_models, setup_usage, tui_usage, usage, wizard_usage, CliCommand,
-        CreateTaskCliArgs, ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs,
-        TuiCliArgs, WizardCliArgs,
+        build_task_activity_lines, create_task_usage, execute_tui_action, list_tasks_usage,
+        load_repo_configs, parse_cli_args, parse_enabled_models, setup_usage, tui_usage, usage,
+        wizard_usage, CliCommand, CreateTaskCliArgs, ListTasksCliArgs, ReviewApproveCliArgs,
+        RunCliArgs, SetupCliArgs, TuiCliArgs, WizardCliArgs,
     };
     use chrono::Utc;
-    use orch_core::events::EventKind;
-    use orch_core::events::ReviewVerdict;
+    use orch_core::events::{
+        Event, EventKind, GraphiteHygieneReport, ReviewOutput, ReviewVerdict, TestAssessment,
+    };
     use orch_core::state::{
         ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus, VerifyTier,
     };
@@ -2503,5 +2703,52 @@ submit_mode = "single"
         assert!(outcome.message.contains("recorded APPROVE"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_task_activity_lines_contains_review_details_from_events() {
+        let task = mk_reviewing_task("T-LINES");
+        let event = Event {
+            id: EventId("E-LINES".to_string()),
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at: Utc::now(),
+            kind: EventKind::ReviewCompleted {
+                reviewer: ModelKind::Codex,
+                output: ReviewOutput {
+                    verdict: ReviewVerdict::RequestChanges,
+                    issues: vec![orch_core::events::ReviewIssue {
+                        severity: orch_core::events::IssueSeverity::High,
+                        file: "src/lib.rs".to_string(),
+                        line: Some(42),
+                        description: "fix logic".to_string(),
+                        suggested_fix: None,
+                    }],
+                    risk_flags: vec!["API_BREAK".to_string()],
+                    graphite_hygiene: GraphiteHygieneReport {
+                        ok: false,
+                        notes: "stack needs restack".to_string(),
+                    },
+                    test_assessment: TestAssessment {
+                        ok: false,
+                        notes: "missing regression test".to_string(),
+                    },
+                },
+            },
+        };
+        let approval = orch_core::types::TaskApproval {
+            task_id: task.id.clone(),
+            reviewer: ModelKind::Codex,
+            verdict: ReviewVerdict::RequestChanges,
+            issued_at: Utc::now(),
+        };
+
+        let lines = build_task_activity_lines(&task, &[event], &[approval]);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("approvals:"));
+        assert!(rendered.contains("events (latest first):"));
+        assert!(rendered.contains("review codex verdict=RequestChanges"));
+        assert!(rendered.contains("issue High src/lib.rs:42 fix logic"));
+        assert!(rendered.contains("risks API_BREAK"));
     }
 }

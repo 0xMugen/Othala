@@ -103,6 +103,7 @@ impl AgentPane {
 pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
     pub panes: Vec<AgentPane>,
+    pub selected_task_activity: Vec<String>,
     pub selected_task_idx: usize,
     pub selected_pane_idx: usize,
     pub focused_pane_idx: Option<usize>,
@@ -114,6 +115,7 @@ impl Default for DashboardState {
         Self {
             tasks: Vec::new(),
             panes: Vec::new(),
+            selected_task_activity: Vec::new(),
             selected_task_idx: 0,
             selected_pane_idx: 0,
             focused_pane_idx: None,
