@@ -15,6 +15,7 @@ use crate::service::{
     CompleteFullVerifyEventIds, CompleteQuickVerifyEventIds, CompleteRestackEventIds,
     CompleteSubmitEventIds, OrchdService, ServiceError,
 };
+use crate::title::normalize_task_title;
 
 static EVENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -200,8 +201,9 @@ impl RuntimeEngine {
             .branch_name
             .clone()
             .unwrap_or_else(|| default_branch_name(task));
+        let graphite_title = normalize_task_title(&task.title);
         let graphite = GraphiteClient::new(repo.root.clone());
-        if let Err(err) = graphite.create_branch(&branch, &task.title) {
+        if let Err(err) = graphite.create_branch(&branch, &graphite_title) {
             if !is_branch_already_present_error(&err) {
                 self.mark_task_failed(
                     service,
@@ -507,9 +509,10 @@ impl RuntimeEngine {
 
         let runtime_path = task_runtime_path(task, repo_config);
         let client = GraphiteClient::new(runtime_path);
+        let graphite_title = normalize_task_title(&task.title);
 
         // Commit any uncommitted changes in the worktree before submitting.
-        let _ = client.commit_pending(&task.title);
+        let _ = client.commit_pending(&graphite_title);
 
         // Sync trunk from remote before submitting so gt submit sees an up-to-date trunk.
         let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
