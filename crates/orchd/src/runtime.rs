@@ -350,6 +350,28 @@ impl RuntimeEngine {
         let runtime_path = task_runtime_path(task, repo_config);
         let client = GraphiteClient::new(runtime_path);
 
+        // Move onto the stack anchor before restacking so the branch is properly stacked.
+        if let Some(anchor_branch) =
+            select_stack_anchor_branch(&service.list_tasks()?, task)
+        {
+            if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
+                service.record_event(&Event {
+                    id: event_id(&task.id, "RESTACK-MOVE-ERROR", at),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at,
+                    kind: EventKind::Error {
+                        code: "restack_move_onto_failed".to_string(),
+                        message: format!(
+                            "failed to move {} onto {} before restack: {err}",
+                            task.id.0, anchor_branch
+                        ),
+                    },
+                })?;
+                // Continue with restack anyway — it may still work against trunk.
+            }
+        }
+
         match client.restack_with_outcome() {
             Ok(RestackOutcome::Restacked) => {
                 let _ = service.complete_restack(
@@ -518,31 +540,32 @@ impl RuntimeEngine {
         let repo_client = GraphiteClient::new(repo_config.repo_path.clone());
         let _ = repo_client.sync_trunk();
 
+        // Move onto the stack anchor BEFORE submitting so the PR is created as stacked.
+        if let Some(anchor_branch) =
+            select_stack_anchor_branch(&service.list_tasks()?, task)
+        {
+            if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
+                service.record_event(&Event {
+                    id: event_id(&task.id, "SUBMIT-MOVE-ERROR", at),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at,
+                    kind: EventKind::Error {
+                        code: "submit_move_onto_failed".to_string(),
+                        message: format!(
+                            "failed to move {} onto {} before submit: {err}",
+                            task.id.0, anchor_branch
+                        ),
+                    },
+                })?;
+                // Continue with submit anyway — the PR will be standalone.
+            }
+        }
+
         let mode = repo_config.graphite.submit_mode.unwrap_or(task.submit_mode);
         let submit_result = client.submit(mode);
 
         let success = submit_result.is_ok();
-        if success {
-            if let Some(anchor_branch) =
-                select_submit_stack_anchor_branch(&service.list_tasks()?, task)
-            {
-                if let Err(err) = client.move_current_branch_onto(&anchor_branch) {
-                    service.record_event(&Event {
-                        id: event_id(&task.id, "SUBMIT-MOVE-ERROR", at),
-                        task_id: Some(task.id.clone()),
-                        repo_id: Some(task.repo_id.clone()),
-                        at,
-                        kind: EventKind::Error {
-                            code: "submit_move_onto_first_failed".to_string(),
-                            message: format!(
-                                "submitted task {} but failed to move onto {}: {err}",
-                                task.id.0, anchor_branch
-                            ),
-                        },
-                    })?;
-                }
-            }
-        }
         let failure_message = submit_result.err().map(|err| err.to_string());
         let _ = service.complete_submit(
             &task.id,
@@ -691,13 +714,16 @@ fn task_runtime_path(task: &Task, repo_config: &RepoConfig) -> PathBuf {
     repo_config.repo_path.clone()
 }
 
-fn select_submit_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> {
+fn select_stack_anchor_branch(tasks: &[Task], current: &Task) -> Option<String> {
     tasks
         .iter()
         .filter(|task| {
             task.id != current.id
                 && task.repo_id == current.repo_id
-                && matches!(task.state, TaskState::AwaitingMerge | TaskState::Merged)
+                && matches!(
+                    task.state,
+                    TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged
+                )
         })
         .filter_map(|task| {
             let branch = task.branch_name.as_deref()?.trim();
@@ -785,7 +811,7 @@ fn synthetic_draft_pr_url(task_id: &TaskId) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_branch_name, select_submit_stack_anchor_branch, synthetic_draft_pr_url,
+        default_branch_name, select_stack_anchor_branch, synthetic_draft_pr_url,
         task_runtime_path,
     };
     use chrono::{Duration, Utc};
@@ -926,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn select_submit_stack_anchor_branch_uses_oldest_completed_peer_in_repo() {
+    fn select_stack_anchor_branch_uses_oldest_completed_peer_in_repo() {
         let now = Utc::now();
         let current = task_with_state_and_times(
             "T2",
@@ -954,12 +980,12 @@ mod tests {
         );
 
         let anchor =
-            select_submit_stack_anchor_branch(&[current.clone(), newer_done, first_done], &current);
+            select_stack_anchor_branch(&[current.clone(), newer_done, first_done], &current);
         assert_eq!(anchor.as_deref(), Some("task/T1"));
     }
 
     #[test]
-    fn select_submit_stack_anchor_branch_ignores_other_repos_and_missing_branches() {
+    fn select_stack_anchor_branch_ignores_other_repos_and_missing_branches() {
         let now = Utc::now();
         let current = task_with_state_and_times(
             "T2",
@@ -986,7 +1012,7 @@ mod tests {
             now - Duration::minutes(4),
         );
 
-        let anchor = select_submit_stack_anchor_branch(
+        let anchor = select_stack_anchor_branch(
             &[current.clone(), wrong_repo, empty_branch],
             &current,
         );
