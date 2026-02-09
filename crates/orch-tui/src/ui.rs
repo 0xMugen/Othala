@@ -249,7 +249,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
-    let (title, mut lines) = if let Some(pane) = app.state.selected_pane() {
+    let (title, lines) = if let Some(pane) = app.state.selected_pane() {
         let mut lines = pane_meta_lines(pane, None);
         lines.push(divider_line(panes[1].width));
         let tail = pane.tail(20);
@@ -828,6 +828,7 @@ mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
     use orch_core::types::{ModelKind, RepoId, TaskId};
+    use ratatui::style::Color;
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
