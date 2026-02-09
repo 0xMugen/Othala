@@ -15,6 +15,7 @@ orch-core = { path = "../orch-core" }
 orch-git = { path = "../orch-git" }
 orch-graphite = { path = "../orch-graphite" }
 orch-notify = { path = "../orch-notify" }
+orch-tui = { path = "../orch-tui" }
 orch-verify = { path = "../orch-verify" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

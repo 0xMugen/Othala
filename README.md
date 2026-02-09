@@ -54,10 +54,16 @@ After install, start the interactive setup wizard:
 othala wizard
 ```
 
+Open the command center TUI:
+
+```bash
+othala
+```
+
 Run one orchestration tick:
 
 ```bash
-othala --once
+othala daemon --once
 ```
 
 ## Dev Quick Start
@@ -76,19 +82,25 @@ cargo test -p orchd
 cargo check
 ```
 
-3. Run `othala` from source (bootstrap + one scheduler/runtime tick):
+3. Run `othala` TUI from source:
 
 ```bash
-cargo run -p orchd --bin othala -- --once
+cargo run -p orchd --bin othala
 ```
 
-4. Create a task:
+4. Run one scheduler/runtime tick from source:
+
+```bash
+cargo run -p orchd --bin othala -- daemon --once
+```
+
+5. Create a task:
 
 ```bash
 cargo run -p orchd --bin othala -- create-task --spec templates/task-spec.example.json
 ```
 
-5. List tasks:
+6. List tasks:
 
 ```bash
 cargo run -p orchd --bin othala -- list-tasks
@@ -99,7 +111,7 @@ cargo run -p orchd --bin othala -- list-tasks
 ### Run daemon
 
 ```bash
-othala \
+othala daemon \
   --org-config config/org.toml \
   --repos-config-dir config/repos \
   --sqlite-path .orch/state.sqlite \

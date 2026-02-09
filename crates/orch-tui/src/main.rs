@@ -1,4 +1,5 @@
 use orch_tui::{run_tui, TuiApp, TuiError};
+use rusqlite::Connection;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,9 +57,21 @@ fn run() -> Result<(), MainError> {
 }
 
 fn load_tasks_from_sqlite(path: &Path) -> Result<Vec<orch_core::types::Task>, String> {
-    let store = orchd::SqliteStore::open(path).map_err(|err| err.to_string())?;
-    store.migrate().map_err(|err| err.to_string())?;
-    store.list_tasks().map_err(|err| err.to_string())
+    let conn = Connection::open(path).map_err(|err| err.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT payload_json FROM tasks ORDER BY updated_at DESC, task_id ASC")
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        let payload = row.map_err(|err| err.to_string())?;
+        let task = serde_json::from_str::<orch_core::types::Task>(&payload)
+            .map_err(|err| err.to_string())?;
+        tasks.push(task);
+    }
+    Ok(tasks)
 }
 
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {

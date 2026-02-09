@@ -14,6 +14,7 @@ use orch_core::state::{ReviewCapacityState, ReviewPolicy, ReviewStatus, TaskStat
 use orch_core::types::{EventId, Task, TaskId, TaskSpec};
 use orch_core::types::{ModelKind, SubmitMode};
 use orch_core::validation::{Validate, ValidationIssue, ValidationLevel};
+use orch_tui::{run_tui, TuiApp, TuiError};
 use orchd::{
     ModelAvailability, OrchdService, RuntimeEngine, RuntimeError, Scheduler, SchedulerConfig,
     ServiceError,
@@ -30,6 +31,7 @@ const DEFAULT_ORG_CONFIG: &str = "config/org.toml";
 const DEFAULT_REPOS_CONFIG_DIR: &str = "config/repos";
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_ROOT: &str = ".orch/events";
+const DEFAULT_TUI_TICK_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunCliArgs {
@@ -38,6 +40,12 @@ struct RunCliArgs {
     sqlite_path: PathBuf,
     event_log_root: PathBuf,
     once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiCliArgs {
+    tick_ms: u64,
+    sqlite_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +90,7 @@ struct ReviewApproveCliArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run(RunCliArgs),
+    Tui(TuiCliArgs),
     Setup(SetupCliArgs),
     Wizard(WizardCliArgs),
     CreateTask(CreateTaskCliArgs),
@@ -158,6 +167,8 @@ enum MainError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
+    Tui(#[from] TuiError),
+    #[error(transparent)]
     Web(#[from] std::io::Error),
 }
 
@@ -179,12 +190,37 @@ fn run() -> Result<(), MainError> {
             Ok(())
         }
         CliCommand::Run(args) => run_daemon(args),
+        CliCommand::Tui(args) => run_tui_command(args),
         CliCommand::Setup(args) => run_setup(args),
         CliCommand::Wizard(args) => run_wizard(args),
         CliCommand::CreateTask(args) => run_create_task(args),
         CliCommand::ListTasks(args) => run_list_tasks(args),
         CliCommand::ReviewApprove(args) => run_review_approve(args),
     }
+}
+
+fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
+    let mut app = match load_tasks_from_sqlite(&args.sqlite_path) {
+        Ok(tasks) => {
+            let mut app = TuiApp::from_tasks(&tasks);
+            app.state.status_line = format!(
+                "othala tui started tick_ms={} tasks={}",
+                args.tick_ms,
+                tasks.len()
+            );
+            app
+        }
+        Err(err) => {
+            let mut app = TuiApp::default();
+            app.state.status_line = format!(
+                "othala tui started tick_ms={} task_load_warning={}",
+                args.tick_ms, err
+            );
+            app
+        }
+    };
+    run_tui(&mut app, Duration::from_millis(args.tick_ms))?;
+    Ok(())
 }
 
 fn run_daemon(args: RunCliArgs) -> Result<(), MainError> {
@@ -437,7 +473,7 @@ fn run_wizard(args: WizardCliArgs) -> Result<(), MainError> {
 
     let summary = summarize_setup(&report, &validated);
     print_setup_summary(&summary, per_model_concurrency, &args.org_config_path);
-    println!("next: run `othala --once` to execute one scheduler/runtime tick");
+    println!("next: run `othala daemon --once` to execute one scheduler/runtime tick");
 
     Ok(())
 }
@@ -835,6 +871,17 @@ fn current_model_availability(
     (scheduler_availability, availability_map)
 }
 
+fn load_tasks_from_sqlite(path: &Path) -> Result<Vec<Task>, MainError> {
+    let store = orchd::SqliteStore::open(path)
+        .map_err(|source| MainError::InvalidConfig(format!("failed to open sqlite: {source}")))?;
+    store.migrate().map_err(|source| {
+        MainError::InvalidConfig(format!("failed to migrate sqlite: {source}"))
+    })?;
+    store
+        .list_tasks()
+        .map_err(|source| MainError::InvalidConfig(format!("failed to list tasks: {source}")))
+}
+
 fn ensure_dir(path: &Path) -> Result<(), MainError> {
     fs::create_dir_all(path).map_err(|source| MainError::CreateDir {
         path: path.to_path_buf(),
@@ -933,10 +980,12 @@ fn validate_repo_configs(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), M
 
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
     if args.is_empty() {
-        return Ok(CliCommand::Run(default_run_args()));
+        return Ok(CliCommand::Tui(default_tui_args()));
     }
 
     match args[0].as_str() {
+        "daemon" => parse_run_cli_args(args[1..].to_vec(), program),
+        "tui" => parse_tui_cli_args(args[1..].to_vec(), program),
         "setup" => parse_setup_cli_args(args[1..].to_vec(), program),
         "wizard" => parse_wizard_cli_args(args[1..].to_vec(), program),
         "create-task" => parse_create_task_cli_args(args[1..].to_vec(), program),
@@ -945,6 +994,49 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainEr
         "help" | "--help" | "-h" => Ok(CliCommand::Help(usage(program))),
         _ => parse_run_cli_args(args, program),
     }
+}
+
+fn parse_tui_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
+    let mut parsed = default_tui_args();
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(CliCommand::Help(tui_usage(program))),
+            "--tick-ms" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| MainError::Args("missing value for --tick-ms".to_string()))?;
+                let tick_ms = value.parse::<u64>().map_err(|_| {
+                    MainError::Args(format!("invalid --tick-ms value: {value} (expected u64)"))
+                })?;
+                if tick_ms == 0 {
+                    return Err(MainError::Args(
+                        "invalid --tick-ms value: 0 (must be > 0)".to_string(),
+                    ));
+                }
+                parsed.tick_ms = tick_ms;
+            }
+            "--sqlite-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --sqlite-path".to_string())
+                })?;
+                parsed.sqlite_path = PathBuf::from(value);
+            }
+            other => {
+                return Err(MainError::Args(format!(
+                    "unknown tui argument: {other}\n\n{}",
+                    tui_usage(program)
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(CliCommand::Tui(parsed))
 }
 
 fn parse_run_cli_args(args: Vec<String>, program: &str) -> Result<CliCommand, MainError> {
@@ -1357,10 +1449,26 @@ fn default_run_args() -> RunCliArgs {
     }
 }
 
+fn default_tui_args() -> TuiCliArgs {
+    TuiCliArgs {
+        tick_ms: DEFAULT_TUI_TICK_MS,
+        sqlite_path: PathBuf::from(DEFAULT_SQLITE_PATH),
+    }
+}
+
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
-\nDefaults:\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
+        "Usage:\n  {program}\n  {program} tui [--tick-ms <u64>] [--sqlite-path <path>]\n  {program} daemon [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>] [--once]\n  {program} setup [--org-config <path>] [--enable <models>] [--per-model-concurrency <n>]\n  {program} wizard [--org-config <path>] [--per-model-concurrency <n>]\n  {program} create-task --spec <path> [--org-config <path>] [--repos-config-dir <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} list-tasks [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n  {program} review-approve --task-id <id> --reviewer <claude|codex|gemini> [--verdict <approve|request_changes|block>] [--org-config <path>] [--sqlite-path <path>] [--event-log-root <path>]\n\
+\nDefaults:\n  {program}: launches TUI\n  tui --tick-ms 250\n  --org-config config/org.toml\n  --repos-config-dir config/repos\n  --sqlite-path .orch/state.sqlite\n  --event-log-root .orch/events"
+    )
+}
+
+fn tui_usage(program: &str) -> String {
+    format!(
+        "Usage: {program} tui [--tick-ms <u64>] [--sqlite-path <path>]\n\
+Defaults:\n\
+  --tick-ms 250\n\
+  --sqlite-path .orch/state.sqlite"
     )
 }
 
@@ -1403,8 +1511,9 @@ fn review_approve_usage(program: &str) -> String {
 mod tests {
     use super::{
         create_task_usage, list_tasks_usage, load_repo_configs, parse_cli_args,
-        parse_enabled_models, setup_usage, usage, wizard_usage, CliCommand, CreateTaskCliArgs,
-        ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs, WizardCliArgs,
+        parse_enabled_models, setup_usage, tui_usage, usage, wizard_usage, CliCommand,
+        CreateTaskCliArgs, ListTasksCliArgs, ReviewApproveCliArgs, RunCliArgs, SetupCliArgs,
+        TuiCliArgs, WizardCliArgs,
     };
     use orch_core::events::ReviewVerdict;
     use orch_core::types::{ModelKind, TaskId};
@@ -1416,6 +1525,18 @@ mod tests {
         let parsed = parse_cli_args(Vec::new(), "orchd").expect("parse");
         assert_eq!(
             parsed,
+            CliCommand::Tui(TuiCliArgs {
+                tick_ms: 250,
+                sqlite_path: PathBuf::from(".orch/state.sqlite"),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_daemon_subcommand_uses_run_defaults() {
+        let parsed = parse_cli_args(vec!["daemon".to_string()], "orchd").expect("parse daemon");
+        assert_eq!(
+            parsed,
             CliCommand::Run(RunCliArgs {
                 org_config_path: PathBuf::from("config/org.toml"),
                 repos_config_dir: PathBuf::from("config/repos"),
@@ -1424,6 +1545,35 @@ mod tests {
                 once: false,
             })
         );
+    }
+
+    #[test]
+    fn parse_cli_args_tui_subcommand_parses_overrides() {
+        let parsed = parse_cli_args(
+            vec![
+                "tui".to_string(),
+                "--tick-ms".to_string(),
+                "500".to_string(),
+                "--sqlite-path".to_string(),
+                "/tmp/state.sqlite".to_string(),
+            ],
+            "orchd",
+        )
+        .expect("parse tui");
+        assert_eq!(
+            parsed,
+            CliCommand::Tui(TuiCliArgs {
+                tick_ms: 500,
+                sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_tui_help_returns_usage() {
+        let parsed =
+            parse_cli_args(vec!["tui".to_string(), "--help".to_string()], "orchd").expect("help");
+        assert_eq!(parsed, CliCommand::Help(tui_usage("orchd")));
     }
 
     #[test]
