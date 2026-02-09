@@ -801,9 +801,19 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
         _ => ChecklistState::Skipped,
     };
 
-    // -- ready to merge --
-    let ready_to_merge = match task.state {
-        TaskState::Submitting | TaskState::AwaitingMerge => ChecklistState::Active,
+    // -- pushing: Active during submit, Done once past Submitting --
+    let pushing = match task.state {
+        TaskState::Submitting => ChecklistState::Active,
+        TaskState::AwaitingMerge | TaskState::Merged => ChecklistState::Done,
+        TaskState::Failed if matches!(task.display_state.as_str(), "Submitting") => {
+            ChecklistState::Blocked
+        }
+        _ => ChecklistState::Pending,
+    };
+
+    // -- merging: Active when awaiting merge, Done when merged --
+    let merging = match task.state {
+        TaskState::AwaitingMerge => ChecklistState::Active,
         TaskState::Merged => ChecklistState::Done,
         _ => ChecklistState::Pending,
     };
@@ -825,7 +835,9 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             TaskState::VerifyingQuick | TaskState::VerifyingFull => "verifying",
             TaskState::Reviewing => "reviewing",
             TaskState::NeedsHuman => "needs human",
-            TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge => "ready",
+            TaskState::Ready => "ready",
+            TaskState::Submitting => "pushing",
+            TaskState::AwaitingMerge => "awaiting merge",
             TaskState::Restacking => "restacking",
             TaskState::RestackConflict => "restack conflict",
             TaskState::Failed => "failed",
@@ -862,10 +874,11 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
         checklist_line("verifying", verifying),
         checklist_line("reviewing", reviewing),
         checklist_line("restacking (if needed)", restacking),
-        checklist_line("ready to merge", ready_to_merge),
+        checklist_line("pushing", pushing),
+        checklist_line("merging", merging),
     ];
 
-    // -- verify / review detail lines --
+    // -- verify / review / push detail lines --
     if task.verify_summary != "not_run" {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -884,6 +897,23 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>) -> Vec<Line<'static>> {
             Span::styled("review: ", Style::default().fg(DIM)),
             Span::styled(
                 task.review_summary.clone(),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
+    // -- push detail --
+    let push_detail = match task.state {
+        TaskState::Submitting => Some("gt submit in progress..."),
+        TaskState::AwaitingMerge => Some("pr submitted, awaiting merge"),
+        TaskState::Merged => Some("merged"),
+        _ => None,
+    };
+    if let Some(detail) = push_detail {
+        lines.push(Line::from(vec![
+            Span::styled("push: ", Style::default().fg(DIM)),
+            Span::styled(
+                detail.to_string(),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -1065,7 +1095,8 @@ mod tests {
         assert!(text
             .iter()
             .any(|line| line.contains("restacking (if needed)")));
-        assert!(text.iter().any(|line| line.contains("[ ] ready to merge")));
+        assert!(text.iter().any(|line| line.contains("[ ] pushing")));
+        assert!(text.iter().any(|line| line.contains("[ ] merging")));
     }
 
     #[test]
@@ -1081,6 +1112,26 @@ mod tests {
             .collect();
 
         assert!(text.iter().any(|line| line.contains("plan complete: yes")));
-        assert!(text.iter().any(|line| line.contains("[x] ready to merge")));
+        assert!(text.iter().any(|line| line.contains("[x] pushing")));
+        assert!(text.iter().any(|line| line.contains("[x] merging")));
+    }
+
+    #[test]
+    fn status_sidebar_lines_shows_push_detail_when_submitting() {
+        let mut row = mk_row("T3");
+        row.state = TaskState::Submitting;
+        row.display_state = "Submitting".to_string();
+
+        let rendered = status_sidebar_lines(Some(&row));
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("push: gt submit in progress...")));
+        assert!(text.iter().any(|line| line.contains("[~] pushing")));
+        assert!(text.iter().any(|line| line.contains("[ ] merging")));
     }
 }

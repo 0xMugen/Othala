@@ -495,10 +495,8 @@ fn run_tui_command(args: TuiCliArgs) -> Result<(), MainError> {
                     ) {
                         Ok(_) => {
                             signal_tick_requested = true;
-                            app.state.status_line = format!(
-                                "patch-ready detected for {}; started graphite submit ({mode:?})",
-                                task_id.0
-                            );
+                            app.state.status_line =
+                                format!("pushing {} to graphite...", task_id.0);
                         }
                         Err(err) => {
                             app.state.status_line =
@@ -2279,20 +2277,32 @@ fn run_single_orchestrator_tick(
         return Ok(None);
     }
 
-    Ok(Some(format!(
-        "tick: scheduled={} blocked={} init={} verify_start={} restacked={} conflicts={} verify_pass={} verify_fail={} submitted={} submit_fail={} errors={}",
-        scheduling.scheduled.len(),
-        scheduling.blocked.len(),
-        runtime_tick.initialized,
-        runtime_tick.verify_started,
-        runtime_tick.restacked,
-        runtime_tick.restack_conflicts,
-        runtime_tick.verify_passed,
-        runtime_tick.verify_failed,
-        runtime_tick.submitted,
-        runtime_tick.submit_failed,
-        runtime_tick.errors
-    )))
+    // Produce a cleaner message when a submit/push occurred.
+    let message = if runtime_tick.submitted > 0 {
+        format!("pushed {} task(s) to graphite", runtime_tick.submitted)
+    } else if runtime_tick.submit_failed > 0 {
+        format!(
+            "push failed for {} task(s)",
+            runtime_tick.submit_failed
+        )
+    } else {
+        format!(
+            "tick: scheduled={} blocked={} init={} verify_start={} restacked={} conflicts={} verify_pass={} verify_fail={} submitted={} submit_fail={} errors={}",
+            scheduling.scheduled.len(),
+            scheduling.blocked.len(),
+            runtime_tick.initialized,
+            runtime_tick.verify_started,
+            runtime_tick.restacked,
+            runtime_tick.restack_conflicts,
+            runtime_tick.verify_passed,
+            runtime_tick.verify_failed,
+            runtime_tick.submitted,
+            runtime_tick.submit_failed,
+            runtime_tick.errors
+        )
+    };
+
+    Ok(Some(message))
 }
 
 fn refresh_selected_task_activity(app: &mut TuiApp, service: &OrchdService) {
