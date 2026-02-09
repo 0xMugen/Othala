@@ -194,7 +194,7 @@ impl RuntimeEngine {
             .clone()
             .unwrap_or_else(|| default_branch_name(task));
         let graphite = GraphiteClient::new(repo.root.clone());
-        if let Err(err) = graphite.create_branch(&branch) {
+        if let Err(err) = graphite.create_branch(&branch, &task.title) {
             if !is_branch_already_present_error(&err) {
                 self.mark_task_failed(
                     service,

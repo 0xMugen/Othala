@@ -37,16 +37,21 @@ impl GraphiteClient {
         }
     }
 
-    pub fn create_branch(&self, branch: &str) -> Result<(), GraphiteError> {
+    pub fn create_branch(&self, branch: &str, message: &str) -> Result<(), GraphiteError> {
         if branch.trim().is_empty() {
             return Err(GraphiteError::ContractViolation {
                 message: "branch name for gt create must not be empty".to_string(),
             });
         }
+        if message.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "commit message for gt create must not be empty".to_string(),
+            });
+        }
         self.cli.run_allowed(
             self.repo_root.as_path(),
             AllowedAutoCommand::Create,
-            ["create", branch],
+            ["create", "-m", message, "--no-interactive", branch],
         )?;
         Ok(())
     }
@@ -125,17 +130,31 @@ impl GraphiteClient {
                 self.cli.run_allowed(
                     self.repo_root.as_path(),
                     AllowedAutoCommand::Submit,
-                    ["submit"],
+                    ["submit", "--no-edit", "--no-interactive"],
                 )?;
             }
             SubmitMode::Stack => {
                 self.cli.run_allowed(
                     self.repo_root.as_path(),
                     AllowedAutoCommand::SubmitStack,
-                    ["submit", "--stack"],
+                    ["submit", "--stack", "--no-edit", "--no-interactive"],
                 )?;
             }
         }
+        Ok(())
+    }
+
+    pub fn repo_init(&self, trunk: &str) -> Result<(), GraphiteError> {
+        if trunk.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "trunk branch for gt repo init must not be empty".to_string(),
+            });
+        }
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::RepoInit,
+            ["repo", "init", "--trunk", trunk, "--no-interactive"],
+        )?;
         Ok(())
     }
 
@@ -229,13 +248,25 @@ mod tests {
             GraphiteCli::new("/definitely/missing/gt"),
         );
         let err = client
-            .create_branch("   ")
+            .create_branch("   ", "some message")
             .expect_err("blank branch must fail contract check");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
     }
 
     #[test]
-    fn submit_stack_mode_passes_stack_flag_to_cli_command() {
+    fn create_branch_rejects_blank_message_before_cli_invocation() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .create_branch("task/T1", "   ")
+            .expect_err("blank message must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn submit_stack_mode_passes_stack_and_headless_flags() {
         let client = GraphiteClient::with_cli(
             PathBuf::from("."),
             GraphiteCli::new("/definitely/missing/gt"),
@@ -247,13 +278,15 @@ mod tests {
             GraphiteError::Io { command, .. } => {
                 assert!(command.contains("submit"));
                 assert!(command.contains("--stack"));
+                assert!(command.contains("--no-edit"));
+                assert!(command.contains("--no-interactive"));
             }
             other => panic!("expected io error, got {other:?}"),
         }
     }
 
     #[test]
-    fn submit_single_mode_does_not_include_stack_flag() {
+    fn submit_single_mode_passes_headless_flags_without_stack() {
         let client = GraphiteClient::with_cli(
             PathBuf::from("."),
             GraphiteCli::new("/definitely/missing/gt"),
@@ -265,6 +298,41 @@ mod tests {
             GraphiteError::Io { command, .. } => {
                 assert!(command.contains("submit"));
                 assert!(!command.contains("--stack"));
+                assert!(command.contains("--no-edit"));
+                assert!(command.contains("--no-interactive"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_init_rejects_blank_trunk() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .repo_init("  ")
+            .expect_err("blank trunk must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn repo_init_passes_correct_arguments() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .repo_init("main")
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("repo"));
+                assert!(command.contains("init"));
+                assert!(command.contains("--trunk"));
+                assert!(command.contains("main"));
+                assert!(command.contains("--no-interactive"));
             }
             other => panic!("expected io error, got {other:?}"),
         }

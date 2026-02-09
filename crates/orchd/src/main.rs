@@ -2360,13 +2360,25 @@ fn run_startup_preflight(repo_configs: &[(PathBuf, RepoConfig)]) -> Result<(), M
             ));
         }
 
-        if let Err(err) = GraphiteClient::new(repo.repo_path.clone()).status_snapshot() {
-            errors.push(format!(
-                "repo {} graphite check failed at {}: {}",
-                repo.repo_id,
-                repo.repo_path.display(),
-                err
-            ));
+        let gt_client = GraphiteClient::new(repo.repo_path.clone());
+        if let Err(err) = gt_client.status_snapshot() {
+            // Graphite may not be initialized in this repo — attempt auto-init.
+            if let Err(init_err) = gt_client.repo_init(&repo.base_branch) {
+                errors.push(format!(
+                    "repo {} graphite check failed at {} (auto-init also failed: {}): {}",
+                    repo.repo_id,
+                    repo.repo_path.display(),
+                    init_err,
+                    err
+                ));
+            } else if let Err(retry_err) = gt_client.status_snapshot() {
+                errors.push(format!(
+                    "repo {} graphite check failed at {} (even after auto-init): {}",
+                    repo.repo_id,
+                    repo.repo_path.display(),
+                    retry_err
+                ));
+            }
         }
     }
 

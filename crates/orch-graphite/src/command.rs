@@ -14,6 +14,7 @@ pub enum AllowedAutoCommand {
     Status,
     Submit,
     SubmitStack,
+    RepoInit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,10 +100,18 @@ impl GraphiteCli {
 fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(), GraphiteError> {
     let ok = match allowed {
         AllowedAutoCommand::Create => {
-            args.len() == 2 && arg_eq(args, 0, "create") && {
-                let branch = arg_at(args, 1);
-                !branch.trim().is_empty() && !branch.starts_with('-')
-            }
+            args.len() == 5
+                && arg_eq(args, 0, "create")
+                && arg_eq(args, 1, "-m")
+                && {
+                    let msg = arg_at(args, 2);
+                    !msg.trim().is_empty()
+                }
+                && arg_eq(args, 3, "--no-interactive")
+                && {
+                    let branch = arg_at(args, 4);
+                    !branch.trim().is_empty() && !branch.starts_with('-')
+                }
         }
         AllowedAutoCommand::Restack => args.len() == 1 && arg_eq(args, 0, "restack"),
         AllowedAutoCommand::AddAllForConflict => {
@@ -113,9 +122,29 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
             args.len() == 2 && arg_eq(args, 0, "log") && arg_eq(args, 1, "short")
         }
         AllowedAutoCommand::Status => args.len() == 1 && arg_eq(args, 0, "status"),
-        AllowedAutoCommand::Submit => args.len() == 1 && arg_eq(args, 0, "submit"),
+        AllowedAutoCommand::Submit => {
+            args.len() == 3
+                && arg_eq(args, 0, "submit")
+                && arg_eq(args, 1, "--no-edit")
+                && arg_eq(args, 2, "--no-interactive")
+        }
         AllowedAutoCommand::SubmitStack => {
-            args.len() == 2 && arg_eq(args, 0, "submit") && arg_eq(args, 1, "--stack")
+            args.len() == 4
+                && arg_eq(args, 0, "submit")
+                && arg_eq(args, 1, "--stack")
+                && arg_eq(args, 2, "--no-edit")
+                && arg_eq(args, 3, "--no-interactive")
+        }
+        AllowedAutoCommand::RepoInit => {
+            args.len() == 5
+                && arg_eq(args, 0, "repo")
+                && arg_eq(args, 1, "init")
+                && arg_eq(args, 2, "--trunk")
+                && {
+                    let trunk = arg_at(args, 3);
+                    !trunk.trim().is_empty() && !trunk.starts_with('-')
+                }
+                && arg_eq(args, 4, "--no-interactive")
         }
     };
 
@@ -161,7 +190,11 @@ mod tests {
 
     #[test]
     fn validate_contract_accepts_allowed_invocations() {
-        assert!(validate_contract(AllowedAutoCommand::Create, &os(&["create", "task/T1"])).is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Create,
+            &os(&["create", "-m", "my message", "--no-interactive", "task/T1"])
+        )
+        .is_ok());
         assert!(validate_contract(AllowedAutoCommand::Restack, &os(&["restack"])).is_ok());
         assert!(
             validate_contract(AllowedAutoCommand::AddAllForConflict, &os(&["add", "-A"])).is_ok()
@@ -171,28 +204,63 @@ mod tests {
         );
         assert!(validate_contract(AllowedAutoCommand::LogShort, &os(&["log", "short"])).is_ok());
         assert!(validate_contract(AllowedAutoCommand::Status, &os(&["status"])).is_ok());
-        assert!(validate_contract(AllowedAutoCommand::Submit, &os(&["submit"])).is_ok());
-        assert!(
-            validate_contract(AllowedAutoCommand::SubmitStack, &os(&["submit", "--stack"])).is_ok()
-        );
+        assert!(validate_contract(
+            AllowedAutoCommand::Submit,
+            &os(&["submit", "--no-edit", "--no-interactive"])
+        )
+        .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::SubmitStack,
+            &os(&["submit", "--stack", "--no-edit", "--no-interactive"])
+        )
+        .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::RepoInit,
+            &os(&["repo", "init", "--trunk", "main", "--no-interactive"])
+        )
+        .is_ok());
     }
 
     #[test]
     fn validate_contract_rejects_disallowed_or_mismatched_invocations() {
-        let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", ""]))
-            .expect_err("empty create branch should fail");
+        // Old-style create (missing -m and --no-interactive) must fail
+        let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", "task/T1"]))
+            .expect_err("old-style create without -m should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
-        let err = validate_contract(AllowedAutoCommand::Create, &os(&["create", "--stack"]))
-            .expect_err("create branch must not be flag-like");
+        let err = validate_contract(
+            AllowedAutoCommand::Create,
+            &os(&["create", "-m", "", "--no-interactive", "task/T1"]),
+        )
+        .expect_err("empty create message should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(
+            AllowedAutoCommand::Create,
+            &os(&["create", "-m", "msg", "--no-interactive", "--stack"]),
+        )
+        .expect_err("create branch must not be flag-like");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
         let err = validate_contract(AllowedAutoCommand::Restack, &os(&["restack", "--stack"]))
             .expect_err("restack extra args should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
+        // Old-style submit (missing --no-edit --no-interactive) must fail
+        let err = validate_contract(AllowedAutoCommand::Submit, &os(&["submit"]))
+            .expect_err("old-style submit without headless flags should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
         let err = validate_contract(AllowedAutoCommand::Submit, &os(&["submit", "--stack"]))
             .expect_err("submit stack args require SubmitStack variant");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        // RepoInit rejects empty trunk
+        let err = validate_contract(
+            AllowedAutoCommand::RepoInit,
+            &os(&["repo", "init", "--trunk", "", "--no-interactive"]),
+        )
+        .expect_err("empty trunk should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
     }
 
