@@ -254,7 +254,10 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         lines.push(divider_line(panes[1].width));
         let tail = pane.tail(20);
         if tail.is_empty() {
-            lines.push(Line::from(Span::styled("no output yet", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
         } else {
             lines.extend(tail.into_iter().map(stylize_output_line));
         }
@@ -319,7 +322,10 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = pane.window(output_cap, scroll_back);
         if window.is_empty() {
-            lines.push(Line::from(Span::styled("no output yet", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
         } else {
             lines.extend(window.into_iter().map(stylize_output_line));
         }
@@ -369,7 +375,10 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = pane.window(output_cap, scroll_back);
         if window.is_empty() {
-            lines.push(Line::from(Span::styled("no output yet", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                "no output yet",
+                Style::default().fg(DIM),
+            )));
         } else {
             lines.extend(window.into_iter().map(stylize_output_line));
         }
@@ -473,10 +482,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             ));
         }
         if !app.state.status_line.is_empty() {
-            spans.push(Span::styled(
-                " | status: ",
-                Style::default().fg(DIM),
-            ));
+            spans.push(Span::styled(" | status: ", Style::default().fg(DIM)));
             spans.push(Span::styled(
                 app.state.status_line.as_str(),
                 Style::default()
@@ -634,12 +640,18 @@ fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
             Style::default().fg(DIM)
         };
         let status_style = if is_selected {
-            Style::default().fg(sc).bg(SELECTED_BG).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(sc)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(sc).add_modifier(Modifier::BOLD)
         };
 
-        spans.push(Span::styled(format!(" {}:{} ", idx + 1, pane.instance_id), base_style));
+        spans.push(Span::styled(
+            format!(" {}:{} ", idx + 1, pane.instance_id),
+            base_style,
+        ));
         spans.push(Span::styled(format!("{tag} "), status_style));
         spans.push(Span::styled(format!("{}l ", pane.lines.len()), meta_style));
     }
