@@ -9,6 +9,7 @@ pub enum AllowedAutoCommand {
     Create,
     Modify,
     Restack,
+    MoveOnto,
     Sync,
     AddAllForConflict,
     ContinueConflict,
@@ -130,6 +131,16 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
         AllowedAutoCommand::Restack => {
             args.len() == 2 && arg_eq(args, 0, "restack") && arg_eq(args, 1, "--no-interactive")
         }
+        AllowedAutoCommand::MoveOnto => {
+            args.len() == 4
+                && arg_eq(args, 0, "move")
+                && arg_eq(args, 1, "--onto")
+                && {
+                    let target = arg_at(args, 2);
+                    !target.trim().is_empty() && !target.starts_with('-')
+                }
+                && arg_eq(args, 3, "--no-interactive")
+        }
         AllowedAutoCommand::Sync => {
             args.len() == 4
                 && arg_eq(args, 0, "sync")
@@ -234,6 +245,11 @@ mod tests {
             &os(&["restack", "--no-interactive"])
         )
         .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::MoveOnto,
+            &os(&["move", "--onto", "task/T1", "--no-interactive"])
+        )
+        .is_ok());
         assert!(
             validate_contract(AllowedAutoCommand::AddAllForConflict, &os(&["add", "-A"])).is_ok()
         );
@@ -295,6 +311,20 @@ mod tests {
             &os(&["restack", "--no-interactive", "--stack"]),
         )
         .expect_err("restack extra args should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(
+            AllowedAutoCommand::MoveOnto,
+            &os(&["move", "--onto", "", "--no-interactive"]),
+        )
+        .expect_err("move target branch must not be empty");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(
+            AllowedAutoCommand::MoveOnto,
+            &os(&["move", "--onto", "task/T1"]),
+        )
+        .expect_err("move must include --no-interactive");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
 
         // Old-style submit (missing --no-edit --no-interactive) must fail

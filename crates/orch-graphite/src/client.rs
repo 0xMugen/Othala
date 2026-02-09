@@ -104,6 +104,20 @@ impl GraphiteClient {
         classify_restack_result(result)
     }
 
+    pub fn move_current_branch_onto(&self, target_branch: &str) -> Result<(), GraphiteError> {
+        if target_branch.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "target branch for gt move must not be empty".to_string(),
+            });
+        }
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::MoveOnto,
+            ["move", "--onto", target_branch, "--no-interactive"],
+        )?;
+        Ok(())
+    }
+
     pub fn begin_conflict_resolution(&self) -> Result<(), GraphiteError> {
         self.cli.run_allowed(
             self.repo_root.as_path(),
@@ -329,6 +343,38 @@ mod tests {
                 assert!(command.contains("submit"));
                 assert!(!command.contains("--stack"));
                 assert!(command.contains("--no-edit"));
+                assert!(command.contains("--no-interactive"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_current_branch_onto_rejects_blank_target() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .move_current_branch_onto("   ")
+            .expect_err("blank target branch must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn move_current_branch_onto_passes_expected_flags() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .move_current_branch_onto("task/T1")
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("move"));
+                assert!(command.contains("--onto"));
+                assert!(command.contains("task/T1"));
                 assert!(command.contains("--no-interactive"));
             }
             other => panic!("expected io error, got {other:?}"),
