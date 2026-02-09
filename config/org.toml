@@ -1,13 +1,17 @@
 [models]
-enabled = ["claude", "codex", "gemini"]
+enabled = [
+    "claude",
+    "codex",
+    "gemini",
+]
 policy = "adaptive"
 min_approvals = 2
 
 [concurrency]
 per_repo = 10
-claude = 10
-codex = 10
-gemini = 10
+claude = 5
+codex = 5
+gemini = 5
 
 [graphite]
 auto_submit = true
