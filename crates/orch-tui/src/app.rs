@@ -563,10 +563,9 @@ mod tests {
                 title: "Task T1".to_string(),
                 branch: "task/T1".to_string(),
                 stack_position: None,
-                state: TaskState::Running,
-                display_state: "Running".to_string(),
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
                 verify_summary: "not_run".to_string(),
-                review_summary: "0/0 unanimous=false cap=ok".to_string(),
                 last_activity: Utc::now(),
             },
             TaskOverviewRow {
@@ -575,10 +574,9 @@ mod tests {
                 title: "Task T2".to_string(),
                 branch: "task/T2".to_string(),
                 stack_position: None,
-                state: TaskState::Running,
-                display_state: "Running".to_string(),
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
                 verify_summary: "not_run".to_string(),
-                review_summary: "0/0 unanimous=false cap=ok".to_string(),
                 last_activity: Utc::now(),
             },
         ];
@@ -633,11 +631,10 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
+            state: TaskState::Chatting,
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
-            display_state: "Running".to_string(),
+            display_state: "Chatting".to_string(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -679,11 +676,10 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
+            state: TaskState::Chatting,
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
-            display_state: "Running".to_string(),
+            display_state: "Chatting".to_string(),
         }];
         app.state.focused_task = true;
 
@@ -764,11 +760,10 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
+            state: TaskState::Chatting,
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
-            display_state: "Running".to_string(),
+            display_state: "Chatting".to_string(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -832,10 +827,9 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
-            display_state: "Running".to_string(),
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
         }];
 
@@ -870,10 +864,9 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
-            display_state: "Running".to_string(),
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
         }];
 
@@ -930,11 +923,10 @@ mod tests {
             title: "Task T1".to_string(),
             branch: "task/T1".to_string(),
             stack_position: None,
-            state: TaskState::Running,
+            state: TaskState::Chatting,
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
-            display_state: "Running".to_string(),
+            display_state: "Chatting".to_string(),
         }];
 
         // Set a focused pane to verify it gets cleared

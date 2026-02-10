@@ -1,14 +1,14 @@
+//! Map events to notifications for MVP.
+
 use chrono::Utc;
 use orch_core::events::{Event, EventKind};
 
 use crate::types::{NotificationMessage, NotificationSeverity, NotificationTopic};
 
+/// Map an event to a notification, if applicable.
 pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
     match &event.kind {
-        EventKind::VerifyCompleted {
-            tier: _,
-            success: false,
-        } => Some(NotificationMessage {
+        EventKind::VerifyCompleted { success: false } => Some(NotificationMessage {
             at: Utc::now(),
             topic: NotificationTopic::VerifyFailed,
             severity: NotificationSeverity::Error,
@@ -22,7 +22,7 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
             topic: NotificationTopic::RestackConflict,
             severity: NotificationSeverity::Warning,
             title: "Restack conflict".to_string(),
-            body: "Restack conflict detected. Resolve conflicts, then run `gt add -A` and `gt continue`."
+            body: "Restack conflict detected. Resolve conflicts manually."
                 .to_string(),
             task_id: event.task_id.clone(),
             repo_id: event.repo_id.clone(),
@@ -36,18 +36,6 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
             task_id: event.task_id.clone(),
             repo_id: event.repo_id.clone(),
         }),
-        EventKind::ReviewRequested { required_models } if required_models.is_empty() => {
-            Some(NotificationMessage {
-                at: Utc::now(),
-                topic: NotificationTopic::WaitingReviewCapacity,
-                severity: NotificationSeverity::Warning,
-                title: "Waiting for review capacity".to_string(),
-                body: "No reviewers available for this task based on current policy/capacity."
-                    .to_string(),
-                task_id: event.task_id.clone(),
-                repo_id: event.repo_id.clone(),
-            })
-        }
         EventKind::Error { code, message } => Some(NotificationMessage {
             at: Utc::now(),
             topic: NotificationTopic::TaskError,
@@ -65,7 +53,6 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
 mod tests {
     use chrono::Utc;
     use orch_core::events::EventKind;
-    use orch_core::state::VerifyTier;
     use orch_core::types::{EventId, RepoId, TaskId};
 
     use super::notification_for_event;
@@ -74,7 +61,7 @@ mod tests {
     fn mk_event(kind: EventKind) -> orch_core::events::Event {
         orch_core::events::Event {
             id: EventId("E1".to_string()),
-            task_id: Some(TaskId("T1".to_string())),
+            task_id: Some(TaskId::new("T1")),
             repo_id: Some(RepoId("R1".to_string())),
             at: Utc::now(),
             kind,
@@ -83,25 +70,12 @@ mod tests {
 
     #[test]
     fn maps_failed_verify_to_error_notification() {
-        let event = mk_event(EventKind::VerifyCompleted {
-            tier: VerifyTier::Quick,
-            success: false,
-        });
+        let event = mk_event(EventKind::VerifyCompleted { success: false });
         let message = notification_for_event(&event).expect("expected notification");
         assert_eq!(message.topic, NotificationTopic::VerifyFailed);
         assert_eq!(message.severity, NotificationSeverity::Error);
         assert_eq!(message.task_id, event.task_id);
         assert_eq!(message.repo_id, event.repo_id);
-    }
-
-    #[test]
-    fn maps_empty_review_requested_to_waiting_capacity() {
-        let event = mk_event(EventKind::ReviewRequested {
-            required_models: Vec::new(),
-        });
-        let message = notification_for_event(&event).expect("expected notification");
-        assert_eq!(message.topic, NotificationTopic::WaitingReviewCapacity);
-        assert_eq!(message.severity, NotificationSeverity::Warning);
     }
 
     #[test]
@@ -130,23 +104,11 @@ mod tests {
         let message = notification_for_event(&event).expect("expected notification");
         assert_eq!(message.topic, NotificationTopic::RestackConflict);
         assert_eq!(message.severity, NotificationSeverity::Warning);
-        assert!(message.body.contains("gt add -A"));
-        assert!(message.body.contains("gt continue"));
-        assert_eq!(message.task_id, event.task_id);
-        assert_eq!(message.repo_id, event.repo_id);
     }
 
     #[test]
-    fn ignores_review_requested_with_non_empty_models_and_successful_verify() {
-        let review_requested = mk_event(EventKind::ReviewRequested {
-            required_models: vec![orch_core::types::ModelKind::Claude],
-        });
-        assert!(notification_for_event(&review_requested).is_none());
-
-        let verify_ok = mk_event(EventKind::VerifyCompleted {
-            tier: VerifyTier::Quick,
-            success: true,
-        });
+    fn ignores_successful_verify() {
+        let verify_ok = mk_event(EventKind::VerifyCompleted { success: true });
         assert!(notification_for_event(&verify_ok).is_none());
     }
 

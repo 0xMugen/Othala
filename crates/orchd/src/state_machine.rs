@@ -1,3 +1,5 @@
+//! MVP state machine for task transitions.
+
 use chrono::{DateTime, Utc};
 use orch_core::state::TaskState;
 use orch_core::types::Task;
@@ -15,6 +17,7 @@ pub struct StateTransition {
     pub at: DateTime<Utc>,
 }
 
+/// Transition a task to a new state.
 pub fn transition_task(
     task: &mut Task,
     to: TaskState,
@@ -31,6 +34,14 @@ pub fn transition_task(
     Ok(StateTransition { from, to, at })
 }
 
+/// Check if a state transition is valid.
+///
+/// MVP state transitions:
+/// ```text
+/// Chatting → Ready → Submitting → AwaitingMerge → Merged
+///                ↓
+///           Restacking
+/// ```
 pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
     use TaskState::*;
 
@@ -39,270 +50,118 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
     }
 
     match (from, to) {
-        (Queued, Initializing) => true,
-        (Initializing, DraftPrOpen | Failed | Paused) => true,
-        (DraftPrOpen, Running | Submitting | Failed | Paused) => true,
-        (
-            Running,
-            Restacking | VerifyingQuick | VerifyingFull | NeedsHuman | Submitting | Failed | Paused,
-        ) => true,
-        (Restacking, VerifyingQuick | RestackConflict | Failed | Paused) => true,
-        (RestackConflict, Restacking | NeedsHuman | Submitting | Failed | Paused) => true,
-        (VerifyingQuick, Reviewing | Running | Submitting | Failed | NeedsHuman | Paused) => true,
-        (
-            VerifyingFull,
-            Running | Reviewing | Ready | Submitting | AwaitingMerge | Failed | NeedsHuman | Paused,
-        ) => true,
-        (Reviewing, Ready | Running | Submitting | VerifyingFull | NeedsHuman | Failed | Paused) => true,
-        (Ready, VerifyingFull | Submitting | AwaitingMerge | Failed | Paused) => true,
-        (Submitting, Restacking | AwaitingMerge | Failed | Paused) => true,
-        (AwaitingMerge, VerifyingFull | Submitting | Merged | Running | Failed | Paused) => true,
-        (NeedsHuman, Running | Submitting | Paused | Failed) => true,
-        (Paused, Running | Submitting | Failed) => true,
-        (Failed, Running | Restacking | NeedsHuman | Submitting | Paused) => true,
+        // Normal flow: Chatting → Ready
+        (Chatting, Ready) => true,
+        // Ready → Submitting (auto-submit)
+        (Ready, Submitting) => true,
+        // Ready → Restacking (parent merged, need rebase)
+        (Ready, Restacking) => true,
+        // Submitting → AwaitingMerge (submit success)
+        (Submitting, AwaitingMerge) => true,
+        // Submitting → Restacking (stack needs rebase during submit)
+        (Submitting, Restacking) => true,
+        // Restacking → Ready (restack complete)
+        (Restacking, Ready) => true,
+        // AwaitingMerge → Merged (PR merged)
+        (AwaitingMerge, Merged) => true,
+        // AwaitingMerge → Restacking (parent merged, need rebase)
+        (AwaitingMerge, Restacking) => true,
+        // Any state can go back to Chatting (retry/fix)
+        (_, Chatting) => true,
         _ => false,
     }
 }
 
+/// Get a string tag for a task state (for event logging).
 pub fn task_state_tag(state: TaskState) -> &'static str {
     use TaskState::*;
     match state {
-        Queued => "QUEUED",
-        Initializing => "INITIALIZING",
-        DraftPrOpen => "DRAFT_PR_OPEN",
-        Running => "RUNNING",
-        Restacking => "RESTACKING",
-        RestackConflict => "RESTACK_CONFLICT",
-        VerifyingQuick => "VERIFYING_QUICK",
-        VerifyingFull => "VERIFYING_FULL",
-        Reviewing => "REVIEWING",
-        NeedsHuman => "NEEDS_HUMAN",
+        Chatting => "CHATTING",
         Ready => "READY",
         Submitting => "SUBMITTING",
+        Restacking => "RESTACKING",
         AwaitingMerge => "AWAITING_MERGE",
         Merged => "MERGED",
-        Failed => "FAILED",
-        Paused => "PAUSED",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use orch_core::state::{ReviewCapacityState, ReviewStatus, VerifyStatus};
-    use orch_core::types::{RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
-
-    use super::{is_transition_allowed, transition_task};
-    use orch_core::state::TaskState;
+    use super::*;
+    use std::path::PathBuf;
 
     fn mk_task(state: TaskState) -> Task {
-        Task {
-            id: TaskId("T1".to_string()),
-            repo_id: RepoId("example".to_string()),
-            title: "task".to_string(),
-            state,
-            role: TaskRole::General,
-            task_type: TaskType::Feature,
-            preferred_model: None,
-            depends_on: Vec::new(),
-            submit_mode: SubmitMode::Single,
-            branch_name: Some("task/T1".to_string()),
-            worktree_path: ".orch/wt/T1".into(),
-            pr: None,
-            verify_status: VerifyStatus::NotRun,
-            review_status: ReviewStatus {
-                required_models: Vec::new(),
-                approvals_received: 0,
-                approvals_required: 0,
-                unanimous: false,
-                capacity_state: ReviewCapacityState::Sufficient,
-            },
-            patch_ready: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+        let mut task = Task::new(
+            orch_core::TaskId::new("T1"),
+            orch_core::RepoId("example".to_string()),
+            "Test task".to_string(),
+            PathBuf::from(".orch/wt/T1"),
+        );
+        task.state = state;
+        task
     }
 
     #[test]
-    fn allows_full_verify_from_active_lifecycle_states() {
-        assert!(is_transition_allowed(
-            TaskState::Running,
-            TaskState::VerifyingFull
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Reviewing,
-            TaskState::VerifyingFull
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Ready,
-            TaskState::VerifyingFull
-        ));
-        assert!(is_transition_allowed(
-            TaskState::AwaitingMerge,
-            TaskState::VerifyingFull
-        ));
+    fn allows_normal_flow_transitions() {
+        assert!(is_transition_allowed(TaskState::Chatting, TaskState::Ready));
+        assert!(is_transition_allowed(TaskState::Ready, TaskState::Submitting));
+        assert!(is_transition_allowed(TaskState::Submitting, TaskState::AwaitingMerge));
+        assert!(is_transition_allowed(TaskState::AwaitingMerge, TaskState::Merged));
     }
 
     #[test]
-    fn allows_return_from_full_verify_to_prior_progress_states() {
-        assert!(is_transition_allowed(
-            TaskState::VerifyingFull,
-            TaskState::Running
-        ));
-        assert!(is_transition_allowed(
-            TaskState::VerifyingFull,
-            TaskState::Reviewing
-        ));
-        assert!(is_transition_allowed(
-            TaskState::VerifyingFull,
-            TaskState::Ready
-        ));
-        assert!(is_transition_allowed(
-            TaskState::VerifyingFull,
-            TaskState::AwaitingMerge
-        ));
+    fn allows_restacking_transitions() {
+        assert!(is_transition_allowed(TaskState::Ready, TaskState::Restacking));
+        assert!(is_transition_allowed(TaskState::Submitting, TaskState::Restacking));
+        assert!(is_transition_allowed(TaskState::AwaitingMerge, TaskState::Restacking));
+        assert!(is_transition_allowed(TaskState::Restacking, TaskState::Ready));
     }
 
     #[test]
-    fn disallows_full_verify_from_queued() {
-        assert!(!is_transition_allowed(
-            TaskState::Queued,
-            TaskState::VerifyingFull
-        ));
+    fn allows_retry_to_chatting() {
+        assert!(is_transition_allowed(TaskState::Ready, TaskState::Chatting));
+        assert!(is_transition_allowed(TaskState::Submitting, TaskState::Chatting));
+        assert!(is_transition_allowed(TaskState::Merged, TaskState::Chatting));
     }
 
     #[test]
-    fn transition_updates_task_state_for_new_verify_full_path() {
-        let mut task = mk_task(TaskState::Ready);
+    fn disallows_invalid_transitions() {
+        assert!(!is_transition_allowed(TaskState::Chatting, TaskState::Merged));
+        assert!(!is_transition_allowed(TaskState::Ready, TaskState::Merged));
+        assert!(!is_transition_allowed(TaskState::Restacking, TaskState::Merged));
+    }
+
+    #[test]
+    fn transition_updates_task_state() {
+        let mut task = mk_task(TaskState::Chatting);
         let at = Utc::now();
-        let transition =
-            transition_task(&mut task, TaskState::VerifyingFull, at).expect("valid transition");
-        assert_eq!(transition.from, TaskState::Ready);
-        assert_eq!(transition.to, TaskState::VerifyingFull);
-        assert_eq!(task.state, TaskState::VerifyingFull);
+        let result = transition_task(&mut task, TaskState::Ready, at).expect("valid transition");
+
+        assert_eq!(result.from, TaskState::Chatting);
+        assert_eq!(result.to, TaskState::Ready);
+        assert_eq!(task.state, TaskState::Ready);
         assert_eq!(task.updated_at, at);
     }
 
     #[test]
-    fn allows_pause_from_active_states_and_resume_from_failed() {
-        assert!(is_transition_allowed(TaskState::Running, TaskState::Paused));
-        assert!(is_transition_allowed(
-            TaskState::Running,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::RestackConflict,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Failed,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Reviewing,
-            TaskState::Paused
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Submitting,
-            TaskState::Paused
-        ));
-        assert!(is_transition_allowed(TaskState::Failed, TaskState::Paused));
-    }
-
-    #[test]
-    fn disallows_invalid_shortcuts_between_lifecycle_states() {
-        assert!(!is_transition_allowed(
-            TaskState::Queued,
-            TaskState::Running
-        ));
-        assert!(!is_transition_allowed(TaskState::Ready, TaskState::Running));
-        assert!(!is_transition_allowed(
-            TaskState::Submitting,
-            TaskState::Ready
-        ));
-        assert!(!is_transition_allowed(
-            TaskState::Merged,
-            TaskState::Running
-        ));
-        assert!(!is_transition_allowed(
-            TaskState::Paused,
-            TaskState::Reviewing
-        ));
-    }
-
-    #[test]
-    fn transition_rejects_invalid_target_state() {
-        let mut task = mk_task(TaskState::Queued);
+    fn transition_rejects_invalid() {
+        let mut task = mk_task(TaskState::Chatting);
         let at = Utc::now();
-        let err = transition_task(&mut task, TaskState::Running, at)
-            .expect_err("queued -> running should be invalid");
+        let err = transition_task(&mut task, TaskState::Merged, at).expect_err("should fail");
+
         assert!(matches!(
             err,
-            super::StateMachineError::InvalidTransition {
-                from: TaskState::Queued,
-                to: TaskState::Running
+            StateMachineError::InvalidTransition {
+                from: TaskState::Chatting,
+                to: TaskState::Merged
             }
         ));
-        assert_eq!(task.state, TaskState::Queued);
+        assert_eq!(task.state, TaskState::Chatting);
     }
 
     #[test]
-    fn transition_allows_noop_self_transition_and_updates_timestamp() {
-        let mut task = mk_task(TaskState::Running);
-        let at = Utc::now();
-        let transition =
-            transition_task(&mut task, TaskState::Running, at).expect("self transition");
-        assert_eq!(transition.from, TaskState::Running);
-        assert_eq!(transition.to, TaskState::Running);
-        assert_eq!(task.state, TaskState::Running);
-        assert_eq!(task.updated_at, at);
-    }
-
-    #[test]
-    fn merged_is_terminal_except_self_transition() {
+    fn self_transition_allowed() {
+        assert!(is_transition_allowed(TaskState::Chatting, TaskState::Chatting));
         assert!(is_transition_allowed(TaskState::Merged, TaskState::Merged));
-        assert!(!is_transition_allowed(TaskState::Merged, TaskState::Paused));
-        assert!(!is_transition_allowed(TaskState::Merged, TaskState::Failed));
-        assert!(!is_transition_allowed(
-            TaskState::Merged,
-            TaskState::Running
-        ));
-    }
-
-    #[test]
-    fn allows_direct_submit_from_intermediate_states() {
-        assert!(is_transition_allowed(
-            TaskState::DraftPrOpen,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::VerifyingQuick,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::VerifyingFull,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Reviewing,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::NeedsHuman,
-            TaskState::Submitting
-        ));
-        assert!(is_transition_allowed(
-            TaskState::Paused,
-            TaskState::Submitting
-        ));
-    }
-
-    #[test]
-    fn task_state_tag_covers_restack_conflict_and_paused() {
-        assert_eq!(
-            super::task_state_tag(TaskState::RestackConflict),
-            "RESTACK_CONFLICT"
-        );
-        assert_eq!(super::task_state_tag(TaskState::Paused), "PAUSED");
     }
 }

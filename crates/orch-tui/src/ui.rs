@@ -28,14 +28,10 @@ const THINKING_FRAMES: [&str; 4] = ["o..", ".o.", "..o", ".o."];
 
 fn state_color(state: TaskState) -> Color {
     match state {
-        TaskState::Running | TaskState::VerifyingQuick | TaskState::VerifyingFull => Color::Green,
+        TaskState::Chatting => Color::Green,
         TaskState::Ready | TaskState::Merged => Color::Cyan,
         TaskState::Submitting | TaskState::AwaitingMerge => Color::Blue,
-        TaskState::Reviewing | TaskState::DraftPrOpen => Color::Magenta,
-        TaskState::NeedsHuman | TaskState::RestackConflict => Color::Yellow,
-        TaskState::Failed => Color::Red,
-        TaskState::Paused => Color::DarkGray,
-        TaskState::Queued | TaskState::Initializing | TaskState::Restacking => Color::White,
+        TaskState::Restacking => Color::Yellow,
     }
 }
 
@@ -390,7 +386,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
-        " repo | task | title | state | verify | review | activity",
+        " repo | task | title | state | verify | activity",
         header_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -915,8 +911,6 @@ fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a>
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(&task.review_summary, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(ts, Style::default().fg(DIM)),
     ])
 }
@@ -1058,105 +1052,54 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> 
         ))];
     };
 
-    // -- coding: Active during initial work, Done once past Running --
-    let coding = match task.state {
-        TaskState::Failed
-            if task.display_state == "VerifyFail" || task.display_state == "SubmitFail" =>
-        {
-            ChecklistState::Done
-        }
-        TaskState::Failed => ChecklistState::Blocked,
-        TaskState::Queued | TaskState::Paused => ChecklistState::Pending,
-        TaskState::Initializing | TaskState::DraftPrOpen => ChecklistState::Active,
-        TaskState::Running if task.display_state == "Running" => ChecklistState::Active,
+    // MVP simplified checklist based on 6 states
+    let chatting = match task.state {
+        TaskState::Chatting => ChecklistState::Active,
         _ => ChecklistState::Done,
     };
 
-    // -- verifying: tracks verify lifecycle via display_state --
     let verifying = if task.display_state == "VerifyFail" {
         ChecklistState::Blocked
-    } else if matches!(
-        task.state,
-        TaskState::VerifyingQuick | TaskState::VerifyingFull
-    ) || task.display_state == "Verifying"
-    {
+    } else if task.display_state == "Verifying" {
         ChecklistState::Active
-    } else if task.display_state == "SubmitFail"
-        || task.display_state == "Verified"
-        || matches!(
-            task.state,
-            TaskState::Reviewing
-                | TaskState::NeedsHuman
-                | TaskState::Ready
-                | TaskState::Submitting
-                | TaskState::AwaitingMerge
-                | TaskState::Merged
-        )
-    {
+    } else if matches!(task.state, TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged) {
         ChecklistState::Done
     } else {
         ChecklistState::Pending
     };
 
-    // -- reviewing: tracks code-review phase --
-    let reviewing = match task.state {
-        TaskState::Reviewing => ChecklistState::Active,
-        TaskState::NeedsHuman => ChecklistState::Blocked,
-        TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged => {
-            ChecklistState::Done
-        }
-        _ => ChecklistState::Pending,
-    };
-
-    // -- restacking: optional, Skipped unless entered --
     let restacking = match task.state {
         TaskState::Restacking => ChecklistState::Active,
-        TaskState::RestackConflict => ChecklistState::Blocked,
         _ => ChecklistState::Skipped,
     };
 
-    // -- pushing: Active during submit, Done once past Submitting --
     let pushing = match task.state {
         TaskState::Submitting => ChecklistState::Active,
         TaskState::AwaitingMerge | TaskState::Merged => ChecklistState::Done,
-        TaskState::Failed if task.display_state == "SubmitFail" => ChecklistState::Blocked,
         _ => ChecklistState::Pending,
     };
 
-    // -- merging: Active when awaiting merge, Done when merged --
     let merging = match task.state {
         TaskState::AwaitingMerge => ChecklistState::Active,
         TaskState::Merged => ChecklistState::Done,
         _ => ChecklistState::Pending,
     };
 
-    // -- plan complete (only at Merged) / current phase label --
+    // Phase label
     let (plan_label, plan_value, plan_color) = if task.state == TaskState::Merged {
         ("plan complete: ", "yes", Color::Green)
     } else {
         let phase = match task.state {
-            TaskState::Queued => "queued",
-            TaskState::Paused => "paused",
-            TaskState::Initializing | TaskState::DraftPrOpen => "coding",
-            TaskState::Running => match task.display_state.as_str() {
+            TaskState::Chatting => match task.display_state.as_str() {
                 "Verifying" => "verifying",
                 "VerifyFail" => "verify failed",
                 "Verified" => "verified",
-                _ => "coding",
+                _ => "chatting",
             },
-            TaskState::VerifyingQuick | TaskState::VerifyingFull => "verifying",
-            TaskState::Reviewing => "reviewing",
-            TaskState::NeedsHuman => "needs human",
             TaskState::Ready => "ready",
             TaskState::Submitting => "pushing",
-            TaskState::AwaitingMerge => "awaiting merge",
             TaskState::Restacking => "restacking",
-            TaskState::RestackConflict => "restack conflict",
-            TaskState::Failed => match task.display_state.as_str() {
-                "VerifyFail" => "verify failed",
-                "SubmitFail" => "push failed",
-                _ => "failed",
-            },
+            TaskState::AwaitingMerge => "awaiting merge",
             TaskState::Merged => unreachable!(),
         };
         ("phase: ", phase, Color::Yellow)
@@ -1184,15 +1127,14 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> 
             "checklist",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        checklist_line("coding", coding),
+        checklist_line("chatting", chatting),
         checklist_line("verifying", verifying),
-        checklist_line("reviewing", reviewing),
         checklist_line("restacking (if needed)", restacking),
         checklist_line("pushing", pushing),
         checklist_line("merging", merging),
     ];
 
-    // -- verify / review / push detail lines --
+    // Verify detail
     if task.verify_summary != "not_run" {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -1203,20 +1145,8 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> 
             ),
         ]));
     }
-    if task.review_summary != "0/0 unanimous=false cap=ok" {
-        if task.verify_summary == "not_run" {
-            lines.push(Line::from(""));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("review: ", Style::default().fg(DIM)),
-            Span::styled(
-                task.review_summary.clone(),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-    }
 
-    // -- push detail --
+    // Push detail
     let push_detail = match task.state {
         TaskState::Submitting => Some("gt submit in progress..."),
         TaskState::AwaitingMerge => Some("pr submitted, awaiting merge"),
@@ -1230,7 +1160,7 @@ fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> 
         ]));
     }
 
-    // -- activity log --
+    // Activity log
     if !activity.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1293,10 +1223,9 @@ mod tests {
             title: format!("Title for {task_id}"),
             branch: format!("task/{task_id}"),
             stack_position: None,
-            state: TaskState::Running,
-            display_state: "Running".to_string(),
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
-            review_summary: "0/0 unanimous=false cap=ok".to_string(),
             last_activity: Utc::now(),
         }
     }
@@ -1356,9 +1285,8 @@ mod tests {
         assert!(text.contains("example"));
         assert!(text.contains("T9"));
         assert!(text.contains("Title for T9"));
-        assert!(text.contains("Running"));
+        assert!(text.contains("Chatting"));
         assert!(text.contains("not_run"));
-        assert!(text.contains("0/0 unanimous=false cap=ok"));
         assert!(text.contains(&expected_ts));
     }
 
@@ -1491,8 +1419,8 @@ mod tests {
     #[test]
     fn status_sidebar_lines_compactly_reports_plan_and_status() {
         let mut row = mk_row("T1");
-        row.state = TaskState::Running;
-        row.display_state = "Running".to_string();
+        row.state = TaskState::Chatting;
+        row.display_state = "Chatting".to_string();
 
         let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
@@ -1500,11 +1428,10 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
 
-        assert!(text.iter().any(|line| line.contains("phase: coding")));
-        assert!(text.iter().any(|line| line.contains("status: Running")));
-        assert!(text.iter().any(|line| line.contains("[~] coding")));
+        assert!(text.iter().any(|line| line.contains("phase: chatting")));
+        assert!(text.iter().any(|line| line.contains("status: Chatting")));
+        assert!(text.iter().any(|line| line.contains("[~] chatting")));
         assert!(text.iter().any(|line| line.contains("[ ] verifying")));
-        assert!(text.iter().any(|line| line.contains("[ ] reviewing")));
         assert!(text
             .iter()
             .any(|line| line.contains("restacking (if needed)")));
@@ -1602,10 +1529,10 @@ mod tests {
     }
 
     #[test]
-    fn status_sidebar_shows_push_failed_when_submit_fails() {
+    fn status_sidebar_shows_verifying_when_verify_in_progress() {
         let mut row = mk_row("T1");
-        row.state = TaskState::Failed;
-        row.display_state = "SubmitFail".to_string();
+        row.state = TaskState::Chatting;
+        row.display_state = "Verifying".to_string();
 
         let rendered = status_sidebar_lines(Some(&row), &[]);
         let text: Vec<String> = rendered
@@ -1613,16 +1540,14 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
 
-        assert!(text.iter().any(|line| line.contains("[x] coding")));
-        assert!(text.iter().any(|line| line.contains("[x] verifying")));
-        assert!(text.iter().any(|line| line.contains("[!] pushing")));
-        assert!(text.iter().any(|line| line.contains("phase: push failed")));
+        assert!(text.iter().any(|line| line.contains("[~] verifying")));
+        assert!(text.iter().any(|line| line.contains("phase: verifying")));
     }
 
     #[test]
     fn status_sidebar_shows_verify_failed_when_verify_fails() {
         let mut row = mk_row("T1");
-        row.state = TaskState::Failed;
+        row.state = TaskState::Chatting;
         row.display_state = "VerifyFail".to_string();
 
         let rendered = status_sidebar_lines(Some(&row), &[]);
@@ -1631,11 +1556,8 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
 
-        assert!(text.iter().any(|line| line.contains("[x] coding")));
         assert!(text.iter().any(|line| line.contains("[!] verifying")));
-        assert!(text
-            .iter()
-            .any(|line| line.contains("phase: verify failed")));
+        assert!(text.iter().any(|line| line.contains("phase: verify failed")));
     }
 
     #[test]

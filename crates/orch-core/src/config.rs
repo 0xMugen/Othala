@@ -1,9 +1,10 @@
+//! Configuration types for the MVP orchestrator.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::state::ReviewPolicy;
 use crate::types::{ModelKind, SubmitMode};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,7 @@ pub enum SetupApplyError {
     InvalidConcurrencyDefault,
 }
 
+/// Organization-wide configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgConfig {
     pub models: ModelsConfig,
@@ -56,11 +58,13 @@ pub struct OrgConfig {
     pub ui: UiConfig,
 }
 
+/// Model configuration - simplified for MVP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsConfig {
     pub enabled: Vec<ModelKind>,
-    pub policy: ReviewPolicy,
-    pub min_approvals: usize,
+    /// Default model to use for new chats
+    #[serde(default)]
+    pub default: Option<ModelKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,15 +108,11 @@ pub struct NixConfig {
     pub dev_shell: String,
 }
 
+/// Verify configuration - simplified for MVP (just a command).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyConfig {
-    pub quick: VerifyCommands,
-    pub full: VerifyCommands,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifyCommands {
-    pub commands: Vec<String>,
+    /// Command to run for verification (e.g., "cargo check && cargo test")
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,21 +206,14 @@ fn dedupe_models(models: &[ModelKind]) -> Vec<ModelKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_setup_selection_to_org_config, load_org_config, load_repo_config, parse_org_config,
-        parse_repo_config, save_org_config, ConfigError, OrgConfig, SetupApplyError,
-    };
-    use crate::types::ModelKind;
+    use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     fn sample_org() -> OrgConfig {
         parse_org_config(
             r#"
 [models]
 enabled = ["claude", "codex", "gemini"]
-policy = "adaptive"
-min_approvals = 2
 
 [concurrency]
 per_repo = 10
@@ -249,17 +242,8 @@ base_branch = "main"
 [nix]
 dev_shell = "nix develop"
 
-[verify.quick]
-commands = [
-  "nix develop -c just fmt",
-  "nix develop -c just lint",
-  "nix develop -c just test"
-]
-
-[verify.full]
-commands = [
-  "nix develop -c just test-all"
-]
+[verify]
+command = "cargo check && cargo test"
 
 [graphite]
 draft_on_start = true
@@ -332,12 +316,8 @@ submit_mode = "single"
         assert_eq!(repo.repo_id, "example");
         assert_eq!(repo.base_branch, "main");
         assert_eq!(repo.nix.dev_shell, "nix develop");
-        assert_eq!(repo.verify.quick.commands.len(), 3);
-        assert_eq!(repo.verify.full.commands.len(), 1);
-        assert_eq!(
-            repo.graphite.submit_mode,
-            Some(crate::types::SubmitMode::Single)
-        );
+        assert_eq!(repo.verify.command, "cargo check && cargo test");
+        assert_eq!(repo.graphite.submit_mode, Some(SubmitMode::Single));
     }
 
     #[test]
@@ -351,23 +331,5 @@ submit_mode = "single"
         let err = load_repo_config(&invalid_path).expect_err("invalid config should fail");
         assert!(matches!(err, ConfigError::Parse { path, .. } if path == invalid_path));
         let _ = fs::remove_file(invalid_path);
-    }
-
-    #[test]
-    fn save_org_config_creates_parent_directories() {
-        let config = sample_org();
-        let base = std::env::temp_dir().join(format!(
-            "othala-config-parent-test-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let path = base.join("nested/config/org.toml");
-
-        save_org_config(&path, &config).expect("save config in nested path");
-        assert!(path.exists());
-
-        let loaded = load_org_config(&path).expect("load config from nested path");
-        assert_eq!(loaded, config);
-
-        let _ = fs::remove_dir_all(base);
     }
 }

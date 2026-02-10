@@ -1,7 +1,8 @@
+//! Validation for MVP orchestrator types.
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::{OrgConfig, RepoConfig};
-use crate::state::ReviewPolicy;
 use crate::types::TaskSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,17 +43,6 @@ impl Validate for OrgConfig {
             });
         }
 
-        if matches!(self.models.policy, ReviewPolicy::Adaptive)
-            && self.models.enabled.len() >= 2
-            && self.models.min_approvals < 2
-        {
-            issues.push(ValidationIssue {
-                level: ValidationLevel::Error,
-                code: "models.min_approvals.too_low",
-                message: "adaptive policy requires min_approvals >= 2 when two or more models are enabled".to_string(),
-            });
-        }
-
         issues
     }
 }
@@ -77,19 +67,11 @@ impl Validate for RepoConfig {
             });
         }
 
-        if self.verify.quick.commands.is_empty() {
-            issues.push(ValidationIssue {
-                level: ValidationLevel::Error,
-                code: "verify.quick.commands.empty",
-                message: "verify.quick.commands must contain at least one command".to_string(),
-            });
-        }
-
-        if self.verify.full.commands.is_empty() {
+        if self.verify.command.trim().is_empty() {
             issues.push(ValidationIssue {
                 level: ValidationLevel::Warning,
-                code: "verify.full.commands.empty",
-                message: "verify.full.commands is empty; merge sandbox full verification will be unavailable".to_string(),
+                code: "verify.command.empty",
+                message: "verify command is empty; verification will be skipped".to_string(),
             });
         }
 
@@ -134,18 +116,16 @@ mod tests {
     use super::{Validate, ValidationLevel};
     use crate::config::{
         ConcurrencyConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy, NixConfig, OrgConfig,
-        RepoConfig, RepoGraphiteConfig, UiConfig, VerifyCommands, VerifyConfig,
+        RepoConfig, RepoGraphiteConfig, UiConfig, VerifyConfig,
     };
-    use crate::state::ReviewPolicy;
-    use crate::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskRole, TaskSpec, TaskType};
+    use crate::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskSpec};
     use std::path::PathBuf;
 
     fn valid_org_config() -> OrgConfig {
         OrgConfig {
             models: ModelsConfig {
                 enabled: vec![ModelKind::Claude, ModelKind::Codex],
-                policy: ReviewPolicy::Adaptive,
-                min_approvals: 2,
+                default: Some(ModelKind::Claude),
             },
             concurrency: ConcurrencyConfig {
                 per_repo: 10,
@@ -173,12 +153,7 @@ mod tests {
                 dev_shell: "nix develop".to_string(),
             },
             verify: VerifyConfig {
-                quick: VerifyCommands {
-                    commands: vec!["nix develop -c cargo test".to_string()],
-                },
-                full: VerifyCommands {
-                    commands: vec!["nix develop -c cargo test --all-targets".to_string()],
-                },
+                command: "cargo check && cargo test".to_string(),
             },
             graphite: RepoGraphiteConfig {
                 draft_on_start: true,
@@ -190,12 +165,10 @@ mod tests {
     fn valid_task_spec() -> TaskSpec {
         TaskSpec {
             repo_id: RepoId("example".to_string()),
-            task_id: TaskId("T123".to_string()),
+            task_id: TaskId::new("T123"),
             title: "Add profile endpoint".to_string(),
-            task_type: TaskType::Feature,
-            role: TaskRole::General,
             preferred_model: Some(ModelKind::Codex),
-            depends_on: vec![TaskId("T100".to_string())],
+            depends_on: vec![TaskId::new("T100")],
             submit_mode: Some(SubmitMode::Single),
         }
     }
@@ -204,27 +177,12 @@ mod tests {
     fn org_config_validation_reports_expected_errors() {
         let mut config = valid_org_config();
         config.concurrency.per_repo = 0;
-        config.models.min_approvals = 1;
 
         let issues = config.validate();
-        assert_eq!(issues.len(), 2);
-
+        assert_eq!(issues.len(), 1);
         assert!(issues.iter().any(|issue| {
             issue.level == ValidationLevel::Error && issue.code == "concurrency.per_repo.zero"
         }));
-        assert!(issues.iter().any(|issue| {
-            issue.level == ValidationLevel::Error && issue.code == "models.min_approvals.too_low"
-        }));
-    }
-
-    #[test]
-    fn org_config_validation_allows_single_model_with_min_approvals_one() {
-        let mut config = valid_org_config();
-        config.models.enabled = vec![ModelKind::Claude];
-        config.models.min_approvals = 1;
-
-        let issues = config.validate();
-        assert!(issues.is_empty());
     }
 
     #[test]
@@ -240,27 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn org_config_validation_allows_low_min_approvals_in_strict_policy() {
-        let mut config = valid_org_config();
-        config.models.policy = ReviewPolicy::Strict;
-        config.models.min_approvals = 1;
-
-        let issues = config.validate();
-        assert!(issues
-            .iter()
-            .all(|issue| issue.code != "models.min_approvals.too_low"));
-    }
-
-    #[test]
-    fn repo_config_validation_reports_errors_and_warning() {
+    fn repo_config_validation_reports_errors() {
         let mut config = valid_repo_config();
         config.repo_id = "  ".to_string();
         config.base_branch = "".to_string();
-        config.verify.quick.commands.clear();
-        config.verify.full.commands.clear();
 
         let issues = config.validate();
-        assert_eq!(issues.len(), 4);
+        assert_eq!(issues.len(), 2);
 
         assert!(issues.iter().any(|issue| {
             issue.level == ValidationLevel::Error && issue.code == "repo.repo_id.empty"
@@ -268,18 +212,12 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.level == ValidationLevel::Error && issue.code == "repo.base_branch.empty"
         }));
-        assert!(issues.iter().any(|issue| {
-            issue.level == ValidationLevel::Error && issue.code == "verify.quick.commands.empty"
-        }));
-        assert!(issues.iter().any(|issue| {
-            issue.level == ValidationLevel::Warning && issue.code == "verify.full.commands.empty"
-        }));
     }
 
     #[test]
     fn task_spec_validation_reports_missing_identifiers_and_title() {
         let mut spec = valid_task_spec();
-        spec.task_id = TaskId(" ".to_string());
+        spec.task_id = TaskId::new(" ");
         spec.repo_id = RepoId("".to_string());
         spec.title = "   ".to_string();
 

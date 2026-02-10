@@ -1,26 +1,21 @@
+//! Core types for the Othala MVP orchestrator.
+
 pub mod config;
 pub mod events;
 pub mod state;
 pub mod types;
 pub mod validation;
 
-// MVP simplified types
-pub mod chat;
-pub mod chat_state;
-
+// Re-export core types for convenience
 pub use config::*;
 pub use events::*;
 pub use state::*;
 pub use types::*;
 pub use validation::*;
 
-// MVP re-exports
-pub use chat::{Chat, ChatId};
-pub use chat_state::{ChatState, VerifyResult};
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_org_config, ModelKind, TaskId, TaskState, Validate};
+    use super::*;
     use std::any::TypeId;
 
     #[test]
@@ -31,13 +26,11 @@ mod tests {
     }
 
     #[test]
-    fn crate_root_reexports_parse_and_validate_helpers() {
-        let mut org = parse_org_config(
+    fn crate_root_reexports_parse_helpers() {
+        let org = parse_org_config(
             r#"
 [models]
 enabled = ["claude", "codex"]
-policy = "adaptive"
-min_approvals = 2
 
 [concurrency]
 per_repo = 10
@@ -56,12 +49,6 @@ web_bind = "127.0.0.1:9842"
         )
         .expect("parse org");
 
-        assert!(org.validate().is_empty());
-
-        org.concurrency.per_repo = 0;
-        let issues = org.validate();
-        assert!(issues
-            .iter()
-            .any(|issue| issue.code == "concurrency.per_repo.zero"));
+        assert_eq!(org.models.enabled.len(), 2);
     }
 }

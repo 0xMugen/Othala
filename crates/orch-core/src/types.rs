@@ -1,11 +1,19 @@
+//! Core types for the MVP orchestrator.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::state::{ReviewStatus, TaskState, VerifyStatus};
+use crate::state::{TaskState, VerifyStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
+
+impl TaskId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoId(pub String);
@@ -28,205 +36,198 @@ pub enum SubmitMode {
     Stack,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskRole {
-    Architecture,
-    GraphiteStack,
-    Docs,
-    Frontend,
-    Tests,
-    General,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskType {
-    Feature,
-    Bugfix,
-    Chore,
-    Refactor,
-    Docs,
-    Test,
-    Other(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestRef {
     pub number: u64,
     pub url: String,
     pub draft: bool,
 }
 
+/// Task specification for creating new tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
     pub repo_id: RepoId,
     pub task_id: TaskId,
     pub title: String,
-    #[serde(rename = "type")]
-    pub task_type: TaskType,
-    pub role: TaskRole,
     pub preferred_model: Option<ModelKind>,
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
     pub submit_mode: Option<SubmitMode>,
 }
 
+/// A task (AI coding session) - simplified for MVP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub repo_id: RepoId,
     pub title: String,
     pub state: TaskState,
-    pub role: TaskRole,
-    pub task_type: TaskType,
     pub preferred_model: Option<ModelKind>,
     pub depends_on: Vec<TaskId>,
     pub submit_mode: SubmitMode,
     pub branch_name: Option<String>,
     pub worktree_path: PathBuf,
     pub pr: Option<PullRequestRef>,
-    pub verify_status: VerifyStatus,
-    pub review_status: ReviewStatus,
-    /// Set to `true` when the agent emits `[patch_ready]` or exits cleanly,
-    /// indicating coding completed before any subsequent failure.
     #[serde(default)]
-    pub patch_ready: bool,
+    pub verify_status: VerifyStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskApproval {
-    pub task_id: TaskId,
-    pub reviewer: ModelKind,
-    pub verdict: crate::events::ReviewVerdict,
-    pub issued_at: DateTime<Utc>,
+impl Task {
+    /// Create a new task in Chatting state.
+    pub fn new(
+        id: TaskId,
+        repo_id: RepoId,
+        title: String,
+        worktree_path: PathBuf,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            repo_id,
+            title,
+            state: TaskState::Chatting,
+            preferred_model: None,
+            depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
+            branch_name: None,
+            worktree_path,
+            pr: None,
+            verify_status: VerifyStatus::NotRun,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Add explicit dependency.
+    pub fn with_dependency(mut self, dep: TaskId) -> Self {
+        self.depends_on.push(dep);
+        self
+    }
+
+    /// Set preferred model.
+    pub fn with_model(mut self, model: ModelKind) -> Self {
+        self.preferred_model = Some(model);
+        self
+    }
+
+    /// Check if all explicit dependencies are resolved (merged).
+    pub fn dependencies_resolved(&self, tasks: &[Task]) -> bool {
+        self.depends_on.iter().all(|dep_id| {
+            tasks
+                .iter()
+                .find(|t| &t.id == dep_id)
+                .map(|t| t.state == TaskState::Merged)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Transition to Ready state.
+    pub fn mark_ready(&mut self) {
+        self.state = TaskState::Ready;
+        self.updated_at = Utc::now();
+    }
+
+    /// Transition to Submitting state.
+    pub fn mark_submitting(&mut self) {
+        self.state = TaskState::Submitting;
+        self.updated_at = Utc::now();
+    }
+
+    /// Transition to Restacking state.
+    pub fn mark_restacking(&mut self) {
+        self.state = TaskState::Restacking;
+        self.updated_at = Utc::now();
+    }
+
+    /// Transition to AwaitingMerge state with PR URL.
+    pub fn mark_submitted(&mut self, pr_url: String, pr_number: u64) {
+        self.state = TaskState::AwaitingMerge;
+        self.pr = Some(PullRequestRef {
+            number: pr_number,
+            url: pr_url,
+            draft: false,
+        });
+        self.updated_at = Utc::now();
+    }
+
+    /// Transition to Merged state.
+    pub fn mark_merged(&mut self) {
+        self.state = TaskState::Merged;
+        self.updated_at = Utc::now();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ModelKind, PullRequestRef, RepoId, SubmitMode, Task, TaskApproval, TaskId, TaskRole,
-        TaskSpec, TaskType,
-    };
-    use crate::events::ReviewVerdict;
-    use crate::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus, VerifyTier};
-    use chrono::{TimeZone, Utc};
-    use serde::{Deserialize, Serialize};
-    use std::path::PathBuf;
+    use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct SpecDoc {
-        spec: TaskSpec,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct EnumDoc {
-        model: ModelKind,
-        mode: SubmitMode,
-        role: TaskRole,
+    fn make_task(id: &str, state: TaskState) -> Task {
+        let mut task = Task::new(
+            TaskId::new(id),
+            RepoId("test-repo".to_string()),
+            format!("Test {}", id),
+            PathBuf::from(format!(".orch/wt/{}", id)),
+        );
+        task.state = state;
+        task
     }
 
     #[test]
-    fn task_spec_uses_type_field_and_defaults_depends_on() {
-        let doc: SpecDoc = toml::from_str(
+    fn new_task_starts_in_chatting_state() {
+        let task = Task::new(
+            TaskId::new("T1"),
+            RepoId("repo".to_string()),
+            "Test".to_string(),
+            PathBuf::from(".orch/wt/T1"),
+        );
+        assert_eq!(task.state, TaskState::Chatting);
+    }
+
+    #[test]
+    fn dependencies_resolved_when_all_merged() {
+        let t1 = make_task("T1", TaskState::Merged);
+        let t2 = make_task("T2", TaskState::Merged);
+        let t3 = make_task("T3", TaskState::Chatting)
+            .with_dependency(TaskId::new("T1"))
+            .with_dependency(TaskId::new("T2"));
+
+        let tasks = vec![t1, t2, t3.clone()];
+        assert!(t3.dependencies_resolved(&tasks));
+    }
+
+    #[test]
+    fn dependencies_not_resolved_when_some_not_merged() {
+        let t1 = make_task("T1", TaskState::Merged);
+        let t2 = make_task("T2", TaskState::Ready); // Not merged!
+        let t3 = make_task("T3", TaskState::Chatting)
+            .with_dependency(TaskId::new("T1"))
+            .with_dependency(TaskId::new("T2"));
+
+        let tasks = vec![t1, t2, t3.clone()];
+        assert!(!t3.dependencies_resolved(&tasks));
+    }
+
+    #[test]
+    fn task_spec_deserializes_with_defaults() {
+        let spec: TaskSpec = toml::from_str(
             r#"
-[spec]
 repo_id = "example"
 task_id = "T123"
 title = "Add endpoint"
-type = "feature"
-role = "general"
 preferred_model = "codex"
 "#,
         )
         .expect("deserialize task spec");
 
-        assert_eq!(doc.spec.task_type, TaskType::Feature);
-        assert!(doc.spec.depends_on.is_empty());
-        assert_eq!(doc.spec.preferred_model, Some(ModelKind::Codex));
-
-        let encoded = toml::to_string(&doc).expect("serialize task spec");
-        assert!(encoded.contains("type = \"feature\""));
+        assert!(spec.depends_on.is_empty());
+        assert_eq!(spec.preferred_model, Some(ModelKind::Codex));
     }
 
     #[test]
-    fn core_enums_serialize_as_snake_case() {
-        let doc = EnumDoc {
-            model: ModelKind::Claude,
-            mode: SubmitMode::Stack,
-            role: TaskRole::GraphiteStack,
-        };
-
-        let encoded = toml::to_string(&doc).expect("serialize enum doc");
-        assert!(encoded.contains("model = \"claude\""));
-        assert!(encoded.contains("mode = \"stack\""));
-        assert!(encoded.contains("role = \"graphite_stack\""));
-
-        let decoded: EnumDoc = toml::from_str(&encoded).expect("deserialize enum doc");
-        assert_eq!(decoded, doc);
-    }
-
-    #[test]
-    fn task_roundtrip_preserves_core_fields_and_status() {
-        let task = Task {
-            id: TaskId("T200".to_string()),
-            repo_id: RepoId("example".to_string()),
-            title: "Implement verify runner".to_string(),
-            state: TaskState::Reviewing,
-            role: TaskRole::Tests,
-            task_type: TaskType::Feature,
-            preferred_model: Some(ModelKind::Gemini),
-            depends_on: vec![TaskId("T100".to_string())],
-            submit_mode: SubmitMode::Single,
-            branch_name: Some("t200-verify-runner".to_string()),
-            worktree_path: PathBuf::from(".orch/wt/T200"),
-            pr: Some(PullRequestRef {
-                number: 42,
-                url: "https://github.com/0xMugen/Othala/pull/42".to_string(),
-                draft: true,
-            }),
-            verify_status: VerifyStatus::Passed {
-                tier: VerifyTier::Quick,
-            },
-            review_status: ReviewStatus {
-                required_models: vec![ModelKind::Claude, ModelKind::Codex],
-                approvals_received: 2,
-                approvals_required: 2,
-                unanimous: true,
-                capacity_state: ReviewCapacityState::Sufficient,
-            },
-            patch_ready: false,
-            created_at: Utc
-                .with_ymd_and_hms(2026, 2, 8, 16, 10, 0)
-                .single()
-                .expect("valid created_at"),
-            updated_at: Utc
-                .with_ymd_and_hms(2026, 2, 8, 16, 12, 30)
-                .single()
-                .expect("valid updated_at"),
-        };
-
-        let encoded = toml::to_string(&task).expect("serialize task");
-        let decoded: Task = toml::from_str(&encoded).expect("deserialize task");
-        assert_eq!(decoded, task);
-    }
-
-    #[test]
-    fn task_approval_roundtrip_preserves_reviewer_and_verdict() {
-        let approval = TaskApproval {
-            task_id: TaskId("T321".to_string()),
-            reviewer: ModelKind::Codex,
-            verdict: ReviewVerdict::Approve,
-            issued_at: Utc
-                .with_ymd_and_hms(2026, 2, 8, 17, 0, 0)
-                .single()
-                .expect("valid issued_at"),
-        };
-
-        let encoded = toml::to_string(&approval).expect("serialize approval");
-        let decoded: TaskApproval = toml::from_str(&encoded).expect("deserialize approval");
-        assert_eq!(decoded, approval);
+    fn model_kind_serializes_as_snake_case() {
+        let json = serde_json::to_string(&ModelKind::Claude).unwrap();
+        assert_eq!(json, "\"claude\"");
     }
 }
