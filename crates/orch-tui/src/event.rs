@@ -26,39 +26,19 @@ pub enum TuiEvent {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use orch_core::state::{ReviewCapacityState, ReviewStatus, TaskState, VerifyStatus};
-    use orch_core::types::{ModelKind, RepoId, SubmitMode, Task, TaskId, TaskRole, TaskType};
+    use orch_core::types::{ModelKind, RepoId, Task, TaskId};
+    use std::path::PathBuf;
 
     use super::TuiEvent;
     use crate::AgentPaneStatus;
 
     fn mk_task(id: &str) -> Task {
-        Task {
-            id: TaskId(id.to_string()),
-            repo_id: RepoId("example".to_string()),
-            title: format!("Task {id}"),
-            state: TaskState::Running,
-            role: TaskRole::General,
-            task_type: TaskType::Feature,
-            preferred_model: None,
-            depends_on: Vec::new(),
-            submit_mode: SubmitMode::Single,
-            branch_name: Some(format!("task/{id}")),
-            worktree_path: format!(".orch/wt/{id}").into(),
-            pr: None,
-            verify_status: VerifyStatus::NotRun,
-            review_status: ReviewStatus {
-                required_models: vec![ModelKind::Claude],
-                approvals_received: 0,
-                approvals_required: 1,
-                unanimous: false,
-                capacity_state: ReviewCapacityState::Sufficient,
-            },
-            patch_ready: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+        Task::new(
+            TaskId(id.to_string()),
+            RepoId("example".to_string()),
+            format!("Task {id}"),
+            PathBuf::from(format!(".orch/wt/{id}")),
+        )
     }
 
     #[test]

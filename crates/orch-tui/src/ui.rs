@@ -483,10 +483,8 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Focused views ----------------------------------------------------------
 
 fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let pane = app
-        .state
-        .focused_pane_idx
-        .and_then(|idx| app.state.panes.get(idx));
+    let pane_idx = app.state.focused_pane_idx;
+    let pane = pane_idx.and_then(|idx| app.state.panes.get(idx));
 
     let viewport_height = area.height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
@@ -495,7 +493,12 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
         lines.push(divider_line(area.width));
         let output_cap = viewport_height.saturating_sub(lines.len());
-        let window = pane.window(output_cap, scroll_back);
+        let window = pane_idx
+            .map(|idx| {
+                app.state
+                    .pane_window_with_history(idx, output_cap, scroll_back)
+            })
+            .unwrap_or_default();
         if window.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no output yet",
@@ -524,9 +527,14 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .map(|t| t.task_id.0.clone())
         .unwrap_or_else(|| "-".to_string());
 
-    // Find the agent pane for this task
-    let task_pane =
-        selected_task.and_then(|task| app.state.panes.iter().find(|p| p.task_id == task.task_id));
+    // Find the agent pane for this task.
+    let task_pane_idx = selected_task.and_then(|task| {
+        app.state
+            .panes
+            .iter()
+            .position(|p| p.task_id == task.task_id)
+    });
+    let task_pane = task_pane_idx.and_then(|idx| app.state.panes.get(idx));
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -538,9 +546,10 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Left: task status checklist
     let status_title = format!("Status ({task_id_str})");
-    let status_widget = Paragraph::new(status_sidebar_lines(selected_task, &app.state.selected_task_activity))
-        .block(focused_block(&status_title))
-        .wrap(Wrap { trim: false });
+    let status_widget =
+        Paragraph::new(status_sidebar_lines(selected_task, &app.state.selected_task_activity))
+            .block(focused_block(&status_title))
+            .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
 
     // Right: agent PTY output
@@ -548,7 +557,12 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
         lines.push(divider_line(cols[1].width));
         let output_cap = viewport_height.saturating_sub(lines.len());
-        let window = pane.window(output_cap, scroll_back);
+        let window = task_pane_idx
+            .map(|idx| {
+                app.state
+                    .pane_window_with_history(idx, output_cap, scroll_back)
+            })
+            .unwrap_or_default();
         if window.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no output yet",

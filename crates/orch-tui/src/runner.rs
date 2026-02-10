@@ -9,7 +9,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn run_tui(app: &mut TuiApp, tick_rate: Duration) -> Result<(), TuiError> {
     run_tui_with_hook(app, tick_rate, |_| {})
@@ -48,12 +48,33 @@ fn run_loop(
     tick_rate: Duration,
     on_tick: &mut impl FnMut(&mut TuiApp),
 ) -> Result<(), TuiError> {
+    let mut last_tick = Instant::now();
+    let mut needs_draw = true;
+
     while !app.should_quit {
-        if event::poll(tick_rate)? {
+        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+
+        if event::poll(timeout)? {
+            // Drain all queued input events at once instead of one-per-loop.
             handle_terminal_event(app, event::read()?);
+            while event::poll(Duration::ZERO)? {
+                handle_terminal_event(app, event::read()?);
+            }
+            needs_draw = true;
         }
-        on_tick(app);
-        terminal.draw(|frame| render_dashboard(frame, app))?;
+
+        // Only run the expensive on_tick (SQLite queries, supervisor poll)
+        // when the tick interval has actually elapsed — not on every keypress.
+        if last_tick.elapsed() >= tick_rate {
+            on_tick(app);
+            last_tick = Instant::now();
+            needs_draw = true;
+        }
+
+        if needs_draw {
+            terminal.draw(|frame| render_dashboard(frame, app))?;
+            needs_draw = false;
+        }
     }
     Ok(())
 }

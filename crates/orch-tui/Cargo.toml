@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 crossterm = "0.28"
+orch-agents = { path = "../orch-agents" }
 orch-core = { path = "../orch-core" }
+orchd = { path = "../orchd" }
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

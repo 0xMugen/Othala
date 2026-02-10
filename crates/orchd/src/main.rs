@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
+use orchd::supervisor::AgentSupervisor;
 use orchd::{OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +31,11 @@ enum Commands {
     List,
     /// Show chat status
     Status {
+        /// Chat/task ID
+        id: String,
+    },
+    /// Delete a chat
+    Delete {
         /// Chat/task ID
         id: String,
     },
@@ -58,9 +64,9 @@ enum ChatAction {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let db_path = PathBuf::from(".othala/db.sqlite");
-    let event_log_path = PathBuf::from(".othala/events");
-    
+    let db_path = PathBuf::from(".orch/state.sqlite");
+    let event_log_path = PathBuf::from(".orch/events");
+
     // Ensure directories exist
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -84,15 +90,15 @@ fn main() -> anyhow::Result<()> {
         Commands::Chat { action } => match action {
             ChatAction::New { repo, title, model } => {
                 let task_id = format!("chat-{}", Utc::now().timestamp_millis());
-                let worktree_path = PathBuf::from(format!(".othala/wt/{}", task_id));
-                
+                let worktree_path = std::env::current_dir()?;
+
                 let mut task = Task::new(
                     TaskId::new(&task_id),
                     RepoId(repo.clone()),
                     title.clone(),
                     worktree_path,
                 );
-                
+
                 let model_kind = match model.to_lowercase().as_str() {
                     "claude" => ModelKind::Claude,
                     "codex" => ModelKind::Codex,
@@ -120,7 +126,12 @@ fn main() -> anyhow::Result<()> {
                     println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
                     println!("{}", "-".repeat(70));
                     for task in tasks {
-                        println!("{:<20} {:<10} {:<40}", task.id.0, format!("{:?}", task.state), task.title);
+                        println!(
+                            "{:<20} {:<10} {:<40}",
+                            task.id.0,
+                            format!("{:?}", task.state),
+                            task.title
+                        );
                     }
                 }
             }
@@ -133,7 +144,12 @@ fn main() -> anyhow::Result<()> {
                 println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
                 println!("{}", "-".repeat(70));
                 for task in tasks {
-                    println!("{:<20} {:<10} {:<40}", task.id.0, format!("{:?}", task.state), task.title);
+                    println!(
+                        "{:<20} {:<10} {:<40}",
+                        task.id.0,
+                        format!("{:?}", task.state),
+                        task.title
+                    );
                 }
             }
         }
@@ -159,24 +175,106 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Delete { id } => {
+            let task_id = TaskId::new(&id);
+            if service.delete_task(&task_id)? {
+                println!("Deleted chat: {}", id);
+            } else {
+                println!("Chat not found: {}", id);
+            }
+        }
         Commands::Daemon => {
             println!("Othala daemon starting...");
-            println!("MVP daemon mode - monitoring for chat state changes");
-            
-            // Simple daemon loop
-            loop {
-                let tasks = service.list_tasks()?;
-                let chatting = tasks.iter().filter(|t| t.state == TaskState::Chatting).count();
-                let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
-                let submitting = tasks.iter().filter(|t| t.state == TaskState::Submitting).count();
-                let awaiting = tasks.iter().filter(|t| t.state == TaskState::AwaitingMerge).count();
-                let merged = tasks.iter().filter(|t| t.state == TaskState::Merged).count();
+            println!("MVP daemon mode - spawning agents for active chats");
 
-                if tasks.is_empty() {
-                    // Sleep quietly when no tasks
-                } else {
+            let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+
+            loop {
+                // Spawn agents for Chatting tasks that don't have a session yet.
+                let chatting_tasks = service.list_tasks_by_state(TaskState::Chatting)?;
+                for task in &chatting_tasks {
+                    if !supervisor.has_session(&task.id) {
+                        if let Err(e) = supervisor.spawn_agent(
+                            &task.id,
+                            &task.repo_id,
+                            &task.worktree_path,
+                            &task.title,
+                            task.preferred_model,
+                        ) {
+                            eprintln!("[daemon] Failed to spawn agent for {}: {}", task.id.0, e);
+                        }
+                    }
+                }
+
+                // Poll for output and completed agents.
+                let result = supervisor.poll();
+                for chunk in &result.output {
+                    for line in &chunk.lines {
+                        println!("[{}] {}", chunk.task_id.0, line);
+                    }
+                }
+                for outcome in &result.completed {
+                    let now = Utc::now();
+                    if outcome.patch_ready || outcome.success {
+                        let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
+                        match service.mark_ready(&outcome.task_id, event_id, now) {
+                            Ok(_) => println!(
+                                "[daemon] {} -> Ready (exit={:?})",
+                                outcome.task_id.0, outcome.exit_code
+                            ),
+                            Err(e) => eprintln!(
+                                "[daemon] Failed to mark {} ready: {}",
+                                outcome.task_id.0, e
+                            ),
+                        }
+                    } else if outcome.needs_human {
+                        let event = Event {
+                            id: EventId(format!("E-HUMAN-{}", outcome.task_id.0)),
+                            task_id: Some(outcome.task_id.clone()),
+                            repo_id: None,
+                            at: now,
+                            kind: EventKind::NeedsHuman {
+                                reason: "Agent requested human assistance".to_string(),
+                            },
+                        };
+                        if let Err(e) = service.record_event(&event) {
+                            eprintln!(
+                                "[daemon] Failed to record needs_human for {}: {}",
+                                outcome.task_id.0, e
+                            );
+                        } else {
+                            println!("[daemon] {} needs human help", outcome.task_id.0);
+                        }
+                    } else {
+                        eprintln!(
+                            "[daemon] {} failed (exit={:?})",
+                            outcome.task_id.0, outcome.exit_code
+                        );
+                    }
+                }
+
+                // Print status summary.
+                let tasks = service.list_tasks()?;
+                if !tasks.is_empty() {
+                    let chatting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Chatting)
+                        .count();
+                    let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
+                    let submitting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Submitting)
+                        .count();
+                    let awaiting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::AwaitingMerge)
+                        .count();
+                    let merged = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Merged)
+                        .count();
                     println!(
-                        "[{}] Chats: {} chatting, {} ready, {} submitting, {} awaiting merge, {} merged",
+                        "[{}] {} chatting, {} ready, {} submitting, {} awaiting, {} merged",
                         chrono::Local::now().format("%H:%M:%S"),
                         chatting,
                         ready,
@@ -186,7 +284,7 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
     }

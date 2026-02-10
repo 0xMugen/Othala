@@ -1,16 +1,23 @@
-use orch_tui::{run_tui, TuiApp, TuiError};
-use rusqlite::Connection;
-use std::env;
-use std::path::{Path, PathBuf};
+use chrono::Utc;
+use orch_core::events::{Event, EventKind};
+use orch_core::state::TaskState;
+use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
+use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiEvent, UiAction};
+use orchd::supervisor::AgentSupervisor;
+use orchd::{OrchdService, Scheduler, SchedulerConfig};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_TICK_MS: u64 = 250;
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
+const DEFAULT_EVENT_LOG_PATH: &str = ".orch/events";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     tick_ms: u64,
     sqlite_path: PathBuf,
+    event_log_path: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +25,9 @@ enum MainError {
     #[error("{0}")]
     Args(String),
     #[error(transparent)]
-    Tui(#[from] TuiError),
+    Tui(#[from] orch_tui::TuiError),
+    #[error(transparent)]
+    Any(#[from] anyhow::Error),
 }
 
 fn main() {
@@ -29,54 +38,227 @@ fn main() {
 }
 
 fn run() -> Result<(), MainError> {
-    let mut argv = env::args();
+    let mut argv = std::env::args();
     let program = argv.next().unwrap_or_else(|| "orch-tui".to_string());
     let args = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
 
-    let mut app = match load_tasks_from_sqlite(&args.sqlite_path) {
-        Ok(tasks) => {
-            let mut app = TuiApp::from_tasks(&tasks);
-            app.state.status_line = format!(
-                "orch-tui started tick_ms={} tasks={}",
-                args.tick_ms,
-                tasks.len()
-            );
-            app
-        }
-        Err(err) => {
-            let mut app = TuiApp::default();
-            app.state.status_line = format!(
-                "orch-tui started tick_ms={} task_load_warning={}",
-                args.tick_ms, err
-            );
-            app
-        }
-    };
-    run_tui(&mut app, Duration::from_millis(args.tick_ms))?;
-    Ok(())
-}
-
-fn load_tasks_from_sqlite(path: &Path) -> Result<Vec<orch_core::types::Task>, String> {
-    let conn = Connection::open(path).map_err(|err| err.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT payload_json FROM tasks ORDER BY updated_at DESC, task_id ASC")
-        .map_err(|err| err.to_string())?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|err| err.to_string())?;
-    let mut tasks = Vec::new();
-    for row in rows {
-        let payload = row.map_err(|err| err.to_string())?;
-        let task = serde_json::from_str::<orch_core::types::Task>(&payload)
-            .map_err(|err| err.to_string())?;
-        tasks.push(task);
+    // Ensure directories exist.
+    if let Some(parent) = args.sqlite_path.parent() {
+        std::fs::create_dir_all(parent).ok();
     }
-    Ok(tasks)
+    std::fs::create_dir_all(&args.event_log_path).ok();
+
+    let scheduler = Scheduler::new(SchedulerConfig {
+        per_repo_limit: 10,
+        per_model_limit: vec![
+            (ModelKind::Claude, 10),
+            (ModelKind::Codex, 10),
+            (ModelKind::Gemini, 10),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>(),
+    });
+
+    let service = OrchdService::open(&args.sqlite_path, &args.event_log_path, scheduler)
+        .map_err(|e| MainError::Any(e.into()))?;
+
+    let tasks = service.list_tasks().unwrap_or_default();
+    let mut app = TuiApp::from_tasks(&tasks);
+    app.state.status_line = format!(
+        "orch-tui started tick_ms={} tasks={}",
+        args.tick_ms,
+        tasks.len()
+    );
+
+    let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+    let mut tick_counter: u32 = 0;
+
+    run_tui_with_hook(&mut app, Duration::from_millis(args.tick_ms), |app| {
+        // Process queued actions from the UI.
+        let actions = app.drain_actions();
+        for queued in actions {
+            match queued.action {
+                UiAction::CreateTask => {
+                    if let Some(prompt) = &queued.prompt {
+                        let model = queued.model.unwrap_or(ModelKind::Claude);
+                        let task_id = format!("chat-{}", Utc::now().timestamp_millis());
+                        let worktree_path =
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        let mut task = Task::new(
+                            TaskId::new(&task_id),
+                            RepoId("default".to_string()),
+                            prompt.clone(),
+                            worktree_path,
+                        );
+                        task.preferred_model = Some(model);
+                        let event = Event {
+                            id: EventId(format!("E-CREATE-{}", task_id)),
+                            task_id: Some(task.id.clone()),
+                            repo_id: Some(task.repo_id.clone()),
+                            at: Utc::now(),
+                            kind: EventKind::TaskCreated,
+                        };
+                        match service.create_task(&task, &event) {
+                            Ok(()) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("created chat {task_id}"),
+                                });
+                            }
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("create failed: {e}"),
+                                });
+                            }
+                        }
+                    }
+                }
+                UiAction::DeleteTask => {
+                    if let Some(task_id) = &queued.task_id {
+                        supervisor.stop(task_id);
+                        match service.delete_task(task_id) {
+                            Ok(true) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("deleted {}", task_id.0),
+                                });
+                            }
+                            Ok(false) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("not found: {}", task_id.0),
+                                });
+                            }
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("delete failed: {e}"),
+                                });
+                            }
+                        }
+                    }
+                }
+                UiAction::StartAgent => {
+                    if let Some(task_id) = &queued.task_id {
+                        if let Ok(Some(task)) = service.task(task_id) {
+                            let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                            match supervisor.spawn_agent(
+                                &task.id,
+                                &task.repo_id,
+                                &task.worktree_path,
+                                &task.title,
+                                Some(model),
+                            ) {
+                                Ok(()) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "started {:?} agent for {}",
+                                            model, task_id.0
+                                        ),
+                                    });
+                                }
+                                Err(e) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!("spawn failed: {e}"),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                UiAction::StopAgent => {
+                    if let Some(task_id) = &queued.task_id {
+                        supervisor.stop(task_id);
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!("stopped agent for {}", task_id.0),
+                        });
+                    }
+                }
+                _ => {
+                    app.apply_event(TuiEvent::StatusLine {
+                        message: format!("action not yet implemented: {:?}", queued.action),
+                    });
+                }
+            }
+        }
+
+        // Poll supervisor for output and completions.
+        let result = supervisor.poll();
+        for chunk in result.output {
+            let instance_id = format!("agent-{}", chunk.task_id.0);
+            app.apply_event(TuiEvent::AgentPaneOutput {
+                instance_id,
+                task_id: chunk.task_id,
+                model: chunk.model,
+                lines: chunk.lines,
+            });
+        }
+        for outcome in &result.completed {
+            let instance_id = format!("agent-{}", outcome.task_id.0);
+            let now = Utc::now();
+            if outcome.patch_ready || outcome.success {
+                let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
+                let _ = service.mark_ready(&outcome.task_id, event_id, now);
+                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                    instance_id,
+                    status: AgentPaneStatus::Exited,
+                });
+            } else if outcome.needs_human {
+                let event = Event {
+                    id: EventId(format!("E-HUMAN-{}", outcome.task_id.0)),
+                    task_id: Some(outcome.task_id.clone()),
+                    repo_id: None,
+                    at: now,
+                    kind: EventKind::NeedsHuman {
+                        reason: "Agent requested human assistance".to_string(),
+                    },
+                };
+                let _ = service.record_event(&event);
+                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                    instance_id,
+                    status: AgentPaneStatus::Waiting,
+                });
+            } else {
+                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                    instance_id,
+                    status: AgentPaneStatus::Failed,
+                });
+            }
+        }
+
+        // Auto-spawn agents for Chatting tasks without a running session.
+        if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
+            for task in &chatting {
+                if !supervisor.has_session(&task.id) {
+                    let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                    if let Ok(()) = supervisor.spawn_agent(
+                        &task.id,
+                        &task.repo_id,
+                        &task.worktree_path,
+                        &task.title,
+                        Some(model),
+                    ) {
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!("auto-started {:?} agent for {}", model, task.id.0),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Refresh task list periodically (every ~2s at 250ms tick).
+        tick_counter = tick_counter.wrapping_add(1);
+        if tick_counter % 8 == 0 {
+            if let Ok(tasks) = service.list_tasks() {
+                app.apply_event(TuiEvent::TasksReplaced { tasks });
+            }
+        }
+    })?;
+
+    supervisor.stop_all();
+    Ok(())
 }
 
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {
     let mut tick_ms = DEFAULT_TICK_MS;
     let mut sqlite_path = PathBuf::from(DEFAULT_SQLITE_PATH);
+    let mut event_log_path = PathBuf::from(DEFAULT_EVENT_LOG_PATH);
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -104,6 +286,13 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
                 })?;
                 sqlite_path = PathBuf::from(value);
             }
+            "--event-log-path" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    MainError::Args("missing value for --event-log-path".to_string())
+                })?;
+                event_log_path = PathBuf::from(value);
+            }
             other => {
                 return Err(MainError::Args(format!(
                     "unknown argument: {other}\n\n{}",
@@ -117,15 +306,17 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
     Ok(CliArgs {
         tick_ms,
         sqlite_path,
+        event_log_path,
     })
 }
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--tick-ms <u64>] [--sqlite-path <path>]\n\
+        "Usage: {program} [--tick-ms <u64>] [--sqlite-path <path>] [--event-log-path <path>]\n\
 Defaults:\n\
   --tick-ms {DEFAULT_TICK_MS}\n\
-  --sqlite-path {DEFAULT_SQLITE_PATH}"
+  --sqlite-path {DEFAULT_SQLITE_PATH}\n\
+  --event-log-path {DEFAULT_EVENT_LOG_PATH}"
     )
 }
 
@@ -142,6 +333,7 @@ mod tests {
             CliArgs {
                 tick_ms: 250,
                 sqlite_path: PathBuf::from(".orch/state.sqlite"),
+                event_log_path: PathBuf::from(".orch/events"),
             }
         );
     }
@@ -163,6 +355,7 @@ mod tests {
             CliArgs {
                 tick_ms: 500,
                 sqlite_path: PathBuf::from("/tmp/state.sqlite"),
+                event_log_path: PathBuf::from(".orch/events"),
             }
         );
     }

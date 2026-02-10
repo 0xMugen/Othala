@@ -6,6 +6,7 @@ pub mod persistence;
 pub mod scheduler;
 pub mod service;
 pub mod state_machine;
+pub mod supervisor;
 pub mod types;
 
 pub use dependency_graph::*;
@@ -24,9 +25,6 @@ mod tests {
     #[test]
     fn crate_root_reexports_state_machine_helpers() {
         assert_eq!(task_state_tag(TaskState::Chatting), "CHATTING");
-        assert!(is_transition_allowed(
-            TaskState::Chatting,
-            TaskState::Ready
-        ));
+        assert!(is_transition_allowed(TaskState::Chatting, TaskState::Ready));
     }
 }

@@ -116,6 +116,20 @@ impl AgentPane {
     }
 }
 
+fn window_over_lines(lines: &[String], max_lines: usize, scroll_back: usize) -> Vec<String> {
+    let len = lines.len();
+    let max_back = len.saturating_sub(max_lines.min(len));
+    let clamped = scroll_back.min(max_back);
+    let end = len - clamped;
+    let start = end.saturating_sub(max_lines);
+    lines
+        .iter()
+        .skip(start)
+        .take(end - start)
+        .cloned()
+        .collect()
+}
+
 /// Normalize raw pane output into stable display text.
 pub fn normalize_pane_line(raw: &str) -> Option<String> {
     let trimmed = raw.trim_end_matches(['\n', '\r']);
@@ -310,17 +324,70 @@ impl DashboardState {
         };
     }
 
-    fn focused_pane_line_count(&self) -> usize {
+    pub fn pane_window_with_history(
+        &self,
+        pane_idx: usize,
+        max_lines: usize,
+        scroll_back: usize,
+    ) -> Vec<String> {
+        let Some(current_pane) = self.panes.get(pane_idx) else {
+            return Vec::new();
+        };
+
+        if scroll_back == 0 {
+            return current_pane.window(max_lines, 0);
+        }
+
+        let mut timeline = self.pane_history_prefix_lines(pane_idx);
+        timeline.extend(current_pane.lines.iter().cloned());
+        window_over_lines(&timeline, max_lines, scroll_back)
+    }
+
+    fn pane_history_prefix_lines(&self, pane_idx: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for pane in self
+            .panes
+            .iter()
+            .take(pane_idx)
+            .filter(|pane| !pane.lines.is_empty())
+        {
+            lines.push(format!(
+                "--- previous chat {} ({:?}, task={}) ---",
+                pane.instance_id, pane.model, pane.task_id.0
+            ));
+            lines.extend(pane.lines.iter().cloned());
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    fn pane_line_count_with_history(&self, pane_idx: usize) -> usize {
+        let Some(current_pane) = self.panes.get(pane_idx) else {
+            return 0;
+        };
+        let history_lines = self
+            .panes
+            .iter()
+            .take(pane_idx)
+            .filter(|pane| !pane.lines.is_empty())
+            .map(|pane| pane.lines.len() + 2)
+            .sum::<usize>();
+        history_lines + current_pane.lines.len()
+    }
+
+    fn focused_pane_index(&self) -> Option<usize> {
         if self.focused_task {
             self.selected_task()
-                .and_then(|task| self.panes.iter().find(|p| p.task_id == task.task_id))
-                .map(|p| p.lines.len())
-                .unwrap_or(0)
-        } else if let Some(idx) = self.focused_pane_idx {
-            self.panes.get(idx).map(|p| p.lines.len()).unwrap_or(0)
+                .and_then(|task| self.panes.iter().position(|p| p.task_id == task.task_id))
         } else {
-            0
+            self.focused_pane_idx
         }
+    }
+
+    fn focused_pane_line_count(&self) -> usize {
+        self.focused_pane_index()
+            .map(|idx| self.pane_line_count_with_history(idx))
+            .unwrap_or(0)
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
@@ -411,5 +478,60 @@ mod tests {
         let value = normalize_pane_line("[stderr] \u{1b}[31mapply failed\u{1b}[0m")
             .expect("normalized line");
         assert_eq!(value, "apply failed");
+    }
+
+    fn pane_with_lines(
+        instance_id: &str,
+        task_id: &str,
+        model: ModelKind,
+        lines: &[&str],
+    ) -> AgentPane {
+        let mut pane = AgentPane::new(instance_id, TaskId(task_id.to_string()), model);
+        pane.status = AgentPaneStatus::Running;
+        for line in lines {
+            pane.append_line(*line);
+        }
+        pane
+    }
+
+    #[test]
+    fn pane_window_with_history_keeps_live_tail_clean_until_scroll() {
+        let mut state = DashboardState::default();
+        state.panes = vec![
+            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1", "new 2"]),
+        ];
+
+        let window = state.pane_window_with_history(1, 20, 0);
+        assert_eq!(window, vec!["new 1".to_string(), "new 2".to_string()]);
+    }
+
+    #[test]
+    fn pane_window_with_history_reveals_previous_chat_on_scroll_up() {
+        let mut state = DashboardState::default();
+        state.panes = vec![
+            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
+        ];
+
+        let window = state.pane_window_with_history(1, 20, 1);
+        assert!(window
+            .iter()
+            .any(|line| line.contains("--- previous chat A1")));
+        assert!(window.iter().any(|line| line == "old 1"));
+        assert!(window.iter().any(|line| line == "new 1"));
+    }
+
+    #[test]
+    fn focused_scroll_budget_includes_previous_chat_history() {
+        let mut state = DashboardState::default();
+        state.panes = vec![
+            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
+        ];
+        state.focused_pane_idx = Some(1);
+
+        state.scroll_up(50);
+        assert!(state.scroll_back > state.panes[1].lines.len());
     }
 }
