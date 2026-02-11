@@ -181,10 +181,7 @@ mod tests {
 
     #[test]
     fn ignores_self_and_unknown_dependencies() {
-        let graph = build_dependency_graph(&[
-            mk_task("T1", &["T1", "T9"]),
-            mk_task("T2", &[]),
-        ]);
+        let graph = build_dependency_graph(&[mk_task("T1", &["T1", "T9"]), mk_task("T2", &[])]);
 
         let t1_parents = graph
             .parents_by_child
@@ -213,10 +210,7 @@ mod tests {
 
     #[test]
     fn restack_targets_empty_for_leaf_or_unknown_parent() {
-        let graph = build_dependency_graph(&[
-            mk_task("T1", &[]),
-            mk_task("T2", &["T1"]),
-        ]);
+        let graph = build_dependency_graph(&[mk_task("T1", &[]), mk_task("T2", &["T1"])]);
 
         let leaf_targets = restack_descendants_for_parent(&graph, &TaskId("T2".to_string()));
         assert!(leaf_targets.is_empty());

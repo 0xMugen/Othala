@@ -236,8 +236,7 @@ impl TuiApp {
             buffer: String::new(),
             task_id,
         };
-        self.state.status_line =
-            "chat input: type message, Enter=send Esc=cancel".to_string();
+        self.state.status_line = "chat input: type message, Enter=send Esc=cancel".to_string();
     }
 
     fn begin_delete_task_confirmation(&mut self) {

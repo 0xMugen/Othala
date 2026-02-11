@@ -421,6 +421,42 @@ pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> Strin
     }
 }
 
+/// Status of a tool call execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Parsed structural block within agent output for the chat zone view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatBlock {
+    /// User message sent via interactive chat (lines starting with "> ")
+    UserMessage { lines: Vec<String> },
+    /// Agent thinking/reasoning block
+    Thinking { lines: Vec<String> },
+    /// Agent prose (default assistant text)
+    AssistantText { lines: Vec<String> },
+    /// Tool execution block (exec marker + command output)
+    ToolCall {
+        tool: String,
+        lines: Vec<String>,
+        status: ToolStatus,
+    },
+    /// Code fence (``` ... ```)
+    CodeFence {
+        lang: Option<String>,
+        lines: Vec<String>,
+    },
+    /// Diff block (diff --git ... or *** Begin Patch ...)
+    Diff { lines: Vec<String> },
+    /// Agent identity marker (claude/codex/gemini)
+    AgentMarker { agent: String },
+    /// Status/signal lines ([patch_ready], [needs_human], etc.)
+    StatusSignal { line: String },
+}
+
 fn summarize(value: &str, max_len: usize) -> String {
     let mut s = value.trim().replace('\n', " ");
     if s.len() <= max_len {

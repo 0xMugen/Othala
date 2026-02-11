@@ -365,7 +365,7 @@ fn model_tag(model: orch_core::types::ModelKind) -> &'static str {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode};
+    use orch_core::types::{EventId, ModelKind, RepoId};
     use std::path::PathBuf;
 
     fn mk_store() -> SqliteStore {
@@ -402,7 +402,7 @@ mod tests {
         let store = mk_store();
         let mut t1 = mk_task("T1", TaskState::Chatting);
         let mut t2 = mk_task("T2", TaskState::Ready);
-        
+
         t1.updated_at = Utc::now() - chrono::Duration::seconds(100);
         t2.updated_at = Utc::now();
 
@@ -432,17 +432,28 @@ mod tests {
 
         assert!(store.delete_task(&task.id).expect("delete"));
         assert!(store.load_task(&task.id).expect("load").is_none());
-        assert!(store.list_events_for_task(&task.id).expect("events").is_empty());
+        assert!(store
+            .list_events_for_task(&task.id)
+            .expect("events")
+            .is_empty());
     }
 
     #[test]
     fn list_tasks_by_state() {
         let store = mk_store();
-        store.upsert_task(&mk_task("T1", TaskState::Chatting)).expect("upsert");
-        store.upsert_task(&mk_task("T2", TaskState::Ready)).expect("upsert");
-        store.upsert_task(&mk_task("T3", TaskState::Chatting)).expect("upsert");
+        store
+            .upsert_task(&mk_task("T1", TaskState::Chatting))
+            .expect("upsert");
+        store
+            .upsert_task(&mk_task("T2", TaskState::Ready))
+            .expect("upsert");
+        store
+            .upsert_task(&mk_task("T3", TaskState::Chatting))
+            .expect("upsert");
 
-        let chatting = store.list_tasks_by_state(TaskState::Chatting).expect("list");
+        let chatting = store
+            .list_tasks_by_state(TaskState::Chatting)
+            .expect("list");
         assert_eq!(chatting.len(), 2);
 
         let ready = store.list_tasks_by_state(TaskState::Ready).expect("list");

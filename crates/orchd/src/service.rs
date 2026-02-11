@@ -168,8 +168,9 @@ impl OrchdService {
         event_id: EventId,
         at: DateTime<Utc>,
     ) -> Result<Task, ServiceError> {
-        let task = self.transition_task_state(task_id, TaskState::Submitting, event_id.clone(), at)?;
-        
+        let task =
+            self.transition_task_state(task_id, TaskState::Submitting, event_id.clone(), at)?;
+
         self.record_event(&Event {
             id: EventId(format!("{}-submit-started", event_id.0)),
             task_id: Some(task.id.clone()),
@@ -239,7 +240,8 @@ impl OrchdService {
         event_id: EventId,
         at: DateTime<Utc>,
     ) -> Result<Task, ServiceError> {
-        let task = self.transition_task_state(task_id, TaskState::Restacking, event_id.clone(), at)?;
+        let task =
+            self.transition_task_state(task_id, TaskState::Restacking, event_id.clone(), at)?;
 
         self.record_event(&Event {
             id: EventId(format!("{}-restack-started", event_id.0)),
@@ -275,7 +277,10 @@ impl OrchdService {
     // --- Dependency Graph ---
 
     /// Get tasks that need restacking when a parent task is updated.
-    pub fn restack_targets_for_parent(&self, parent_task_id: &TaskId) -> Result<Vec<TaskId>, ServiceError> {
+    pub fn restack_targets_for_parent(
+        &self,
+        parent_task_id: &TaskId,
+    ) -> Result<Vec<TaskId>, ServiceError> {
         let tasks = self.store.list_tasks()?;
         let graph = build_dependency_graph(&tasks);
         Ok(restack_descendants_for_parent(&graph, parent_task_id))
@@ -372,7 +377,6 @@ mod tests {
     use crate::scheduler::SchedulerConfig;
     use chrono::Utc;
     use orch_core::types::{ModelKind, RepoId};
-    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -460,8 +464,13 @@ mod tests {
             .expect("mark ready");
 
         // Ready -> Submitting
-        svc.start_submit(&task.id, SubmitMode::Single, EventId("E2".to_string()), Utc::now())
-            .expect("start submit");
+        svc.start_submit(
+            &task.id,
+            SubmitMode::Single,
+            EventId("E2".to_string()),
+            Utc::now(),
+        )
+        .expect("start submit");
 
         // Submitting -> AwaitingMerge
         let task = svc

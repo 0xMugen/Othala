@@ -18,9 +18,12 @@ pub struct VerifyResult {
 }
 
 /// Run the verification command for a repo.
-pub fn run_verify(repo_config: &RepoConfig, worktree_path: &Path) -> Result<VerifyResult, VerifyError> {
+pub fn run_verify(
+    repo_config: &RepoConfig,
+    worktree_path: &Path,
+) -> Result<VerifyResult, VerifyError> {
     let command = &repo_config.verify.command;
-    
+
     if command.trim().is_empty() {
         // No verify command configured - consider it a pass
         return Ok(VerifyResult {
@@ -66,10 +69,7 @@ pub fn run_verify(repo_config: &RepoConfig, worktree_path: &Path) -> Result<Veri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orch_core::config::{
-        GraphiteOrgConfig, ModelsConfig, MovePolicy, NixConfig, OrgConfig,
-        RepoGraphiteConfig, UiConfig, VerifyConfig, ConcurrencyConfig,
-    };
+    use orch_core::config::{NixConfig, RepoGraphiteConfig, VerifyConfig};
     use orch_core::types::SubmitMode;
     use std::path::PathBuf;
 

@@ -104,31 +104,64 @@ mod tests {
     #[test]
     fn allows_normal_flow_transitions() {
         assert!(is_transition_allowed(TaskState::Chatting, TaskState::Ready));
-        assert!(is_transition_allowed(TaskState::Ready, TaskState::Submitting));
-        assert!(is_transition_allowed(TaskState::Submitting, TaskState::AwaitingMerge));
-        assert!(is_transition_allowed(TaskState::AwaitingMerge, TaskState::Merged));
+        assert!(is_transition_allowed(
+            TaskState::Ready,
+            TaskState::Submitting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::AwaitingMerge
+        ));
+        assert!(is_transition_allowed(
+            TaskState::AwaitingMerge,
+            TaskState::Merged
+        ));
     }
 
     #[test]
     fn allows_restacking_transitions() {
-        assert!(is_transition_allowed(TaskState::Ready, TaskState::Restacking));
-        assert!(is_transition_allowed(TaskState::Submitting, TaskState::Restacking));
-        assert!(is_transition_allowed(TaskState::AwaitingMerge, TaskState::Restacking));
-        assert!(is_transition_allowed(TaskState::Restacking, TaskState::Ready));
+        assert!(is_transition_allowed(
+            TaskState::Ready,
+            TaskState::Restacking
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::Restacking
+        ));
+        assert!(is_transition_allowed(
+            TaskState::AwaitingMerge,
+            TaskState::Restacking
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Restacking,
+            TaskState::Ready
+        ));
     }
 
     #[test]
     fn allows_retry_to_chatting() {
         assert!(is_transition_allowed(TaskState::Ready, TaskState::Chatting));
-        assert!(is_transition_allowed(TaskState::Submitting, TaskState::Chatting));
-        assert!(is_transition_allowed(TaskState::Merged, TaskState::Chatting));
+        assert!(is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::Chatting
+        ));
+        assert!(is_transition_allowed(
+            TaskState::Merged,
+            TaskState::Chatting
+        ));
     }
 
     #[test]
     fn disallows_invalid_transitions() {
-        assert!(!is_transition_allowed(TaskState::Chatting, TaskState::Merged));
+        assert!(!is_transition_allowed(
+            TaskState::Chatting,
+            TaskState::Merged
+        ));
         assert!(!is_transition_allowed(TaskState::Ready, TaskState::Merged));
-        assert!(!is_transition_allowed(TaskState::Restacking, TaskState::Merged));
+        assert!(!is_transition_allowed(
+            TaskState::Restacking,
+            TaskState::Merged
+        ));
     }
 
     #[test]
@@ -161,7 +194,10 @@ mod tests {
 
     #[test]
     fn self_transition_allowed() {
-        assert!(is_transition_allowed(TaskState::Chatting, TaskState::Chatting));
+        assert!(is_transition_allowed(
+            TaskState::Chatting,
+            TaskState::Chatting
+        ));
         assert!(is_transition_allowed(TaskState::Merged, TaskState::Merged));
     }
 }

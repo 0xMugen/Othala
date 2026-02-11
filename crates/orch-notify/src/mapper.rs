@@ -22,8 +22,7 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
             topic: NotificationTopic::RestackConflict,
             severity: NotificationSeverity::Warning,
             title: "Restack conflict".to_string(),
-            body: "Restack conflict detected. Resolve conflicts manually."
-                .to_string(),
+            body: "Restack conflict detected. Resolve conflicts manually.".to_string(),
             task_id: event.task_id.clone(),
             repo_id: event.repo_id.clone(),
         }),

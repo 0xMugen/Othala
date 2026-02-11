@@ -70,8 +70,8 @@ mod tests {
 
     #[test]
     fn detects_patch_ready_variants() {
-        let signal =
-            detect_common_signal("status: [patch_ready] all changes applied").expect("patch ready signal");
+        let signal = detect_common_signal("status: [patch_ready] all changes applied")
+            .expect("patch ready signal");
         assert_eq!(signal.kind, AgentSignalKind::PatchReady);
     }
 
@@ -165,8 +165,7 @@ mod tests {
             detect_common_signal("status: [needs_human] blocked").expect("need human signal");
         assert_eq!(signal.kind, AgentSignalKind::NeedHuman);
 
-        let signal =
-            detect_common_signal("done: [patch_ready]").expect("patch ready signal");
+        let signal = detect_common_signal("done: [patch_ready]").expect("patch ready signal");
         assert_eq!(signal.kind, AgentSignalKind::PatchReady);
 
         let signal =

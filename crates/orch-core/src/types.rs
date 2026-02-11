@@ -76,12 +76,7 @@ pub struct Task {
 
 impl Task {
     /// Create a new task in Chatting state.
-    pub fn new(
-        id: TaskId,
-        repo_id: RepoId,
-        title: String,
-        worktree_path: PathBuf,
-    ) -> Self {
+    pub fn new(id: TaskId, repo_id: RepoId, title: String, worktree_path: PathBuf) -> Self {
         let now = Utc::now();
         Self {
             id,

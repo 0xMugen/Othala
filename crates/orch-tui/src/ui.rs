@@ -1,5 +1,3 @@
-use chrono::{DateTime, Local, Utc};
-use orch_core::state::TaskState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -7,7 +5,19 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, AgentPaneStatus, TaskOverviewRow};
+use crate::chat_parse;
+use crate::chat_render;
+use crate::output_style::stylize_output_lines;
+#[cfg(test)]
+use crate::ui_activity::status_activity;
+#[cfg(test)]
+use crate::ui_footer::wrapped_visual_line_count;
+use crate::ui_footer::{build_footer_content, footer_height};
+use crate::ui_format::{
+    divider_line, format_pane_tabs, format_task_row, pane_meta_lines, status_sidebar_lines,
+};
+#[cfg(test)]
+use crate::ui_format::{pane_status_tag, status_line_color, to_local_time};
 
 // -- Color palette ----------------------------------------------------------
 
@@ -15,265 +25,9 @@ const ACCENT: Color = Color::Cyan;
 const HEADER_FG: Color = Color::White;
 const HEADER_TITLE: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
-const SELECTED_BG: Color = Color::Indexed(236); // dark gray background
+const MUTED: Color = Color::Gray;
 const BORDER_NORMAL: Color = Color::DarkGray;
 const BORDER_FOCUSED: Color = Color::Cyan;
-const KEY_FG: Color = Color::Yellow;
-const MUTED: Color = Color::Gray;
-const OUTPUT_FG: Color = Color::White;
-const FOOTER_DEFAULT_HEIGHT: u16 = 3;
-const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
-const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
-const THINKING_FRAMES: [&str; 4] = ["o..", ".o.", "..o", ".o."];
-
-fn state_color(state: TaskState) -> Color {
-    match state {
-        TaskState::Chatting => Color::Green,
-        TaskState::Ready | TaskState::Merged => Color::Cyan,
-        TaskState::Submitting | TaskState::AwaitingMerge => Color::Blue,
-        TaskState::Restacking => Color::Yellow,
-    }
-}
-
-/// Pick a color for the composite display state label.  Falls back to
-/// `state_color` for states that are not overridden by verify status.
-fn display_state_color(state: TaskState, display_state: &str) -> Color {
-    match display_state {
-        "VerifyFail" | "SubmitFail" => Color::Red,
-        "Verified" => Color::Cyan,
-        "Verifying" => Color::Yellow,
-        _ => state_color(state),
-    }
-}
-
-fn pane_status_color(status: AgentPaneStatus) -> Color {
-    match status {
-        AgentPaneStatus::Starting => Color::Yellow,
-        AgentPaneStatus::Running => Color::Green,
-        AgentPaneStatus::Waiting => Color::Magenta,
-        AgentPaneStatus::Exited => Color::DarkGray,
-        AgentPaneStatus::Failed => Color::Red,
-    }
-}
-
-fn status_line_color(message: &str) -> Color {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("[needs_human]") || lower.contains("needs_human") {
-        Color::Yellow
-    } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
-        Color::Green
-    } else if lower.contains("error") || lower.contains("failed") || lower.contains("not found") {
-        Color::Red
-    } else if lower.contains("ready") || lower.contains("updated") || lower.contains("queued") {
-        ACCENT
-    } else {
-        MUTED
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct OutputBlockState {
-    in_patch_block: bool,
-    in_code_fence: bool,
-    in_diff_block: bool,
-    in_exec_block: bool,
-}
-
-impl OutputBlockState {
-    fn update(&mut self, line: &str) {
-        let trimmed = line.trim();
-
-        // Patch block: *** Begin Patch / *** End Patch
-        if line.starts_with("*** Begin Patch") {
-            self.in_patch_block = true;
-            self.in_exec_block = false;
-        } else if line.starts_with("*** End Patch") {
-            self.in_patch_block = false;
-        }
-
-        // Code fence: toggle on lines starting with ```
-        if line.trim_start().starts_with("```") {
-            self.in_code_fence = !self.in_code_fence;
-            if self.in_code_fence {
-                self.in_exec_block = false;
-            }
-        }
-
-        // Diff block: enter on diff header, exit when line doesn't match diff patterns
-        if line.starts_with("diff --git") || line.starts_with("diff --cc") {
-            self.in_diff_block = true;
-            self.in_exec_block = false;
-        } else if self.in_diff_block && !self.in_patch_block {
-            let is_diff_line = line.starts_with('+')
-                || line.starts_with('-')
-                || line.starts_with(' ')
-                || line.starts_with("@@")
-                || line.starts_with("index ")
-                || line.starts_with("--- ")
-                || line.starts_with("+++ ")
-                || line.starts_with('\\')
-                || line.is_empty();
-            if !is_diff_line {
-                self.in_diff_block = false;
-            }
-        }
-
-        // Exec block: enter on "exec" marker, exit on agent markers or other blocks
-        if trimmed == "exec" {
-            self.in_exec_block = true;
-        } else if self.in_exec_block
-            && (trimmed == "thinking"
-                || trimmed == "codex"
-                || trimmed == "claude"
-                || trimmed == "gemini"
-                || is_patch_marker(line))
-        {
-            self.in_exec_block = false;
-        }
-    }
-}
-
-fn output_line_style(line: &str, state: &OutputBlockState) -> Style {
-    // Patch block lines (existing behavior)
-    if let Some(style) = patch_line_style(line, state.in_patch_block) {
-        return style;
-    }
-
-    // Code fence markers
-    if line.trim_start().starts_with("```") {
-        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    }
-
-    // Diff block header
-    if line.starts_with("diff --git") || line.starts_with("diff --cc") {
-        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    }
-
-    // Inside code fence: muted style, skip content-based heuristics
-    if state.in_code_fence {
-        return Style::default().fg(Color::Gray);
-    }
-
-    // Inside diff block: apply diff coloring
-    if state.in_diff_block {
-        return diff_line_style(line);
-    }
-
-    // Agent CLI markers
-    let trimmed = line.trim();
-    if trimmed == "thinking" {
-        return Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::DIM);
-    }
-    if trimmed == "exec" {
-        return Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
-    }
-    if trimmed == "codex" || trimmed == "claude" || trimmed == "gemini" {
-        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    }
-
-    // Command result lines (e.g. "⎿  ... succeeded in 3.2s")
-    if trimmed.ends_with('s')
-        && (trimmed.contains("succeeded in") || trimmed.contains("failed in"))
-    {
-        return Style::default().fg(Color::Yellow);
-    }
-
-    // Agent exit / token lines
-    if line.starts_with("[agent exited") {
-        return Style::default().fg(DIM);
-    }
-    if line.starts_with("tokens used") {
-        return Style::default().fg(DIM);
-    }
-
-    // Inside exec block: muted style, skip content heuristics
-    if state.in_exec_block {
-        return Style::default().fg(Color::Gray);
-    }
-
-    // Outside all blocks: content-based styling
-    let lower = line.to_ascii_lowercase();
-    if line.trim().is_empty() {
-        Style::default().fg(DIM)
-    } else if lower.contains("[needs_human]") {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if lower.contains("[patch_ready]") {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if lower.contains("error") || lower.contains("failed") {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with("## ") {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(OUTPUT_FG)
-    }
-}
-
-fn diff_line_style(line: &str) -> Style {
-    if line.starts_with("@@") {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(OUTPUT_FG)
-    }
-}
-
-fn patch_line_style(line: &str, in_patch_block: bool) -> Option<Style> {
-    if is_patch_marker(line) {
-        return Some(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    }
-
-    if !in_patch_block {
-        return None;
-    }
-
-    if line.starts_with("@@") {
-        Some(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else if line.starts_with('+') {
-        Some(Style::default().fg(Color::Green))
-    } else if line.starts_with('-') {
-        Some(Style::default().fg(Color::Red))
-    } else {
-        None
-    }
-}
-
-fn is_patch_marker(line: &str) -> bool {
-    line.starts_with("*** Begin Patch")
-        || line.starts_with("*** End Patch")
-        || line.starts_with("*** Update File:")
-        || line.starts_with("*** Add File:")
-        || line.starts_with("*** Delete File:")
-        || line.starts_with("*** Move to:")
-}
-
-fn stylize_output_lines(lines: impl IntoIterator<Item = String>) -> Vec<Line<'static>> {
-    let mut block_state = OutputBlockState::default();
-    lines
-        .into_iter()
-        .map(|line| {
-            let style = output_line_style(&line, &block_state);
-            block_state.update(&line);
-            Line::from(Span::styled(line, style))
-        })
-        .collect()
-}
 
 fn normal_block(title: &str) -> Block<'_> {
     Block::default()
@@ -482,6 +236,18 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 // -- Focused views ----------------------------------------------------------
 
+fn extend_rendered_chat(lines: &mut Vec<Line<'static>>, window: &[String], width: u16) {
+    if window.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no output yet",
+            Style::default().fg(DIM),
+        )));
+        return;
+    }
+    let blocks = chat_parse::parse_chat_blocks(window);
+    lines.extend(chat_render::render_chat_blocks(&blocks, width));
+}
+
 fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let pane_idx = app.state.focused_pane_idx;
     let pane = pane_idx.and_then(|idx| app.state.panes.get(idx));
@@ -499,14 +265,7 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .pane_window_with_history(idx, output_cap, scroll_back)
             })
             .unwrap_or_default();
-        if window.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "no output yet",
-                Style::default().fg(DIM),
-            )));
-        } else {
-            lines.extend(stylize_output_lines(window));
-        }
+        extend_rendered_chat(&mut lines, &window, area.width);
         (format!("Focused Chat {}", pane.instance_id), lines)
     } else {
         (
@@ -546,10 +305,12 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Left: task status checklist
     let status_title = format!("Status ({task_id_str})");
-    let status_widget =
-        Paragraph::new(status_sidebar_lines(selected_task, &app.state.selected_task_activity))
-            .block(focused_block(&status_title))
-            .wrap(Wrap { trim: false });
+    let status_widget = Paragraph::new(status_sidebar_lines(
+        selected_task,
+        &app.state.selected_task_activity,
+    ))
+    .block(focused_block(&status_title))
+    .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
 
     // Right: agent PTY output
@@ -563,14 +324,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .pane_window_with_history(idx, output_cap, scroll_back)
             })
             .unwrap_or_default();
-        if window.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "no output yet",
-                Style::default().fg(DIM),
-            )));
-        } else {
-            lines.extend(stylize_output_lines(window));
-        }
+        extend_rendered_chat(&mut lines, &window, cols[1].width);
         (format!("Agent {}", pane.instance_id), lines)
     } else {
         (
@@ -592,243 +346,14 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 // -- Footer -----------------------------------------------------------------
 
-fn footer_height(app: &TuiApp, width: u16) -> u16 {
-    let Some(prompt) = app.input_prompt() else {
-        return FOOTER_DEFAULT_HEIGHT;
-    };
-    let content_width = width.saturating_sub(2).max(1);
-    let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width.saturating_sub(1));
-    let controls_visual_lines = wrapped_visual_line_count(
-        " Enter=submit Esc=cancel (multiline paste supported)",
-        content_width,
-    );
-    let total_height = prompt_visual_lines
-        .saturating_add(controls_visual_lines)
-        .saturating_add(3); // prompt label + borders
-    u16::try_from(total_height)
-        .unwrap_or(FOOTER_PROMPT_MAX_HEIGHT)
-        .clamp(FOOTER_PROMPT_MIN_HEIGHT, FOOTER_PROMPT_MAX_HEIGHT)
-}
-
-fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    if text.is_empty() {
-        return 1;
-    }
-    text.split('\n')
-        .map(|line| {
-            let len = line.chars().count();
-            if len == 0 {
-                1
-            } else {
-                (len - 1) / width + 1
-            }
-        })
-        .sum()
-}
-
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let (lines, wrap_trim) = if let Some((task_id, branch)) = app.delete_confirm_display() {
-        let branch_label = branch.unwrap_or("-");
-        (
-            vec![Line::from(vec![
-                Span::styled(" delete: ", Style::default().fg(DIM)),
-                Span::styled(task_id.0.clone(), Style::default().fg(HEADER_FG)),
-                Span::styled(" branch=", Style::default().fg(DIM)),
-                Span::styled(branch_label, Style::default().fg(HEADER_FG)),
-                Span::styled("  Enter=confirm Esc=cancel", Style::default().fg(DIM)),
-            ])],
-            true,
-        )
-    } else if let Some((models, selected)) = app.model_select_display() {
-        let mut spans = vec![Span::styled(" model: ", Style::default().fg(DIM))];
-        for (i, m) in models.iter().enumerate() {
-            if i == selected {
-                spans.push(Span::styled(
-                    format!(" {m:?} "),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(format!(" {m:?} "), Style::default().fg(MUTED)));
-            }
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            " Up/Down=cycle Enter=confirm Esc=cancel",
-            Style::default().fg(DIM),
-        ));
-        (vec![Line::from(spans)], true)
-    } else if let Some(prompt) = app.input_prompt() {
-        let mut lines = vec![Line::from(Span::styled(
-            " prompt:",
-            Style::default().fg(DIM),
-        ))];
-        let prompt_lines: Vec<&str> = prompt.split('\n').collect();
-        for (idx, prompt_line) in prompt_lines.iter().enumerate() {
-            let mut spans = vec![
-                Span::styled(" ", Style::default().fg(DIM)),
-                Span::styled(*prompt_line, Style::default().fg(HEADER_FG)),
-            ];
-            if idx + 1 == prompt_lines.len() {
-                spans.push(Span::styled("_", Style::default().fg(ACCENT)));
-            }
-            lines.push(Line::from(spans));
-        }
-        lines.push(Line::from(Span::styled(
-            " Enter=submit Esc=cancel (multiline paste supported)",
-            Style::default().fg(DIM),
-        )));
-        (lines, false)
-    } else {
-        let mut spans: Vec<Span<'_>> = Vec::new();
-        spans.push(Span::raw(" "));
-        let keys: &[(&str, &str)] = &[
-            ("c", "chat"),
-            ("i", "interact"),
-            ("a", "approve"),
-            ("g", "submit"),
-            ("s", "start"),
-            ("x", "stop"),
-            ("r", "restart"),
-            ("d", "delete"),
-            ("q", "quick"),
-            ("f", "full"),
-            ("t", "restack/submit"),
-            ("n", "human"),
-            ("w", "web"),
-            ("p", "pause"),
-            ("u", "resume"),
-        ];
-        for (key, label) in keys {
-            spans.push(Span::styled(
-                *key,
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                format!("={label} "),
-                Style::default().fg(MUTED),
-            ));
-        }
-        if app.state.focused_task || app.state.focused_pane_idx.is_some() {
-            spans.push(Span::styled(
-                "| \u{2191}\u{2193}=scroll PgUp/Dn=page Home/End=top/bottom esc=back",
-                Style::default().fg(DIM),
-            ));
-        } else {
-            spans.push(Span::styled(
-                "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
-                Style::default().fg(DIM),
-            ));
-        }
-        if let Some((activity, color)) = footer_activity_indicator(app) {
-            spans.push(Span::styled(" | thinking: ", Style::default().fg(DIM)));
-            spans.push(Span::styled(
-                activity,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if !app.state.status_line.is_empty() {
-            spans.push(Span::styled(" | status: ", Style::default().fg(DIM)));
-            spans.push(Span::styled(
-                app.state.status_line.as_str(),
-                Style::default()
-                    .fg(status_line_color(&app.state.status_line))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        (vec![Line::from(spans)], true)
-    };
-
-    let title = if app.delete_confirm_display().is_some() {
-        "Confirm Delete"
-    } else if app.model_select_display().is_some() {
-        "Select Model"
-    } else if app.chat_input_display().is_some() {
-        "Chat Input"
-    } else if app.input_prompt().is_some() {
-        "New Chat"
-    } else {
-        "Actions"
-    };
-
-    let widget = Paragraph::new(lines)
-        .block(normal_block(title))
-        .wrap(Wrap { trim: wrap_trim });
+    let content = build_footer_content(app);
+    let widget = Paragraph::new(content.lines)
+        .block(normal_block(content.title))
+        .wrap(Wrap {
+            trim: content.wrap_trim,
+        });
     frame.render_widget(widget, area);
-}
-
-fn pane_status_active(status: AgentPaneStatus) -> bool {
-    matches!(
-        status,
-        AgentPaneStatus::Starting | AgentPaneStatus::Running | AgentPaneStatus::Waiting
-    )
-}
-
-fn animation_frame_now() -> usize {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    (millis / 250) as usize
-}
-
-fn status_activity(status: AgentPaneStatus, frame: usize) -> Option<(String, Color)> {
-    let pulse = THINKING_FRAMES[frame % THINKING_FRAMES.len()];
-    match status {
-        AgentPaneStatus::Starting => Some((format!("starting {pulse}"), Color::Yellow)),
-        AgentPaneStatus::Running => Some((format!("thinking {pulse}"), Color::Cyan)),
-        AgentPaneStatus::Waiting => Some((format!("percolating {pulse}"), Color::Magenta)),
-        AgentPaneStatus::Exited | AgentPaneStatus::Failed => None,
-    }
-}
-
-fn active_activity_pane(app: &TuiApp) -> Option<&AgentPane> {
-    if app.state.focused_task {
-        if let Some(task) = app.state.selected_task() {
-            if let Some(pane) = app
-                .state
-                .panes
-                .iter()
-                .find(|pane| pane.task_id == task.task_id && pane_status_active(pane.status))
-            {
-                return Some(pane);
-            }
-        }
-    }
-
-    if let Some(idx) = app.state.focused_pane_idx {
-        if let Some(pane) = app
-            .state
-            .panes
-            .get(idx)
-            .filter(|pane| pane_status_active(pane.status))
-        {
-            return Some(pane);
-        }
-    }
-
-    if let Some(pane) = app
-        .state
-        .selected_pane()
-        .filter(|pane| pane_status_active(pane.status))
-    {
-        return Some(pane);
-    }
-
-    app.state
-        .panes
-        .iter()
-        .find(|pane| pane_status_active(pane.status))
-}
-
-fn footer_activity_indicator(app: &TuiApp) -> Option<(String, Color)> {
-    let pane = active_activity_pane(app)?;
-    let frame = animation_frame_now();
-    let (activity, color) = status_activity(pane.status, frame)?;
-    Some((format!("{} {activity}", pane.instance_id), color))
 }
 
 fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Option<&str>) {
@@ -882,355 +407,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
-// -- Formatting helpers -----------------------------------------------------
-
-fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a> {
-    let ts = to_local_time(task.last_activity);
-    let sc = display_state_color(task.state, &task.display_state);
-
-    let base_style = if is_selected {
-        Style::default().bg(SELECTED_BG).fg(Color::White)
-    } else {
-        Style::default().fg(MUTED)
-    };
-
-    let prefix = if is_selected { "\u{25B6} " } else { "  " };
-
-    Line::from(vec![
-        Span::styled(
-            prefix,
-            if is_selected {
-                Style::default().fg(ACCENT)
-            } else {
-                Style::default().fg(DIM)
-            },
-        ),
-        Span::styled(&task.repo_id.0, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(
-            &task.task_id.0,
-            if is_selected {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(SELECTED_BG)
-            } else {
-                Style::default().fg(Color::White)
-            },
-        ),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(&task.title, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(
-            task.display_state.as_str(),
-            Style::default().fg(sc).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(&task.verify_summary, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(ts, Style::default().fg(DIM)),
-    ])
-}
-
-fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
-    if app.state.panes.is_empty() {
-        return Line::from(Span::styled(" none", Style::default().fg(DIM)));
-    }
-
-    let mut spans = Vec::new();
-    spans.push(Span::raw(" "));
-    for (idx, pane) in app.state.panes.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let is_selected = idx == app.state.selected_pane_idx;
-        let tag = pane_status_tag(pane);
-        let sc = pane_status_color(pane.status);
-        let base_style = if is_selected {
-            Style::default()
-                .fg(Color::White)
-                .bg(SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(MUTED)
-        };
-        let meta_style = if is_selected {
-            Style::default().fg(DIM).bg(SELECTED_BG)
-        } else {
-            Style::default().fg(DIM)
-        };
-        let status_style = if is_selected {
-            Style::default()
-                .fg(sc)
-                .bg(SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(sc).add_modifier(Modifier::BOLD)
-        };
-
-        spans.push(Span::styled(
-            format!(" {}:{} ", idx + 1, pane.instance_id),
-            base_style,
-        ));
-        spans.push(Span::styled(format!("{tag} "), status_style));
-        spans.push(Span::styled(format!("{}l ", pane.lines.len()), meta_style));
-    }
-    Line::from(spans)
-}
-
-fn pane_meta_lines(pane: &AgentPane, scroll_back: Option<usize>) -> Vec<Line<'static>> {
-    let status = pane_status_tag(pane);
-    let updated = pane.updated_at.with_timezone(&Local).format("%H:%M:%S");
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(" status ", Style::default().fg(DIM)),
-            Span::styled(
-                status.to_string(),
-                Style::default()
-                    .fg(pane_status_color(pane.status))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  model ", Style::default().fg(DIM)),
-            Span::styled(format!("{:?}", pane.model), Style::default().fg(HEADER_FG)),
-        ]),
-        Line::from(vec![
-            Span::styled(" task ", Style::default().fg(DIM)),
-            Span::styled(pane.task_id.0.clone(), Style::default().fg(ACCENT)),
-            Span::styled("  lines ", Style::default().fg(DIM)),
-            Span::styled(pane.lines.len().to_string(), Style::default().fg(HEADER_FG)),
-            Span::styled("  updated ", Style::default().fg(DIM)),
-            Span::styled(updated.to_string(), Style::default().fg(MUTED)),
-        ]),
-    ];
-    if let Some(scroll_back) = scroll_back {
-        if scroll_back > 0 {
-            lines.push(Line::from(vec![
-                Span::styled(" scroll ", Style::default().fg(DIM)),
-                Span::styled(
-                    format!("+{scroll_back} lines from live tail"),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-    }
-    lines
-}
-
-fn divider_line(width: u16) -> Line<'static> {
-    let len = width.saturating_sub(4).max(8) as usize;
-    Line::from(Span::styled("-".repeat(len), Style::default().fg(DIM)))
-}
-
-fn pane_status_tag(pane: &AgentPane) -> &'static str {
-    match pane.status {
-        AgentPaneStatus::Starting => "starting",
-        AgentPaneStatus::Running => "running",
-        AgentPaneStatus::Waiting => "waiting",
-        AgentPaneStatus::Exited => "exited",
-        AgentPaneStatus::Failed => "failed",
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChecklistState {
-    Done,
-    Pending,
-    Skipped,
-    Active,
-    Blocked,
-}
-
-fn checklist_line(label: &str, state: ChecklistState) -> Line<'static> {
-    let (marker, marker_color, label_color) = match state {
-        ChecklistState::Done => ("x", Color::Green, Color::White),
-        ChecklistState::Pending => (" ", DIM, MUTED),
-        ChecklistState::Skipped => ("-", Color::Yellow, DIM),
-        ChecklistState::Active => ("~", Color::Cyan, Color::White),
-        ChecklistState::Blocked => ("!", Color::Red, Color::White),
-    };
-    Line::from(vec![
-        Span::styled(
-            format!("[{marker}] "),
-            Style::default()
-                .fg(marker_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(label.to_string(), Style::default().fg(label_color)),
-    ])
-}
-
-fn status_sidebar_lines(task: Option<&TaskOverviewRow>, activity: &[String]) -> Vec<Line<'static>> {
-    let Some(task) = task else {
-        return vec![Line::from(Span::styled(
-            "no task selected",
-            Style::default().fg(DIM),
-        ))];
-    };
-
-    // MVP simplified checklist based on 6 states
-    let chatting = match task.state {
-        TaskState::Chatting => ChecklistState::Active,
-        _ => ChecklistState::Done,
-    };
-
-    let verifying = if task.display_state == "VerifyFail" {
-        ChecklistState::Blocked
-    } else if task.display_state == "Verifying" {
-        ChecklistState::Active
-    } else if matches!(task.state, TaskState::Ready | TaskState::Submitting | TaskState::AwaitingMerge | TaskState::Merged) {
-        ChecklistState::Done
-    } else {
-        ChecklistState::Pending
-    };
-
-    let restacking = match task.state {
-        TaskState::Restacking => ChecklistState::Active,
-        _ => ChecklistState::Skipped,
-    };
-
-    let pushing = match task.state {
-        TaskState::Submitting => ChecklistState::Active,
-        TaskState::AwaitingMerge | TaskState::Merged => ChecklistState::Done,
-        _ => ChecklistState::Pending,
-    };
-
-    let merging = match task.state {
-        TaskState::AwaitingMerge => ChecklistState::Active,
-        TaskState::Merged => ChecklistState::Done,
-        _ => ChecklistState::Pending,
-    };
-
-    // Phase label
-    let (plan_label, plan_value, plan_color) = if task.state == TaskState::Merged {
-        ("plan complete: ", "yes", Color::Green)
-    } else {
-        let phase = match task.state {
-            TaskState::Chatting => match task.display_state.as_str() {
-                "Verifying" => "verifying",
-                "VerifyFail" => "verify failed",
-                "Verified" => "verified",
-                _ => "chatting",
-            },
-            TaskState::Ready => "ready",
-            TaskState::Submitting => "pushing",
-            TaskState::Restacking => "restacking",
-            TaskState::AwaitingMerge => "awaiting merge",
-            TaskState::Merged => unreachable!(),
-        };
-        ("phase: ", phase, Color::Yellow)
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(plan_label, Style::default().fg(DIM)),
-            Span::styled(
-                plan_value.to_string(),
-                Style::default().fg(plan_color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("status: ", Style::default().fg(DIM)),
-            Span::styled(
-                task.display_state.clone(),
-                Style::default()
-                    .fg(display_state_color(task.state, &task.display_state))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "checklist",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        checklist_line("chatting", chatting),
-        checklist_line("verifying", verifying),
-        checklist_line("restacking (if needed)", restacking),
-        checklist_line("pushing", pushing),
-        checklist_line("merging", merging),
-    ];
-
-    // Verify detail
-    if task.verify_summary != "not_run" {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("verify: ", Style::default().fg(DIM)),
-            Span::styled(
-                task.verify_summary.clone(),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-    }
-
-    // Push detail
-    let push_detail = match task.state {
-        TaskState::Submitting => Some("gt submit in progress..."),
-        TaskState::AwaitingMerge => Some("pr submitted, awaiting merge"),
-        TaskState::Merged => Some("merged"),
-        _ => None,
-    };
-    if let Some(detail) = push_detail {
-        lines.push(Line::from(vec![
-            Span::styled("push: ", Style::default().fg(DIM)),
-            Span::styled(detail.to_string(), Style::default().fg(Color::White)),
-        ]));
-    }
-
-    // Activity log
-    if !activity.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "activity",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
-        let tail = if activity.len() > 10 {
-            &activity[activity.len() - 10..]
-        } else {
-            activity
-        };
-        for entry in tail {
-            let lower = entry.to_lowercase();
-            let color = if lower.contains("error") {
-                Color::Red
-            } else if lower.contains("submit") {
-                Color::Yellow
-            } else if lower.contains("restack") {
-                Color::Cyan
-            } else {
-                DIM
-            };
-            lines.push(Line::from(Span::styled(
-                entry.clone(),
-                Style::default().fg(color),
-            )));
-        }
-    }
-
-    lines
-}
-
-fn to_local_time(value: DateTime<Utc>) -> String {
-    value
-        .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
     use orch_core::types::{ModelKind, RepoId, TaskId};
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Color;
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
 
     use super::{
-        footer_height, format_pane_tabs, format_task_row, output_line_style, pane_status_tag,
-        status_activity, status_line_color, status_sidebar_lines, to_local_time,
-        wrapped_visual_line_count, OutputBlockState,
+        footer_height, format_pane_tabs, format_task_row, pane_status_tag, status_activity,
+        status_line_color, status_sidebar_lines, to_local_time, wrapped_visual_line_count,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1377,48 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn output_line_style_marks_special_chat_signals() {
-        let default_state = OutputBlockState::default();
-        assert_eq!(
-            output_line_style("[needs_human] unblock me", &default_state).fg,
-            Some(Color::Yellow)
-        );
-        assert_eq!(
-            output_line_style("[patch_ready] complete", &default_state).fg,
-            Some(Color::Green)
-        );
-        assert_eq!(
-            output_line_style("fatal error", &default_state).fg,
-            Some(Color::Red)
-        );
-    }
-
-    #[test]
-    fn output_line_style_marks_patch_edits_clearly() {
-        let default_state = OutputBlockState::default();
-        let patch_state = OutputBlockState {
-            in_patch_block: true,
-            ..OutputBlockState::default()
-        };
-        assert_eq!(
-            output_line_style("*** Begin Patch", &default_state).fg,
-            Some(Color::Cyan)
-        );
-        assert_eq!(
-            output_line_style("@@ fn main @@ ", &patch_state).fg,
-            Some(Color::Yellow)
-        );
-        assert_eq!(
-            output_line_style("+let x = 1;", &patch_state).fg,
-            Some(Color::Green)
-        );
-        assert_eq!(
-            output_line_style("-let x = 0;", &patch_state).fg,
-            Some(Color::Red)
-        );
-    }
-
-    #[test]
     fn status_activity_only_animates_live_pane_statuses() {
         let (running, running_color) =
             status_activity(AgentPaneStatus::Running, 2).expect("running activity");
@@ -1493,59 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn code_fence_lines_use_muted_style() {
-        let state = OutputBlockState {
-            in_code_fence: true,
-            ..OutputBlockState::default()
-        };
-        assert_eq!(
-            output_line_style("let x = 42;", &state).fg,
-            Some(Color::Gray)
-        );
-    }
-
-    #[test]
-    fn code_fence_skips_false_error_styling() {
-        let state = OutputBlockState {
-            in_code_fence: true,
-            ..OutputBlockState::default()
-        };
-        // Inside a code fence, "error: something" should be Gray, not Red
-        assert_eq!(
-            output_line_style("error: something went wrong", &state).fg,
-            Some(Color::Gray)
-        );
-    }
-
-    #[test]
-    fn diff_block_lines_get_diff_coloring() {
-        let state = OutputBlockState {
-            in_diff_block: true,
-            ..OutputBlockState::default()
-        };
-        assert_eq!(
-            output_line_style("+added line", &state).fg,
-            Some(Color::Green)
-        );
-        assert_eq!(
-            output_line_style("-removed line", &state).fg,
-            Some(Color::Red)
-        );
-        assert_eq!(
-            output_line_style("@@ -1,3 +1,4 @@", &state).fg,
-            Some(Color::Yellow)
-        );
-    }
-
-    #[test]
-    fn diff_block_header_styled_as_accent() {
-        let default_state = OutputBlockState::default();
-        let style = output_line_style("diff --git a/f b/f", &default_state);
-        assert_eq!(style.fg, Some(Color::Cyan));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
     fn status_sidebar_shows_verifying_when_verify_in_progress() {
         let mut row = mk_row("T1");
         row.state = TaskState::Chatting;
@@ -1574,7 +668,9 @@ mod tests {
             .collect();
 
         assert!(text.iter().any(|line| line.contains("[!] verifying")));
-        assert!(text.iter().any(|line| line.contains("phase: verify failed")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("phase: verify failed")));
     }
 
     #[test]
@@ -1597,7 +693,9 @@ mod tests {
         assert!(text.iter().any(|line| line == "activity"));
         // All activity entries present
         assert!(text.iter().any(|line| line.contains("gt submit --publish")));
-        assert!(text.iter().any(|line| line.contains("error: push rejected")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("error: push rejected")));
         assert!(text
             .iter()
             .any(|line| line.contains("restack onto task/T0")));
@@ -1637,61 +735,5 @@ mod tests {
         // Should contain the last 10 entries
         assert!(text.iter().any(|line| line.contains("log line 5")));
         assert!(text.iter().any(|line| line.contains("log line 14")));
-    }
-
-    #[test]
-    fn exec_block_lines_use_muted_style() {
-        let state = OutputBlockState {
-            in_exec_block: true,
-            ..OutputBlockState::default()
-        };
-        assert_eq!(
-            output_line_style("    Finished test profile [unoptimized + debuginfo]", &state).fg,
-            Some(Color::Gray)
-        );
-    }
-
-    #[test]
-    fn exec_block_skips_false_error_styling() {
-        let state = OutputBlockState {
-            in_exec_block: true,
-            ..OutputBlockState::default()
-        };
-        // Inside an exec block, test result line should be Gray, not Red
-        assert_eq!(
-            output_line_style("test result: ok. 0 passed; 0 failed;", &state).fg,
-            Some(Color::Gray)
-        );
-    }
-
-    #[test]
-    fn thinking_marker_styled_as_dim_magenta() {
-        let default_state = OutputBlockState::default();
-        let style = output_line_style("thinking", &default_state);
-        assert_eq!(style.fg, Some(Color::Magenta));
-        assert!(style.add_modifier.contains(Modifier::DIM));
-    }
-
-    #[test]
-    fn exec_marker_styled_as_yellow_bold() {
-        let default_state = OutputBlockState::default();
-        let style = output_line_style("exec", &default_state);
-        assert_eq!(style.fg, Some(Color::Yellow));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn codex_marker_styled_as_accent() {
-        let default_state = OutputBlockState::default();
-        let style = output_line_style("codex", &default_state);
-        assert_eq!(style.fg, Some(Color::Cyan));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn agent_exit_line_styled_as_dim() {
-        let default_state = OutputBlockState::default();
-        let style = output_line_style("[agent exited code=0]", &default_state);
-        assert_eq!(style.fg, Some(Color::DarkGray));
     }
 }

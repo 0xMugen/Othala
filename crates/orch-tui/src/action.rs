@@ -192,9 +192,6 @@ mod tests {
         );
         assert_eq!(action_label(UiAction::PauseTask), "pause_task");
         assert_eq!(action_label(UiAction::ResumeTask), "resume_task");
-        assert_eq!(
-            action_label(UiAction::SendChatMessage),
-            "send_chat_message"
-        );
+        assert_eq!(action_label(UiAction::SendChatMessage), "send_chat_message");
     }
 }

@@ -323,9 +323,10 @@ fn run() -> Result<(), MainError> {
         // Skip tasks whose pane is in Waiting status (needs human review).
         if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
             for task in &chatting {
-                let pane_waiting = app.state.panes.iter().any(|pane| {
-                    pane.task_id == task.id && pane.status == AgentPaneStatus::Waiting
-                });
+                let pane_waiting =
+                    app.state.panes.iter().any(|pane| {
+                        pane.task_id == task.id && pane.status == AgentPaneStatus::Waiting
+                    });
                 if !supervisor.has_session(&task.id) && !pane_waiting {
                     let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                     if let Ok(()) = supervisor.spawn_agent(

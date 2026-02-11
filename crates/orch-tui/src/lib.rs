@@ -1,10 +1,16 @@
 pub mod action;
 pub mod app;
+pub mod chat_parse;
+pub mod chat_render;
 pub mod error;
 pub mod event;
 pub mod model;
+pub mod output_style;
 pub mod runner;
 pub mod ui;
+mod ui_activity;
+mod ui_footer;
+mod ui_format;
 
 pub use action::*;
 pub use app::*;
