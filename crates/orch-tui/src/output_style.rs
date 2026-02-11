@@ -126,6 +126,10 @@ pub(crate) fn output_line_style(line: &str, state: &OutputBlockState) -> Style {
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
+    } else if lower.contains("[qa_complete]") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else if lower.contains("error") || lower.contains("failed") {
         Style::default().fg(Color::Red)
     } else if line.starts_with("## ") {

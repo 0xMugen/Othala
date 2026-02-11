@@ -50,14 +50,31 @@ pub fn spec_path(repo_root: &Path, task_id: &TaskId) -> PathBuf {
 }
 
 /// Generate the prompt to send to a test-spec-writing agent.
+///
+/// Produces **executable** test scenarios — not just checkbox items.
+/// Each scenario describes concrete commands to run and expected outcomes.
 pub fn generate_test_spec_prompt(task_title: &str, task_description: &str) -> String {
     format!(
         "Write a test specification for the following task.\n\n\
          **Task:** {task_title}\n\n\
          **Description:**\n{task_description}\n\n\
-         Output the spec as markdown with checkbox items (`- [ ] ...`).\n\
-         Each criterion must be objectively verifiable.\n\
-         Include unit tests, integration tests, and build verification sections.\n"
+         Output the spec as markdown with two sections:\n\n\
+         ### Acceptance Tests\n\
+         Concrete, executable test scenarios. Each item should describe:\n\
+         - The exact command to run (e.g., `cargo run`, `curl`, CLI invocations)\n\
+         - The expected output or behavior to verify\n\
+         - Use checkbox items (`- [ ] ...`) for each scenario\n\n\
+         ### Regression Tests\n\
+         Tests to verify existing functionality is not broken:\n\
+         - Build verification (`cargo check`, `cargo test`)\n\
+         - Existing endpoints/commands still work\n\
+         - Database state integrity\n\n\
+         Each criterion must be objectively verifiable by running actual commands.\n\
+         Prefer concrete commands over abstract descriptions.\n\
+         Example:\n\
+         - [ ] Run `cargo build --workspace` — expect exit code 0\n\
+         - [ ] Run `othala list` — expect empty list output\n\
+         - [ ] POST /api/login with valid creds — expect 200 + session cookie\n"
     )
 }
 
@@ -248,7 +265,9 @@ mod tests {
         let prompt = generate_test_spec_prompt("Add auth", "Implement login flow");
         assert!(prompt.contains("Add auth"));
         assert!(prompt.contains("Implement login flow"));
-        assert!(prompt.contains("checkbox"));
+        assert!(prompt.contains("Acceptance Tests"));
+        assert!(prompt.contains("Regression Tests"));
+        assert!(prompt.contains("executable"));
     }
 
     #[test]

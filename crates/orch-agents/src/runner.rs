@@ -208,6 +208,7 @@ fn signal_to_stop_reason(kind: AgentSignalKind) -> Option<EpochStopReason> {
         AgentSignalKind::ConflictResolved => None,
         AgentSignalKind::RateLimited => Some(EpochStopReason::RateLimited),
         AgentSignalKind::ErrorHint => None,
+        AgentSignalKind::QAComplete => None,
     }
 }
 

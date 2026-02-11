@@ -14,6 +14,11 @@ use crate::context_gen::{
 };
 use crate::context_graph::{load_context_graph, ContextLoadConfig};
 use crate::prompt_builder::{build_rich_prompt, PromptConfig, PromptRole, RetryContext};
+use crate::qa_agent::{
+    build_qa_failure_context, build_qa_prompt, load_baseline, load_latest_result,
+    load_task_spec as load_qa_task_spec, poll_qa_agent, save_qa_result, spawn_qa_agent,
+    QAResult, QAState, QAStatus, QAType,
+};
 use crate::retry::evaluate_retry;
 use crate::stack_pipeline::{PipelineAction, PipelineState, next_action};
 use crate::supervisor::{AgentOutcome, AgentSupervisor};
@@ -46,6 +51,8 @@ pub struct DaemonState {
     pub pipelines: HashMap<String, PipelineState>,
     /// Context generation state.
     pub context_gen: ContextGenState,
+    /// Per-task QA agent state (keyed by task_id).
+    pub qa_agents: HashMap<String, QAState>,
 }
 
 impl DaemonState {
@@ -53,6 +60,7 @@ impl DaemonState {
         Self {
             pipelines: HashMap::new(),
             context_gen: ContextGenState::new(),
+            qa_agents: HashMap::new(),
         }
     }
 }
@@ -89,6 +97,21 @@ pub enum DaemonAction {
     ExecutePipeline { action: PipelineAction },
     /// Trigger background context regeneration.
     TriggerContextRegen,
+    /// Spawn a QA agent (baseline or validation).
+    SpawnQA {
+        task_id: TaskId,
+        qa_type: QAType,
+    },
+    /// QA run completed successfully — all tests passed.
+    QACompleted {
+        task_id: TaskId,
+        result: QAResult,
+    },
+    /// QA run found failures.
+    QAFailed {
+        task_id: TaskId,
+        result: QAResult,
+    },
     /// Log a message.
     Log { message: String },
 }
@@ -117,6 +140,41 @@ pub fn daemon_tick(
         }
     }
 
+    // --- Phase 1.5: Check if baseline QA exists for chatting tasks ---
+    //
+    // For tasks about to be spawned, check if a baseline QA result exists for
+    // the task's branch. If no baseline exists and we have a QA spec, spawn a
+    // baseline QA agent first.
+    if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
+        for task in &chatting {
+            let default_branch = format!("task/{}", task.id.0);
+            let branch = task
+                .branch_name
+                .as_deref()
+                .unwrap_or(&default_branch);
+
+            // Skip if QA agent already running for this task.
+            if daemon_state.qa_agents.contains_key(&task.id.0) {
+                continue;
+            }
+
+            // Skip if no baseline spec exists.
+            if load_baseline(&config.repo_root).is_none() {
+                continue;
+            }
+
+            // Skip if we already have a baseline result for this branch.
+            if load_latest_result(&config.repo_root, branch).is_some() {
+                continue;
+            }
+
+            actions.push(DaemonAction::SpawnQA {
+                task_id: task.id.clone(),
+                qa_type: QAType::Baseline,
+            });
+        }
+    }
+
     // --- Phase 2: Poll supervisor for completed agents ---
     let poll_result = supervisor.poll();
 
@@ -133,6 +191,61 @@ pub fn daemon_tick(
             handle_agent_completion(service, outcome, config, now);
         actions.extend(outcome_actions);
     }
+
+    // --- Phase 2.5: Poll QA agents ---
+    //
+    // Check running QA agents for completion. On completion:
+    // - Baseline run → store result, allow implementation to proceed
+    // - Validation run → check regression + acceptance
+    //   - All pass → MarkReady
+    //   - Fail → ScheduleRetry with QA failure details
+    let qa_keys: Vec<String> = daemon_state.qa_agents.keys().cloned().collect();
+    for key in qa_keys {
+        if let Some(qa_state) = daemon_state.qa_agents.get_mut(&key) {
+            if let Some(result) = poll_qa_agent(qa_state) {
+                let task_id = TaskId::new(&key);
+                let all_passed = result.summary.failed == 0;
+                let qa_type = qa_state.qa_type;
+
+                if all_passed {
+                    actions.push(DaemonAction::QACompleted {
+                        task_id: task_id.clone(),
+                        result: result.clone(),
+                    });
+
+                    if qa_type == QAType::Validation {
+                        // Validation passed — mark ready.
+                        actions.push(DaemonAction::MarkReady { task_id });
+                    }
+                } else {
+                    actions.push(DaemonAction::QAFailed {
+                        task_id: task_id.clone(),
+                        result: result.clone(),
+                    });
+
+                    if qa_type == QAType::Validation {
+                        // Validation failed — retry implementation with QA context.
+                        let failure_ctx = build_qa_failure_context(&result);
+                        actions.push(DaemonAction::ScheduleRetry {
+                            task_id,
+                            next_model: ModelKind::Claude,
+                            reason: failure_ctx,
+                        });
+                    }
+                }
+            }
+
+            // Clean up completed/failed QA states.
+            if qa_state.status == QAStatus::Completed || qa_state.status == QAStatus::Failed {
+                // Will be removed below.
+            }
+        }
+    }
+
+    // Remove finished QA agents.
+    daemon_state
+        .qa_agents
+        .retain(|_, s| s.status != QAStatus::Completed && s.status != QAStatus::Failed);
 
     // --- Phase 3: Drive pipelines for Ready tasks ---
     if let Ok(ready_tasks) = service.list_tasks_by_state(TaskState::Ready) {
@@ -244,6 +357,7 @@ fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction
         test_spec: test_spec_content,
         retry,
         verify_command: config.verify_command.clone(),
+        qa_failure_context: None,
     };
 
     let prompt = build_rich_prompt(&prompt_config, &config.template_dir);
@@ -266,9 +380,18 @@ fn handle_agent_completion(
     let mut actions = Vec::new();
 
     if outcome.patch_ready || outcome.success {
-        actions.push(DaemonAction::MarkReady {
-            task_id: outcome.task_id.clone(),
-        });
+        // If a QA baseline spec exists, spawn a validation QA run instead of
+        // immediately marking ready. The QA Phase 2.5 will mark ready on pass.
+        if load_baseline(&config.repo_root).is_some() {
+            actions.push(DaemonAction::SpawnQA {
+                task_id: outcome.task_id.clone(),
+                qa_type: QAType::Validation,
+            });
+        } else {
+            actions.push(DaemonAction::MarkReady {
+                task_id: outcome.task_id.clone(),
+            });
+        }
         return actions;
     }
 
@@ -473,6 +596,118 @@ pub fn execute_actions(
                     }
                 }
             }
+            DaemonAction::SpawnQA { task_id, qa_type } => {
+                // Load baseline spec and build QA prompt.
+                if let Some(baseline) = load_baseline(&config.repo_root) {
+                    let branch = format!("task/{}", task_id.0);
+                    let task_spec = load_qa_task_spec(&config.repo_root, task_id);
+                    let previous = load_latest_result(&config.repo_root, &branch);
+
+                    let prompt = build_qa_prompt(
+                        &baseline,
+                        task_spec.as_deref(),
+                        previous.as_ref(),
+                        &config.repo_root,
+                        &config.template_dir,
+                    );
+
+                    let model = config
+                        .enabled_models
+                        .first()
+                        .copied()
+                        .unwrap_or(ModelKind::Claude);
+
+                    let mut qa_state = QAState::new(*qa_type);
+                    if let Err(e) =
+                        spawn_qa_agent(&config.repo_root, &prompt, model, &mut qa_state)
+                    {
+                        eprintln!(
+                            "[daemon] Failed to spawn QA {} for {}: {}",
+                            qa_type, task_id.0, e
+                        );
+                    } else {
+                        eprintln!(
+                            "[daemon] QA {} started for {}",
+                            qa_type, task_id.0
+                        );
+                        daemon_state
+                            .qa_agents
+                            .insert(task_id.0.clone(), qa_state);
+
+                        // Record event.
+                        let event = Event {
+                            id: EventId(format!("E-QA-{}-{}", qa_type, task_id.0)),
+                            task_id: Some(task_id.clone()),
+                            repo_id: None,
+                            at: now,
+                            kind: EventKind::QAStarted {
+                                qa_type: qa_type.to_string(),
+                            },
+                        };
+                        let _ = service.record_event(&event);
+                    }
+                }
+            }
+            DaemonAction::QACompleted { task_id, result } => {
+                // Save QA result.
+                match save_qa_result(&config.repo_root, result) {
+                    Ok(path) => {
+                        eprintln!(
+                            "[daemon] QA completed for {} ({}/{} passed) → {}",
+                            task_id.0,
+                            result.summary.passed,
+                            result.summary.total,
+                            path.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[daemon] QA completed for {} but failed to save result: {}",
+                            task_id.0, e
+                        );
+                    }
+                }
+
+                let event = Event {
+                    id: EventId(format!("E-QA-DONE-{}", task_id.0)),
+                    task_id: Some(task_id.clone()),
+                    repo_id: None,
+                    at: now,
+                    kind: EventKind::QACompleted {
+                        passed: result.summary.passed,
+                        failed: result.summary.failed,
+                        total: result.summary.total,
+                    },
+                };
+                let _ = service.record_event(&event);
+            }
+            DaemonAction::QAFailed { task_id, result } => {
+                let failures: Vec<String> = result
+                    .tests
+                    .iter()
+                    .filter(|t| !t.passed)
+                    .map(|t| format!("{}.{}: {}", t.suite, t.name, t.detail))
+                    .collect();
+
+                // Save the failed result too (for debugging / history).
+                let _ = save_qa_result(&config.repo_root, result);
+
+                eprintln!(
+                    "[daemon] QA failed for {} — {} failures: {:?}",
+                    task_id.0,
+                    failures.len(),
+                    failures
+                );
+
+                let event = Event {
+                    id: EventId(format!("E-QA-FAIL-{}", task_id.0)),
+                    task_id: Some(task_id.clone()),
+                    repo_id: None,
+                    at: now,
+                    kind: EventKind::QAFailed { failures },
+                };
+                let _ = service.record_event(&event);
+            }
             DaemonAction::Log { message } => {
                 println!("{}", message);
             }
@@ -499,7 +734,6 @@ mod tests {
     use crate::scheduler::{Scheduler, SchedulerConfig};
     use orch_core::events::{Event, EventKind};
     use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
-    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 

@@ -459,6 +459,23 @@ impl TuiApp {
             TuiEvent::StatusLine { message } => {
                 self.state.status_line = message;
             }
+            TuiEvent::QAUpdate {
+                task_id,
+                status,
+                tests,
+                targets,
+            } => {
+                if let Some(task) = self
+                    .state
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.task_id == task_id)
+                {
+                    task.qa_status = Some(status);
+                    task.qa_tests = tests;
+                    task.qa_targets = targets;
+                }
+            }
         }
     }
 
@@ -627,6 +644,9 @@ mod tests {
                 display_state: "Chatting".to_string(),
                 verify_summary: "not_run".to_string(),
                 last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -638,6 +658,9 @@ mod tests {
                 display_state: "Chatting".to_string(),
                 verify_summary: "not_run".to_string(),
                 last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
             },
         ];
         app.state.selected_task_idx = 1;
@@ -695,6 +718,9 @@ mod tests {
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
             display_state: "Chatting".to_string(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -740,6 +766,9 @@ mod tests {
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
             display_state: "Chatting".to_string(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
         app.state.focused_task = true;
 
@@ -824,6 +853,9 @@ mod tests {
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
             display_state: "Chatting".to_string(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -891,6 +923,9 @@ mod tests {
             display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -928,6 +963,9 @@ mod tests {
             display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -987,6 +1025,9 @@ mod tests {
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
             display_state: "Chatting".to_string(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }];
 
         // Set a focused pane to verify it gets cleared
@@ -1032,5 +1073,65 @@ mod tests {
         assert_eq!(app.state.status_line, "model selection canceled");
         let drained = app.drain_actions();
         assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn apply_event_qa_update_sets_task_qa_fields() {
+        use crate::model::QATestDisplay;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.apply_event(TuiEvent::QAUpdate {
+            task_id: TaskId("T1".to_string()),
+            status: "passed 2/2".to_string(),
+            tests: vec![
+                QATestDisplay {
+                    name: "banner".to_string(),
+                    suite: "startup".to_string(),
+                    passed: true,
+                    detail: String::new(),
+                },
+                QATestDisplay {
+                    name: "chat".to_string(),
+                    suite: "tui".to_string(),
+                    passed: true,
+                    detail: String::new(),
+                },
+            ],
+            targets: vec!["verify OAuth".to_string()],
+        });
+
+        let task = &app.state.tasks[0];
+        assert_eq!(task.qa_status.as_deref(), Some("passed 2/2"));
+        assert_eq!(task.qa_tests.len(), 2);
+        assert!(task.qa_tests[0].passed);
+        assert_eq!(task.qa_targets, vec!["verify OAuth"]);
+    }
+
+    #[test]
+    fn apply_event_qa_update_ignores_unknown_task() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::QAUpdate {
+            task_id: TaskId("missing".to_string()),
+            status: "failed".to_string(),
+            tests: vec![],
+            targets: vec![],
+        });
+        // No panic, no tasks added
+        assert!(app.state.tasks.is_empty());
     }
 }

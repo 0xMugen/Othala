@@ -16,6 +16,7 @@ pub enum PromptRole {
     TestSpecWrite,
     Review,
     StackCaptain,
+    QAValidate,
 }
 
 /// Retry context injected when a task is being retried.
@@ -37,6 +38,8 @@ pub struct PromptConfig {
     pub test_spec: Option<String>,
     pub retry: Option<RetryContext>,
     pub verify_command: Option<String>,
+    /// QA failure details injected when retrying after a QA validation failure.
+    pub qa_failure_context: Option<String>,
 }
 
 /// Build a rich prompt from config and template directory.
@@ -51,6 +54,7 @@ pub fn build_rich_prompt(config: &PromptConfig, template_dir: &Path) -> String {
         PromptRole::TestSpecWrite => "tests-specialist.md",
         PromptRole::Review => "reviewer.md",
         PromptRole::StackCaptain => "stack-captain.md",
+        PromptRole::QAValidate => "qa-validator.md",
     };
     let template_path = template_dir.join(template_file);
     if let Ok(template) = std::fs::read_to_string(&template_path) {
@@ -100,6 +104,11 @@ pub fn build_rich_prompt(config: &PromptConfig, template_dir: &Path) -> String {
         ));
     }
 
+    // 5b. QA failure context (when retrying after QA validation failure).
+    if let Some(qa_ctx) = &config.qa_failure_context {
+        sections.push(qa_ctx.clone());
+    }
+
     // 6. Verify command.
     if let Some(cmd) = &config.verify_command {
         sections.push(format!(
@@ -137,6 +146,7 @@ mod tests {
             test_spec: None,
             retry: None,
             verify_command: None,
+            qa_failure_context: None,
         }
     }
 

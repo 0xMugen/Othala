@@ -507,6 +507,9 @@ mod tests {
             display_state: "Chatting".to_string(),
             verify_summary: "not_run".to_string(),
             last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }
     }
 
@@ -809,5 +812,67 @@ mod tests {
         // Should contain the last 10 entries
         assert!(text.iter().any(|line| line.contains("log line 5")));
         assert!(text.iter().any(|line| line.contains("log line 14")));
+    }
+
+    #[test]
+    fn status_sidebar_shows_qa_section_when_qa_data_present() {
+        use crate::model::QATestDisplay;
+
+        let mut row = mk_row("T1");
+        row.qa_status = Some("passed 2/3".to_string());
+        row.qa_tests = vec![
+            QATestDisplay {
+                name: "daemon_banner".to_string(),
+                suite: "startup".to_string(),
+                passed: true,
+                detail: String::new(),
+            },
+            QATestDisplay {
+                name: "create_chat".to_string(),
+                suite: "tui".to_string(),
+                passed: false,
+                detail: "timeout after 5s".to_string(),
+            },
+        ];
+        row.qa_targets = vec!["verify OAuth flow".to_string()];
+
+        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        // QA header
+        assert!(text.iter().any(|line| line == "qa"));
+        // QA status
+        assert!(text.iter().any(|line| line.contains("passed 2/3")));
+        // QA tests header
+        assert!(text.iter().any(|line| line.contains("qa tests")));
+        // Suite names
+        assert!(text.iter().any(|line| line.contains("startup")));
+        assert!(text.iter().any(|line| line.contains("tui")));
+        // Test names
+        assert!(text.iter().any(|line| line.contains("daemon_banner")));
+        assert!(text.iter().any(|line| line.contains("create_chat")));
+        // Failure detail
+        assert!(text.iter().any(|line| line.contains("timeout after 5s")));
+        // QA targets header
+        assert!(text.iter().any(|line| line.contains("qa targets")));
+        // Target
+        assert!(text.iter().any(|line| line.contains("verify OAuth flow")));
+    }
+
+    #[test]
+    fn status_sidebar_hides_qa_section_when_no_qa_data() {
+        let row = mk_row("T1");
+        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(!text.iter().any(|line| line == "qa"));
+        assert!(!text.iter().any(|line| line.contains("qa tests")));
+        assert!(!text.iter().any(|line| line.contains("qa targets")));
     }
 }

@@ -2,7 +2,8 @@ use chrono::Utc;
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
-use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiEvent, UiAction};
+use orch_tui::{run_tui_with_hook, AgentPaneStatus, QATestDisplay, TuiApp, TuiEvent, UiAction};
+use orchd::qa_agent;
 use orchd::supervisor::AgentSupervisor;
 use orchd::{OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
@@ -539,13 +540,68 @@ fn run() -> Result<(), MainError> {
         tick_counter = tick_counter.wrapping_add(1);
         if tick_counter.is_multiple_of(8) {
             if let Ok(tasks) = service.list_tasks() {
-                app.apply_event(TuiEvent::TasksReplaced { tasks });
+                app.apply_event(TuiEvent::TasksReplaced { tasks: tasks.clone() });
+                // Load QA data from disk for each task.
+                let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                for task in &tasks {
+                    let branch = task.branch_name.as_deref().unwrap_or("-");
+                    if let Some(qa_event) = load_qa_display(&repo_root, &task.id, branch) {
+                        app.apply_event(qa_event);
+                    }
+                }
             }
         }
     })?;
 
     supervisor.stop_all();
     Ok(())
+}
+
+// -- QA display loading -----------------------------------------------------
+
+fn load_qa_display(repo_root: &Path, task_id: &TaskId, branch: &str) -> Option<TuiEvent> {
+    if branch == "-" || branch.is_empty() {
+        return None;
+    }
+
+    let result = qa_agent::load_latest_result(repo_root, branch)?;
+
+    let status = if result.summary.failed > 0 {
+        format!(
+            "failed {}/{}",
+            result.summary.passed, result.summary.total
+        )
+    } else {
+        format!("passed {}/{}", result.summary.passed, result.summary.total)
+    };
+
+    let tests: Vec<QATestDisplay> = result
+        .tests
+        .iter()
+        .map(|t| QATestDisplay {
+            name: t.name.clone(),
+            suite: t.suite.clone(),
+            passed: t.passed,
+            detail: t.detail.clone(),
+        })
+        .collect();
+
+    // Load task-specific acceptance targets from spec file.
+    let targets = qa_agent::load_task_spec(repo_root, task_id)
+        .map(|spec| {
+            spec.lines()
+                .filter(|line| line.trim().starts_with("- "))
+                .map(|line| line.trim().strip_prefix("- ").unwrap_or(line.trim()).to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(TuiEvent::QAUpdate {
+        task_id: task_id.clone(),
+        status,
+        tests,
+        targets,
+    })
 }
 
 // -- Chat log persistence ---------------------------------------------------

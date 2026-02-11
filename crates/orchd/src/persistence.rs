@@ -354,6 +354,9 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::TaskFailed { .. } => "task_failed",
         EventKind::TestSpecValidated { .. } => "test_spec_validated",
         EventKind::OrchestratorDecomposed { .. } => "orchestrator_decomposed",
+        EventKind::QAStarted { .. } => "qa_started",
+        EventKind::QACompleted { .. } => "qa_completed",
+        EventKind::QAFailed { .. } => "qa_failed",
     }
 }
 

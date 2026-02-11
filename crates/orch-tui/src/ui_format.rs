@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, AgentPaneStatus, TaskOverviewRow};
+use crate::model::{AgentPane, AgentPaneStatus, QATestDisplay, TaskOverviewRow};
 
 const ACCENT: Color = Color::Cyan;
 const HEADER_FG: Color = Color::White;
@@ -25,9 +25,9 @@ fn state_color(state: TaskState) -> Color {
 /// for states that are not overridden by verify status.
 pub(crate) fn display_state_color(state: TaskState, display_state: &str) -> Color {
     match display_state {
-        "VerifyFail" | "SubmitFail" => Color::Red,
-        "Verified" => Color::Cyan,
-        "Verifying" => Color::Yellow,
+        "VerifyFail" | "SubmitFail" | "QAFail" => Color::Red,
+        "Verified" | "QAPassed" => Color::Cyan,
+        "Verifying" | "QARunning" => Color::Yellow,
         _ => state_color(state),
     }
 }
@@ -48,6 +48,8 @@ pub(crate) fn status_line_color(message: &str) -> Color {
         Color::Yellow
     } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
         Color::Green
+    } else if lower.contains("[qa_complete]") || lower.contains("qa_complete") {
+        ACCENT
     } else if lower.contains("error") || lower.contains("failed") || lower.contains("not found") {
         Color::Red
     } else if lower.contains("ready") || lower.contains("updated") || lower.contains("queued") {
@@ -352,6 +354,52 @@ pub(crate) fn status_sidebar_lines(
         ]));
     }
 
+    // QA section
+    if task.qa_status.is_some() || !task.qa_tests.is_empty() || !task.qa_targets.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "qa",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+
+        // QA status line
+        if let Some(ref status) = task.qa_status {
+            let (qa_marker, qa_color) = qa_status_style(status);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("[{qa_marker}] "),
+                    Style::default().fg(qa_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(status.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // QA test results grouped by suite
+        if !task.qa_tests.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "qa tests",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(qa_test_lines(&task.qa_tests));
+        }
+
+        // Task-specific acceptance targets
+        if !task.qa_targets.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "qa targets",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )));
+            for target in &task.qa_targets {
+                lines.push(Line::from(vec![
+                    Span::styled("  - ", Style::default().fg(DIM)),
+                    Span::styled(target.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+
     if !activity.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -379,6 +427,61 @@ pub(crate) fn status_sidebar_lines(
                 Style::default().fg(color),
             )));
         }
+    }
+
+    lines
+}
+
+/// Pick marker and color for QA status display.
+fn qa_status_style(status: &str) -> (&'static str, Color) {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("running") {
+        ("~", Color::Cyan)
+    } else if lower.contains("passed") && !lower.contains("failed") {
+        ("x", Color::Green)
+    } else if lower.contains("failed") {
+        ("!", Color::Red)
+    } else {
+        (" ", MUTED)
+    }
+}
+
+/// Render QA test results grouped by suite.
+fn qa_test_lines(tests: &[QATestDisplay]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut current_suite = String::new();
+
+    for test in tests {
+        if test.suite != current_suite {
+            current_suite = test.suite.clone();
+            lines.push(Line::from(Span::styled(
+                format!("  {}", current_suite),
+                Style::default().fg(MUTED),
+            )));
+        }
+
+        let (marker, color) = if test.passed {
+            ("x", Color::Green)
+        } else {
+            ("!", Color::Red)
+        };
+
+        let mut spans = vec![
+            Span::styled(
+                format!("  [{marker}] "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(test.name.clone(), Style::default().fg(Color::White)),
+        ];
+
+        if !test.passed && !test.detail.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", test.detail),
+                Style::default().fg(Color::Red),
+            ));
+        }
+
+        lines.push(Line::from(spans));
     }
 
     lines

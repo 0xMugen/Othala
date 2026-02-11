@@ -30,6 +30,8 @@ pub enum AgentSignalKind {
     ConflictResolved,
     RateLimited,
     ErrorHint,
+    #[serde(rename = "qa_complete")]
+    QAComplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +100,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentSignalKind::ErrorHint).expect("serialize"),
             "\"error_hint\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentSignalKind::QAComplete).expect("serialize"),
+            "\"qa_complete\""
         );
     }
 

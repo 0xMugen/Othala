@@ -7,6 +7,7 @@ pub mod daemon_loop;
 pub mod dependency_graph;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod prompt_builder;
+pub mod qa_agent;
 pub mod retry;
 pub mod stack_pipeline;
 pub mod test_spec;

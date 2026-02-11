@@ -6,6 +6,15 @@ use orch_core::types::{ModelKind, RepoId, Task, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Display-friendly QA test result for the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QATestDisplay {
+    pub name: String,
+    pub suite: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
 /// Task overview row for the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOverviewRow {
@@ -20,6 +29,15 @@ pub struct TaskOverviewRow {
     pub display_state: String,
     pub verify_summary: String,
     pub last_activity: DateTime<Utc>,
+    /// Current QA status label (e.g. "baseline running", "passed 5/5").
+    #[serde(default)]
+    pub qa_status: Option<String>,
+    /// Per-test QA results.
+    #[serde(default)]
+    pub qa_tests: Vec<QATestDisplay>,
+    /// Task-specific acceptance targets (what the QA hopes for).
+    #[serde(default)]
+    pub qa_targets: Vec<String>,
 }
 
 impl TaskOverviewRow {
@@ -46,6 +64,9 @@ impl TaskOverviewRow {
             display_state,
             verify_summary,
             last_activity: task.updated_at,
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
         }
     }
 }

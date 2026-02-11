@@ -55,6 +55,20 @@ pub enum EventKind {
     OrchestratorDecomposed {
         sub_task_ids: Vec<String>,
     },
+    /// QA run started (baseline or validation).
+    QAStarted {
+        qa_type: String,
+    },
+    /// QA run completed successfully.
+    QACompleted {
+        passed: u32,
+        failed: u32,
+        total: u32,
+    },
+    /// QA run found failures.
+    QAFailed {
+        failures: Vec<String>,
+    },
 }
 
 /// An event in the orchestrator.

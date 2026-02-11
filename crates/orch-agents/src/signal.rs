@@ -30,6 +30,8 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         Some(AgentSignalKind::NeedHuman)
     } else if lower.contains("[patch_ready]") {
         Some(AgentSignalKind::PatchReady)
+    } else if lower.contains("[qa_complete]") {
+        Some(AgentSignalKind::QAComplete)
     } else if lower.contains("[conflict_resolved]") {
         Some(AgentSignalKind::ConflictResolved)
     } else if lower.contains("rate limit")
@@ -157,6 +159,13 @@ mod tests {
         assert!(detect_common_signal("the needs_human flag is set").is_none());
         assert!(detect_common_signal("patch_ready variable was true").is_none());
         assert!(detect_common_signal("conflict_resolved in the merge").is_none());
+    }
+
+    #[test]
+    fn detects_qa_complete_signal() {
+        let signal =
+            detect_common_signal("all tests done: [qa_complete]").expect("qa complete signal");
+        assert_eq!(signal.kind, AgentSignalKind::QAComplete);
     }
 
     #[test]
