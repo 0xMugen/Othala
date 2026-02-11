@@ -7,10 +7,22 @@ use ratatui::text::{Line, Span};
 use crate::model::{ChatBlock, ToolStatus};
 
 const ACCENT: Color = Color::Cyan;
+const CODEX_ACCENT: Color = Color::Blue;
+const GEMINI_ACCENT: Color = Color::Green;
 const DIM: Color = Color::DarkGray;
 const OUTPUT_FG: Color = Color::White;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn agent_accent_color(agent: &str) -> Color {
+    if agent.eq_ignore_ascii_case("codex") {
+        CODEX_ACCENT
+    } else if agent.eq_ignore_ascii_case("gemini") {
+        GEMINI_ACCENT
+    } else {
+        ACCENT
+    }
+}
 
 /// Truncate a string to at most `max_chars` display characters.
 /// Appends `…` if truncated.
@@ -47,6 +59,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 pub fn render_chat_blocks(blocks: &[ChatBlock], width: u16) -> Vec<Line<'static>> {
     let inner_w = width.saturating_sub(2) as usize;
     let mut output = Vec::with_capacity(blocks.len().saturating_mul(3));
+    let mut active_agent_accent: Option<Color> = None;
     for (i, block) in blocks.iter().enumerate() {
         // AgentMarker handles its own spacing; others get a blank separator.
         if i > 0 && !matches!(block, ChatBlock::AgentMarker { .. }) {
@@ -56,7 +69,7 @@ pub fn render_chat_blocks(blocks: &[ChatBlock], width: u16) -> Vec<Line<'static>
             ChatBlock::UserMessage { lines } => render_user_message(&mut output, lines, inner_w),
             ChatBlock::Thinking { lines } => render_thinking(&mut output, lines, inner_w),
             ChatBlock::AssistantText { lines } => {
-                render_assistant_text(&mut output, lines, inner_w)
+                render_assistant_text(&mut output, lines, inner_w, active_agent_accent)
             }
             ChatBlock::ToolCall {
                 tool,
@@ -67,7 +80,11 @@ pub fn render_chat_blocks(blocks: &[ChatBlock], width: u16) -> Vec<Line<'static>
                 render_code_fence(&mut output, lang.as_deref(), lines, width)
             }
             ChatBlock::Diff { lines } => render_diff(&mut output, lines, width),
-            ChatBlock::AgentMarker { agent } => render_agent_marker(&mut output, agent, width),
+            ChatBlock::AgentMarker { agent } => {
+                let accent = agent_accent_color(agent);
+                active_agent_accent = Some(accent);
+                render_agent_marker(&mut output, agent, width, accent);
+            }
             ChatBlock::StatusSignal { line } => render_status_signal(&mut output, line, inner_w),
         }
     }
@@ -135,7 +152,7 @@ fn render_thinking(output: &mut Vec<Line<'static>>, lines: &[String], inner_w: u
 
 // ── Inline Markdown ─────────────────────────────────────────────────────────
 
-fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
+fn markdown_line_to_spans(line: &str, accent: Color) -> Vec<Span<'static>> {
     let trimmed = line.trim_start();
 
     // Headings
@@ -150,7 +167,7 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
     if let Some(rest) = trimmed.strip_prefix("## ") {
         return vec![Span::styled(
             rest.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )];
     }
     if let Some(rest) = trimmed.strip_prefix("# ") {
@@ -181,9 +198,13 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
         let prefix = " ".repeat(indent);
         let mut spans = vec![Span::styled(
             format!("{prefix} \u{2022} "),
-            Style::default().fg(ACCENT),
+            Style::default().fg(accent),
         )];
-        spans.extend(parse_inline_markdown(rest, Style::default().fg(OUTPUT_FG)));
+        spans.extend(parse_inline_markdown_with_accent(
+            rest,
+            Style::default().fg(OUTPUT_FG),
+            accent,
+        ));
         return spans;
     }
 
@@ -195,12 +216,16 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
             format!("{prefix} {num_str}. "),
             Style::default().fg(Color::Blue),
         )];
-        spans.extend(parse_inline_markdown(rest, Style::default().fg(OUTPUT_FG)));
+        spans.extend(parse_inline_markdown_with_accent(
+            rest,
+            Style::default().fg(OUTPUT_FG),
+            accent,
+        ));
         return spans;
     }
 
     // Default: inline markdown
-    parse_inline_markdown(line, Style::default().fg(OUTPUT_FG))
+    parse_inline_markdown_with_accent(line, Style::default().fg(OUTPUT_FG), accent)
 }
 
 fn try_parse_ordered_list(trimmed: &str) -> Option<(String, &str)> {
@@ -214,6 +239,14 @@ fn try_parse_ordered_list(trimmed: &str) -> Option<(String, &str)> {
 }
 
 fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    parse_inline_markdown_with_accent(text, base_style, ACCENT)
+}
+
+fn parse_inline_markdown_with_accent(
+    text: &str,
+    base_style: Style,
+    accent: Color,
+) -> Vec<Span<'static>> {
     if !text.contains('`') && !text.contains('*') {
         return vec![Span::styled(text.to_string(), base_style)];
     }
@@ -232,7 +265,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
                     spans.push(Span::styled(std::mem::take(&mut current), base_style));
                 }
                 let code: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(code, Style::default().fg(ACCENT)));
+                spans.push(Span::styled(code, Style::default().fg(accent)));
                 i = end + 1;
                 continue;
             }
@@ -344,13 +377,29 @@ fn find_closing_single_star(chars: &[char], start: usize) -> Option<usize> {
 
 // ── Assistant Text (markdown-aware) ─────────────────────────────────────────
 
-fn render_assistant_text(output: &mut Vec<Line<'static>>, lines: &[String], inner_w: usize) {
+fn render_assistant_text(
+    output: &mut Vec<Line<'static>>,
+    lines: &[String],
+    inner_w: usize,
+    agent_accent: Option<Color>,
+) {
+    let accent = agent_accent.unwrap_or(ACCENT);
+    let has_rail = agent_accent.is_some();
+    let rail_width = usize::from(has_rail) * 2;
     for line in lines {
         if line.trim().is_empty() {
             output.push(Line::from(""));
         } else {
-            let truncated = truncate_str(line, inner_w);
-            output.push(Line::from(markdown_line_to_spans(&truncated)));
+            let truncated = truncate_str(line, inner_w.saturating_sub(rail_width));
+            let mut spans = Vec::with_capacity(3);
+            if has_rail {
+                spans.push(Span::styled(
+                    "\u{2502} ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.extend(markdown_line_to_spans(&truncated, accent));
+            output.push(Line::from(spans));
         }
     }
 }
@@ -683,7 +732,7 @@ fn diff_content_style(line: &str) -> Style {
 
 // ── Agent Marker (double-line separator) ────────────────────────────────────
 
-fn render_agent_marker(output: &mut Vec<Line<'static>>, agent: &str, width: u16) {
+fn render_agent_marker(output: &mut Vec<Line<'static>>, agent: &str, width: u16, accent: Color) {
     output.push(Line::from(""));
 
     let label = format!(" {agent} ");
@@ -696,7 +745,7 @@ fn render_agent_marker(output: &mut Vec<Line<'static>>, agent: &str, width: u16)
         Span::styled("\u{2550}".repeat(left), Style::default().fg(DIM)),
         Span::styled(
             label,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled("\u{2550}".repeat(right), Style::default().fg(DIM)),
     ]));
@@ -864,6 +913,33 @@ mod tests {
         }];
         let rendered = render_chat_blocks(&blocks, 80);
         assert_eq!(rendered[0].spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn assistant_text_after_agent_marker_gets_colored_rail() {
+        let blocks = vec![
+            ChatBlock::AgentMarker {
+                agent: "codex".to_string(),
+            },
+            ChatBlock::AssistantText {
+                lines: vec!["Use `cargo test`".to_string()],
+            },
+        ];
+        let rendered = render_chat_blocks(&blocks, 80);
+
+        let rail_span = rendered
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "\u{2502} ")
+            .expect("assistant rail span");
+        assert_eq!(rail_span.style.fg, Some(Color::Blue));
+
+        let code_span = rendered
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "cargo test")
+            .expect("inline code span");
+        assert_eq!(code_span.style.fg, Some(Color::Blue));
     }
 
     #[test]
@@ -1110,6 +1186,21 @@ mod tests {
         let rendered = render_chat_blocks(&blocks, 80);
         // AssistantText(1) + AgentMarker blank(1) + marker(1) + separator(1) + AssistantText(1) = 5
         assert_eq!(rendered.len(), 5);
+    }
+
+    #[test]
+    fn agent_marker_uses_model_specific_color() {
+        let codex = vec![ChatBlock::AgentMarker {
+            agent: "codex".to_string(),
+        }];
+        let codex_rendered = render_chat_blocks(&codex, 40);
+        assert_eq!(codex_rendered[1].spans[1].style.fg, Some(Color::Blue));
+
+        let gemini = vec![ChatBlock::AgentMarker {
+            agent: "gemini".to_string(),
+        }];
+        let gemini_rendered = render_chat_blocks(&gemini, 40);
+        assert_eq!(gemini_rendered[1].spans[1].style.fg, Some(Color::Green));
     }
 
     // ── Status Signal ──
