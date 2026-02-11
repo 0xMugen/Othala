@@ -340,23 +340,23 @@ fn run() -> Result<(), MainError> {
             let now = Utc::now();
             if outcome.patch_ready || outcome.success {
                 let event = Event {
-                    id: EventId(format!("E-HUMAN-REVIEW-{}", outcome.task_id.0)),
+                    id: EventId(format!("E-DONE-{}", outcome.task_id.0)),
                     task_id: Some(outcome.task_id.clone()),
                     repo_id: None,
                     at: now,
                     kind: EventKind::NeedsHuman {
-                        reason: "review required".to_string(),
+                        reason: "agent completed".to_string(),
                     },
                 };
                 let _ = service.record_event(&event);
                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
                     instance_id: instance_id.clone(),
-                    status: AgentPaneStatus::Waiting,
+                    status: AgentPaneStatus::Exited,
                 });
                 let task_label = &outcome.task_id.0;
                 app.apply_event(TuiEvent::StatusLine {
                     message: format!(
-                        "[needs_human] {task_label} ready for review -- press 'a' to approve"
+                        "{task_label} done -- press 'a' to approve or 'i' to chat"
                     ),
                 });
             } else if outcome.needs_human {
