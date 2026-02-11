@@ -118,6 +118,8 @@ pub struct QAState {
     pub child_handle: Option<Child>,
     pub result_rx: Option<mpsc::Receiver<String>>,
     pub qa_complete: bool,
+    /// Accumulated output from the agent — used to parse QA results on completion.
+    pub output_buffer: Vec<String>,
 }
 
 impl QAState {
@@ -132,6 +134,7 @@ impl QAState {
             child_handle: None,
             result_rx: None,
             qa_complete: false,
+            output_buffer: Vec::new(),
         }
     }
 }
@@ -517,7 +520,9 @@ pub fn spawn_qa_agent(
 }
 
 /// Drain pending output lines from a running QA agent without checking for
-/// completion.  Returns the lines for display in a TUI pane.
+/// completion.  Returns the lines for display in a TUI pane.  Also
+/// accumulates lines into `state.output_buffer` so that `poll_qa_agent`
+/// can parse the full output on completion.
 pub fn drain_qa_output(state: &mut QAState) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(rx) = &state.result_rx {
@@ -530,28 +535,33 @@ pub fn drain_qa_output(state: &mut QAState) -> Vec<String> {
             lines.push(line);
         }
     }
+    // Keep a copy in the buffer for parse_qa_output later.
+    state.output_buffer.extend(lines.iter().cloned());
     lines
 }
 
 /// Non-blocking poll of a running QA agent.
 ///
 /// Returns `Some(QAResult)` when the agent has completed.
+///
+/// **Important**: call `drain_qa_output` before this so that channel lines
+/// are accumulated in `state.output_buffer`.  This function drains any
+/// remaining lines (that arrived between the last drain and the child
+/// exiting) and uses the full buffer for parsing.
 pub fn poll_qa_agent(state: &mut QAState) -> Option<QAResult> {
     if state.status != QAStatus::RunningBaseline && state.status != QAStatus::RunningValidation {
         return None;
     }
 
-    // Drain output and check for signals / completion.
-    let mut output_lines = Vec::new();
+    // Drain any lines that arrived since the last drain_qa_output call.
     if let Some(rx) = &state.result_rx {
         while let Ok(line) = rx.try_recv() {
-            // Check for [qa_complete] signal.
             if let Some(signal) = detect_common_signal(&line) {
                 if signal.kind == AgentSignalKind::QAComplete {
                     state.qa_complete = true;
                 }
             }
-            output_lines.push(line);
+            state.output_buffer.push(line);
         }
     }
 
@@ -571,7 +581,7 @@ pub fn poll_qa_agent(state: &mut QAState) -> Option<QAResult> {
         return None;
     }
 
-    // Child exited — drain remaining output.
+    // Child exited — drain any final lines from the channel.
     if let Some(rx) = &state.result_rx {
         while let Ok(line) = rx.try_recv() {
             if let Some(signal) = detect_common_signal(&line) {
@@ -579,11 +589,12 @@ pub fn poll_qa_agent(state: &mut QAState) -> Option<QAResult> {
                     state.qa_complete = true;
                 }
             }
-            output_lines.push(line);
+            state.output_buffer.push(line);
         }
     }
 
-    let raw_output = output_lines.join("\n");
+    // Parse from the full accumulated buffer.
+    let raw_output = state.output_buffer.join("\n");
     let result = parse_qa_output(&raw_output);
 
     if result.tests.is_empty() && !state.qa_complete {

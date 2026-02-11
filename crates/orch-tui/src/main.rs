@@ -912,10 +912,14 @@ fn run() -> Result<(), MainError> {
 
         // Drain QA agent output lines into their TUI panes.
         for (qa_key, qa_state) in qa_agents.iter_mut() {
-            let task_id_str = qa_key.strip_prefix("qa-").unwrap_or(qa_key);
+            // Extract task_id from key: "qa-{task_id}" or "qa-post-{task_id}".
+            let task_id_str = qa_key
+                .strip_prefix("qa-post-")
+                .or_else(|| qa_key.strip_prefix("qa-"))
+                .unwrap_or(qa_key);
             let qa_lines = qa_agent::drain_qa_output(qa_state);
             if !qa_lines.is_empty() {
-                let qa_instance = format!("qa-{task_id_str}");
+                let qa_instance = qa_key.clone();
                 let task_id = TaskId(task_id_str.to_string());
                 let model = service
                     .task(&task_id)
@@ -935,7 +939,11 @@ fn run() -> Result<(), MainError> {
         // Poll QA agents and handle completions.
         let qa_keys: Vec<String> = qa_agents.keys().cloned().collect();
         for qa_key in qa_keys {
-            let task_id_str = qa_key.strip_prefix("qa-").unwrap_or(&qa_key);
+            // Extract task_id from key: "qa-{task_id}" or "qa-post-{task_id}".
+            let task_id_str = qa_key
+                .strip_prefix("qa-post-")
+                .or_else(|| qa_key.strip_prefix("qa-"))
+                .unwrap_or(&qa_key);
             let task_id = TaskId(task_id_str.to_string());
 
             let qa_state = qa_agents.get_mut(&qa_key).unwrap();
@@ -977,7 +985,7 @@ fn run() -> Result<(), MainError> {
                     .unwrap_or_default();
 
                 // Mark the QA pane as exited.
-                let qa_instance = format!("qa-{}", task_id.0);
+                let qa_instance = qa_key.clone();
                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
                     instance_id: qa_instance,
                     status: if all_passed {
@@ -1313,6 +1321,111 @@ fn run() -> Result<(), MainError> {
                                     app.apply_event(TuiEvent::TasksReplaced {
                                         tasks,
                                     });
+                                }
+
+                                // Spawn post-submit QA validation pass.
+                                let qa_key = format!("qa-post-{}", task_id.0);
+                                if !qa_agents.contains_key(&qa_key) {
+                                    if let Some(baseline) =
+                                        qa_agent::load_baseline(&repo_root)
+                                    {
+                                        let task_spec = qa_agent::load_task_spec(
+                                            &repo_root, &task_id,
+                                        );
+                                        let previous = service
+                                            .task(&task_id)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|t| t.branch_name)
+                                            .as_deref()
+                                            .and_then(|b| {
+                                                qa_agent::load_latest_result(
+                                                    &repo_root, b,
+                                                )
+                                            });
+                                        let prompt = qa_agent::build_qa_prompt(
+                                            &baseline,
+                                            task_spec.as_deref(),
+                                            previous.as_ref(),
+                                            &repo_root,
+                                            &template_dir,
+                                        );
+                                        let model = service
+                                            .task(&task_id)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|t| t.preferred_model)
+                                            .unwrap_or(ModelKind::Claude);
+                                        let mut qa_state = qa_agent::QAState::new(
+                                            qa_agent::QAType::Validation,
+                                        );
+                                        match qa_agent::spawn_qa_agent(
+                                            &repo_root,
+                                            &prompt,
+                                            model,
+                                            &mut qa_state,
+                                        ) {
+                                            Ok(()) => {
+                                                qa_agents
+                                                    .insert(qa_key, qa_state);
+                                                let qa_instance = format!(
+                                                    "qa-post-{}",
+                                                    task_id.0
+                                                );
+                                                let targets = task_spec
+                                                    .as_deref()
+                                                    .map(|s| extract_targets(s))
+                                                    .unwrap_or_default();
+                                                app.apply_event(
+                                                    TuiEvent::AgentPaneOutput {
+                                                        instance_id:
+                                                            qa_instance.clone(),
+                                                        task_id: task_id.clone(),
+                                                        model,
+                                                        lines: vec![
+                                                            "[Post-submit QA validation starting...]"
+                                                                .to_string(),
+                                                        ],
+                                                    },
+                                                );
+                                                app.apply_event(
+                                                    TuiEvent::AgentPaneStatusChanged {
+                                                        instance_id: qa_instance,
+                                                        status:
+                                                            AgentPaneStatus::Starting,
+                                                    },
+                                                );
+                                                app.apply_event(
+                                                    TuiEvent::QAUpdate {
+                                                        task_id: task_id.clone(),
+                                                        status:
+                                                            "post-submit validation running"
+                                                                .to_string(),
+                                                        tests: vec![],
+                                                        targets,
+                                                    },
+                                                );
+                                                app.apply_event(
+                                                    TuiEvent::StatusLine {
+                                                        message: format!(
+                                                            "Post-submit QA validation started for {}",
+                                                            task_id.0
+                                                        ),
+                                                    },
+                                                );
+                                            }
+                                            Err(e) => {
+                                                app.apply_event(
+                                                    TuiEvent::StatusLine {
+                                                        message: format!(
+                                                            "Post-submit QA spawn failed for {}: {e}",
+                                                            task_id.0
+                                                        ),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else {
