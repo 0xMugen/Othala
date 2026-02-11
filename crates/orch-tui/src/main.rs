@@ -6,12 +6,14 @@ use orch_tui::{run_tui_with_hook, AgentPaneStatus, TuiApp, TuiEvent, UiAction};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_TICK_MS: u64 = 250;
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_PATH: &str = ".orch/events";
+const CHAT_LOG_DIR: &str = ".orch/chat";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
@@ -47,6 +49,8 @@ fn run() -> Result<(), MainError> {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::create_dir_all(&args.event_log_path).ok();
+    let chat_log_dir = PathBuf::from(CHAT_LOG_DIR);
+    std::fs::create_dir_all(&chat_log_dir).ok();
 
     let scheduler = Scheduler::new(SchedulerConfig {
         per_repo_limit: 10,
@@ -64,6 +68,27 @@ fn run() -> Result<(), MainError> {
 
     let tasks = service.list_tasks().unwrap_or_default();
     let mut app = TuiApp::from_tasks(&tasks);
+
+    // Restore chat history from log files.
+    for task in &tasks {
+        let lines = load_chat_log(&chat_log_dir, &task.id);
+        if !lines.is_empty() {
+            let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+            let instance_id = format!("agent-{}", task.id.0);
+            app.apply_event(TuiEvent::AgentPaneOutput {
+                instance_id: instance_id.clone(),
+                task_id: task.id.clone(),
+                model,
+                lines,
+            });
+            // Mark pane as exited so the user sees history, not "running".
+            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                instance_id,
+                status: AgentPaneStatus::Exited,
+            });
+        }
+    }
+
     app.state.status_line = format!(
         "orch-tui started tick_ms={} tasks={}",
         args.tick_ms,
@@ -81,18 +106,28 @@ fn run() -> Result<(), MainError> {
                 UiAction::CreateTask => {
                     if let Some(prompt) = &queued.prompt {
                         let model = queued.model.unwrap_or(ModelKind::Claude);
-                        let task_id = format!("chat-{}", Utc::now().timestamp_millis());
-                        let worktree_path =
+                        let task_id =
+                            TaskId::new(format!("chat-{}", Utc::now().timestamp_millis()));
+                        let start_path =
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+                        // Try workspace provisioning; fall back to cwd on failure.
+                        let (worktree_path, branch_name) =
+                            match orchd::provision_chat_workspace(&start_path, &task_id) {
+                                Ok(ws) => (ws.worktree_path, Some(ws.branch_name)),
+                                Err(_) => (start_path.clone(), None),
+                            };
+
                         let mut task = Task::new(
-                            TaskId::new(&task_id),
+                            task_id.clone(),
                             RepoId("default".to_string()),
                             prompt.clone(),
                             worktree_path,
                         );
                         task.preferred_model = Some(model);
+                        task.branch_name = branch_name.clone();
                         let event = Event {
-                            id: EventId(format!("E-CREATE-{}", task_id)),
+                            id: EventId(format!("E-CREATE-{}", task_id.0)),
                             task_id: Some(task.id.clone()),
                             repo_id: Some(task.repo_id.clone()),
                             at: Utc::now(),
@@ -100,9 +135,19 @@ fn run() -> Result<(), MainError> {
                         };
                         match service.create_task(&task, &event) {
                             Ok(()) => {
+                                let detail = branch_name
+                                    .as_deref()
+                                    .unwrap_or("(no branch)");
                                 app.apply_event(TuiEvent::StatusLine {
-                                    message: format!("created chat {task_id}"),
+                                    message: format!(
+                                        "created chat {} on {}",
+                                        task_id.0, detail
+                                    ),
                                 });
+                                // Immediately refresh task list so it appears.
+                                if let Ok(tasks) = service.list_tasks() {
+                                    app.apply_event(TuiEvent::TasksReplaced { tasks });
+                                }
                             }
                             Err(e) => {
                                 app.apply_event(TuiEvent::StatusLine {
@@ -115,6 +160,8 @@ fn run() -> Result<(), MainError> {
                 UiAction::DeleteTask => {
                     if let Some(task_id) = &queued.task_id {
                         supervisor.stop(task_id);
+                        // Remove chat log file.
+                        let _ = std::fs::remove_file(chat_log_path(&chat_log_dir, task_id));
                         match service.delete_task(task_id) {
                             Ok(true) => {
                                 app.apply_event(TuiEvent::StatusLine {
@@ -138,6 +185,7 @@ fn run() -> Result<(), MainError> {
                     if let Some(task_id) = &queued.task_id {
                         if let Ok(Some(task)) = service.task(task_id) {
                             let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                            let instance_id = format!("agent-{}", task_id.0);
                             match supervisor.spawn_agent(
                                 &task.id,
                                 &task.repo_id,
@@ -146,6 +194,16 @@ fn run() -> Result<(), MainError> {
                                 Some(model),
                             ) {
                                 Ok(()) => {
+                                    app.apply_event(TuiEvent::AgentPaneOutput {
+                                        instance_id: instance_id.clone(),
+                                        task_id: task_id.clone(),
+                                        model,
+                                        lines: vec![],
+                                    });
+                                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                        instance_id,
+                                        status: AgentPaneStatus::Starting,
+                                    });
                                     app.apply_event(TuiEvent::StatusLine {
                                         message: format!(
                                             "started {:?} agent for {}",
@@ -187,13 +245,15 @@ fn run() -> Result<(), MainError> {
                                         message: format!("interactive spawn failed: {e}"),
                                     });
                                 } else {
-                                    // Echo user message into the pane.
+                                    // Echo user message into the pane and log.
+                                    let user_line = format!("> {message}");
+                                    append_chat_log(&chat_log_dir, task_id, &[user_line.clone()]);
                                     let instance_id = format!("agent-{}", task_id.0);
                                     app.apply_event(TuiEvent::AgentPaneOutput {
                                         instance_id,
                                         task_id: task_id.clone(),
                                         model,
-                                        lines: vec![format!("> {message}")],
+                                        lines: vec![user_line],
                                     });
                                     app.apply_event(TuiEvent::StatusLine {
                                         message: format!(
@@ -207,6 +267,8 @@ fn run() -> Result<(), MainError> {
                             // Session exists — send the message.
                             match supervisor.send_input(task_id, message) {
                                 Ok(()) => {
+                                    let user_line = format!("> {message}");
+                                    append_chat_log(&chat_log_dir, task_id, &[user_line.clone()]);
                                     let instance_id = format!("agent-{}", task_id.0);
                                     let model = service
                                         .task(task_id)
@@ -218,7 +280,7 @@ fn run() -> Result<(), MainError> {
                                         instance_id,
                                         task_id: task_id.clone(),
                                         model,
-                                        lines: vec![format!("> {message}")],
+                                        lines: vec![user_line],
                                     });
                                 }
                                 Err(e) => {
@@ -264,6 +326,7 @@ fn run() -> Result<(), MainError> {
         // Poll supervisor for output and completions.
         let result = supervisor.poll();
         for chunk in result.output {
+            append_chat_log(&chat_log_dir, &chunk.task_id, &chunk.lines);
             let instance_id = format!("agent-{}", chunk.task_id.0);
             app.apply_event(TuiEvent::AgentPaneOutput {
                 instance_id,
@@ -320,25 +383,56 @@ fn run() -> Result<(), MainError> {
         }
 
         // Auto-spawn agents for Chatting tasks without a running session.
-        // Skip tasks whose pane is in Waiting status (needs human review).
+        // Skip tasks whose pane is in a terminal state (Waiting/Failed/Exited).
         if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
             for task in &chatting {
-                let pane_waiting =
-                    app.state.panes.iter().any(|pane| {
-                        pane.task_id == task.id && pane.status == AgentPaneStatus::Waiting
-                    });
-                if !supervisor.has_session(&task.id) && !pane_waiting {
+                let pane_stopped = app.state.panes.iter().any(|pane| {
+                    pane.task_id == task.id
+                        && matches!(
+                            pane.status,
+                            AgentPaneStatus::Waiting
+                                | AgentPaneStatus::Failed
+                                | AgentPaneStatus::Exited
+                        )
+                });
+                if !supervisor.has_session(&task.id) && !pane_stopped {
                     let model = task.preferred_model.unwrap_or(ModelKind::Claude);
-                    if let Ok(()) = supervisor.spawn_agent(
+                    let instance_id = format!("agent-{}", task.id.0);
+                    match supervisor.spawn_agent(
                         &task.id,
                         &task.repo_id,
                         &task.worktree_path,
                         &task.title,
                         Some(model),
                     ) {
-                        app.apply_event(TuiEvent::StatusLine {
-                            message: format!("auto-started {:?} agent for {}", model, task.id.0),
-                        });
+                        Ok(()) => {
+                            // Create pane immediately so the UI shows "starting"
+                            // instead of "no agent running for this task".
+                            app.apply_event(TuiEvent::AgentPaneOutput {
+                                instance_id: instance_id.clone(),
+                                task_id: task.id.clone(),
+                                model,
+                                lines: vec![],
+                            });
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id,
+                                status: AgentPaneStatus::Starting,
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "auto-started {:?} agent for {}",
+                                    model, task.id.0
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "auto-spawn failed for {}: {}",
+                                    task.id.0, e
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -355,6 +449,43 @@ fn run() -> Result<(), MainError> {
 
     supervisor.stop_all();
     Ok(())
+}
+
+// -- Chat log persistence ---------------------------------------------------
+
+fn chat_log_path(base: &Path, task_id: &TaskId) -> PathBuf {
+    base.join(format!("{}.log", task_id.0))
+}
+
+fn append_chat_log(base: &Path, task_id: &TaskId, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let path = chat_log_path(base, task_id);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    for line in lines {
+        let _ = writeln!(file, "{}", line);
+    }
+}
+
+fn load_chat_log(base: &Path, task_id: &TaskId) -> Vec<String> {
+    let path = chat_log_path(base, task_id);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    // Keep only the last 400 lines to match the in-memory limit.
+    if lines.len() > 400 {
+        lines[lines.len() - 400..].to_vec()
+    } else {
+        lines
+    }
 }
 
 fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError> {
@@ -424,7 +555,8 @@ Defaults:\n\
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cli_args, usage, CliArgs};
+    use super::{append_chat_log, chat_log_path, load_chat_log, parse_cli_args, usage, CliArgs};
+    use orch_core::types::TaskId;
     use std::path::PathBuf;
 
     #[test]
@@ -491,5 +623,71 @@ mod tests {
     fn parse_cli_args_help_returns_usage() {
         let err = parse_cli_args(vec!["--help".to_string()], "orch-tui").expect_err("help path");
         assert_eq!(err.to_string(), usage("orch-tui"));
+    }
+
+    fn temp_chat_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "othala-chat-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn chat_log_roundtrip() {
+        let dir = temp_chat_dir();
+        let task_id = TaskId("T1".to_string());
+
+        // Empty before any writes.
+        assert!(load_chat_log(&dir, &task_id).is_empty());
+
+        // Write some lines.
+        append_chat_log(
+            &dir,
+            &task_id,
+            &["line one".to_string(), "line two".to_string()],
+        );
+        let loaded = load_chat_log(&dir, &task_id);
+        assert_eq!(loaded, vec!["line one", "line two"]);
+
+        // Append more lines.
+        append_chat_log(&dir, &task_id, &["line three".to_string()]);
+        let loaded = load_chat_log(&dir, &task_id);
+        assert_eq!(loaded, vec!["line one", "line two", "line three"]);
+    }
+
+    #[test]
+    fn chat_log_truncates_on_load() {
+        let dir = temp_chat_dir();
+        let task_id = TaskId("T-big".to_string());
+
+        let lines: Vec<String> = (0..500).map(|i| format!("line {i}")).collect();
+        append_chat_log(&dir, &task_id, &lines);
+
+        let loaded = load_chat_log(&dir, &task_id);
+        assert_eq!(loaded.len(), 400);
+        assert_eq!(loaded[0], "line 100");
+        assert_eq!(loaded[399], "line 499");
+    }
+
+    #[test]
+    fn chat_log_path_uses_task_id() {
+        let dir = PathBuf::from("/tmp/chat");
+        let task_id = TaskId("chat-123".to_string());
+        assert_eq!(chat_log_path(&dir, &task_id), PathBuf::from("/tmp/chat/chat-123.log"));
+    }
+
+    #[test]
+    fn append_chat_log_skips_empty_lines_vec() {
+        let dir = temp_chat_dir();
+        let task_id = TaskId("T-empty".to_string());
+
+        // Appending empty vec should not create file.
+        append_chat_log(&dir, &task_id, &[]);
+        assert!(!chat_log_path(&dir, &task_id).exists());
     }
 }

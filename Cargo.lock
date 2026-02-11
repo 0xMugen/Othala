@@ -698,6 +698,8 @@ dependencies = [
  "clap",
  "orch-agents",
  "orch-core",
+ "orch-git",
+ "orch-graphite",
  "rusqlite",
  "serde",
  "serde_json",

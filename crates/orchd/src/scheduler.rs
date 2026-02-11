@@ -121,10 +121,8 @@ impl Scheduler {
             *model_counts.entry(running.model).or_insert(0) += 1;
         }
 
-        let available_models = available_models_in_priority_order(
-            &input.enabled_models,
-            &input.availability,
-        );
+        let available_models =
+            available_models_in_priority_order(&input.enabled_models, &input.availability);
         let mut assignments = Vec::new();
         let mut blocked = Vec::new();
 

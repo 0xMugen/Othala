@@ -8,7 +8,7 @@ use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
 use orchd::supervisor::AgentSupervisor;
-use orchd::{OrchdService, Scheduler, SchedulerConfig};
+use orchd::{provision_chat_workspace, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -107,14 +107,17 @@ fn main() -> anyhow::Result<()> {
         Commands::Chat { action } => match action {
             ChatAction::New { repo, title, model } => {
                 let task_id = format!("chat-{}", Utc::now().timestamp_millis());
-                let worktree_path = std::env::current_dir()?;
+                let task_id = TaskId::new(&task_id);
+                let start_path = std::env::current_dir()?;
+                let workspace = provision_chat_workspace(&start_path, &task_id)?;
 
                 let mut task = Task::new(
-                    TaskId::new(&task_id),
+                    task_id.clone(),
                     RepoId(repo.clone()),
                     title.clone(),
-                    worktree_path,
+                    workspace.worktree_path.clone(),
                 );
+                task.branch_name = Some(workspace.branch_name.clone());
 
                 let model_kind = match model.to_lowercase().as_str() {
                     "claude" => ModelKind::Claude,
@@ -125,7 +128,7 @@ fn main() -> anyhow::Result<()> {
                 task.preferred_model = Some(model_kind);
 
                 let event = Event {
-                    id: EventId(format!("E-CREATE-{}", task_id)),
+                    id: EventId(format!("E-CREATE-{}", task_id.0)),
                     task_id: Some(task.id.clone()),
                     repo_id: Some(task.repo_id.clone()),
                     at: Utc::now(),
@@ -133,7 +136,13 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 service.create_task(&task, &event)?;
-                println!("Created chat: {} - {}", task_id, title);
+                println!(
+                    "Created chat: {} - {} [{} @ {}]",
+                    task_id.0,
+                    title,
+                    workspace.branch_name,
+                    workspace.worktree_path.display()
+                );
             }
             ChatAction::List => {
                 print_task_list(&service.list_tasks()?);
@@ -156,6 +165,10 @@ fn main() -> anyhow::Result<()> {
                     if let Some(pr) = task.pr {
                         println!("PR: {} ({})", pr.number, pr.url);
                     }
+                    if let Some(branch) = &task.branch_name {
+                        println!("Branch: {}", branch);
+                    }
+                    println!("Worktree: {}", task.worktree_path.display());
                     println!("Created: {}", task.created_at);
                     println!("Updated: {}", task.updated_at);
                 }

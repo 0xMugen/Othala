@@ -268,8 +268,7 @@ fn detect_tool_status(lines: &[String]) -> ToolStatus {
         if lower.contains("succeeded in") {
             return ToolStatus::Succeeded;
         }
-        if lower.contains("failed in") || (lower.contains("error") && lower.contains("exit code"))
-        {
+        if lower.contains("failed in") || (lower.contains("error") && lower.contains("exit code")) {
             return ToolStatus::Failed;
         }
     }

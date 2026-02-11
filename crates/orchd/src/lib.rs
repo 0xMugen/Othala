@@ -1,5 +1,6 @@
 //! Othala daemon crate - MVP version.
 
+pub mod chat_workspace;
 pub mod dependency_graph;
 pub mod event_log;
 pub mod persistence;
@@ -9,6 +10,7 @@ pub mod state_machine;
 pub mod supervisor;
 pub mod types;
 
+pub use chat_workspace::*;
 pub use dependency_graph::*;
 pub use event_log::*;
 pub use persistence::*;

@@ -272,10 +272,7 @@ fn render_activity_line(frame: &mut Frame<'_>, area: Rect, pane: Option<&AgentPa
             ),
         ])
     } else {
-        Line::from(Span::styled(
-            " \u{25CB} idle",
-            Style::default().fg(DIM),
-        ))
+        Line::from(Span::styled(" \u{25CB} idle", Style::default().fg(DIM)))
     };
     frame.render_widget(Paragraph::new(line), area);
 }
