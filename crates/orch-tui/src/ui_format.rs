@@ -39,6 +39,7 @@ pub(crate) fn pane_status_color(status: AgentPaneStatus) -> Color {
         AgentPaneStatus::Waiting => Color::Magenta,
         AgentPaneStatus::Exited => Color::DarkGray,
         AgentPaneStatus::Failed => Color::Red,
+        AgentPaneStatus::Stopped => Color::Cyan,
     }
 }
 
@@ -205,6 +206,7 @@ pub(crate) fn pane_status_tag(pane: &AgentPane) -> &'static str {
         AgentPaneStatus::Waiting => "waiting",
         AgentPaneStatus::Exited => "exited",
         AgentPaneStatus::Failed => "failed",
+        AgentPaneStatus::Stopped => "stopped",
     }
 }
 

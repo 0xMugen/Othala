@@ -79,6 +79,8 @@ pub enum AgentPaneStatus {
     Waiting,
     Exited,
     Failed,
+    /// Agent was killed because the TUI was closed.
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

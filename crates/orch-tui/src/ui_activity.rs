@@ -26,7 +26,7 @@ pub(crate) fn status_activity(status: AgentPaneStatus, frame: usize) -> Option<(
         AgentPaneStatus::Starting => Some((format!("starting {pulse}"), Color::Yellow)),
         AgentPaneStatus::Running => Some((format!("thinking {pulse}"), Color::Cyan)),
         AgentPaneStatus::Waiting => Some((format!("percolating {pulse}"), Color::Magenta)),
-        AgentPaneStatus::Exited | AgentPaneStatus::Failed => None,
+        AgentPaneStatus::Exited | AgentPaneStatus::Failed | AgentPaneStatus::Stopped => None,
     }
 }
 

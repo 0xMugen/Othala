@@ -252,10 +252,16 @@ fn run() -> Result<(), MainError> {
                 model,
                 lines,
             });
-            // Mark pane as exited so the user sees history, not "running".
+            // Tasks still Chatting were killed when TUI closed — show "stopped".
+            // Tasks that completed (Ready+) show "exited".
+            let status = if task.state == TaskState::Chatting {
+                AgentPaneStatus::Stopped
+            } else {
+                AgentPaneStatus::Exited
+            };
             app.apply_event(TuiEvent::AgentPaneStatusChanged {
                 instance_id,
-                status: AgentPaneStatus::Exited,
+                status,
             });
         }
     }
@@ -720,7 +726,7 @@ fn run() -> Result<(), MainError> {
         }
 
         // Auto-spawn agents for Chatting tasks without a running session.
-        // Skip tasks whose pane is in a terminal state (Waiting/Failed/Exited).
+        // Skip tasks whose pane is in a terminal state (Waiting/Failed/Exited/Stopped).
         if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
             for task in &chatting {
                 let pane_stopped = app.state.panes.iter().any(|pane| {
@@ -730,6 +736,7 @@ fn run() -> Result<(), MainError> {
                             AgentPaneStatus::Waiting
                                 | AgentPaneStatus::Failed
                                 | AgentPaneStatus::Exited
+                                | AgentPaneStatus::Stopped
                         )
                 });
                 if !supervisor.has_session(&task.id) && !pane_stopped {

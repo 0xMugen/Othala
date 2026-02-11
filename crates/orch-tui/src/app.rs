@@ -471,6 +471,10 @@ impl TuiApp {
                         AgentPaneStatus::Exited => {
                             self.state.status_line = format!("pane exited: {instance_id}");
                         }
+                        AgentPaneStatus::Stopped => {
+                            self.state.status_line =
+                                format!("pane stopped: {instance_id}");
+                        }
                         AgentPaneStatus::Starting
                         | AgentPaneStatus::Running
                         | AgentPaneStatus::Waiting => {}
