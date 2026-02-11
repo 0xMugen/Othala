@@ -69,6 +69,11 @@ fn active_activity_pane(app: &TuiApp) -> Option<&AgentPane> {
         .find(|pane| pane_status_active(pane.status))
 }
 
+pub(crate) fn pane_activity_indicator(pane: &AgentPane) -> Option<(String, Color)> {
+    let frame = animation_frame_now();
+    status_activity(pane.status, frame)
+}
+
 pub(crate) fn footer_activity_indicator(app: &TuiApp) -> Option<(String, Color)> {
     let pane = active_activity_pane(app)?;
     let frame = animation_frame_now();

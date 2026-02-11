@@ -50,6 +50,30 @@ pub struct PollResult {
     pub completed: Vec<AgentOutcome>,
 }
 
+/// Spawn background threads that pipe stdout and stderr lines into `tx`.
+///
+/// Consumes `tx` (the last clone goes to the stderr thread).
+fn pipe_child_output(child: &mut Child, tx: mpsc::Sender<String>) {
+    if let Some(stdout) = child.stdout.take() {
+        let tx_out = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx_out.send(line);
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+}
+
 /// Manages running agent sessions.
 pub struct AgentSupervisor {
     sessions: HashMap<String, AgentSession>,
@@ -103,32 +127,7 @@ impl AgentSupervisor {
             .spawn()?;
 
         let (tx, rx) = mpsc::channel();
-
-        // Pipe stdout in a background thread.
-        if let Some(stdout) = child.stdout.take() {
-            let tx_out = tx.clone();
-            thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = tx_out.send(line);
-                    }
-                }
-            });
-        }
-
-        // Pipe stderr in a background thread.
-        if let Some(stderr) = child.stderr.take() {
-            let tx_err = tx;
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = tx_err.send(line);
-                    }
-                }
-            });
-        }
+        pipe_child_output(&mut child, tx);
 
         let session = AgentSession {
             child,
@@ -184,32 +183,7 @@ impl AgentSupervisor {
             .spawn()?;
 
         let (out_tx, out_rx) = mpsc::channel();
-
-        // Pipe stdout in a background thread.
-        if let Some(stdout) = child.stdout.take() {
-            let tx_out = out_tx.clone();
-            thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = tx_out.send(line);
-                    }
-                }
-            });
-        }
-
-        // Pipe stderr in a background thread.
-        if let Some(stderr) = child.stderr.take() {
-            let tx_err = out_tx;
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = tx_err.send(line);
-                    }
-                }
-            });
-        }
+        pipe_child_output(&mut child, out_tx);
 
         // Create a channel + background thread for stdin writes.
         let (in_tx, in_rx) = mpsc::channel::<String>();

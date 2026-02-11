@@ -10,31 +10,65 @@ const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const OUTPUT_FG: Color = Color::White;
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Truncate a string to at most `max_chars` display characters.
+/// Appends `…` if truncated.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut truncate_at = None;
+    let mut keep_end = 0usize;
+    for (i, (idx, _)) in s.char_indices().enumerate() {
+        if i == max_chars.saturating_sub(1) {
+            keep_end = idx;
+        }
+        if i == max_chars {
+            truncate_at = Some(idx);
+            break;
+        }
+    }
+
+    if truncate_at.is_none() {
+        return s.to_string();
+    }
+
+    let mut result = String::with_capacity(keep_end + '\u{2026}'.len_utf8());
+    result.push_str(&s[..keep_end]);
+    result.push('\u{2026}');
+    result
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Convert parsed chat blocks into styled ratatui `Line` sequences for display.
 pub fn render_chat_blocks(blocks: &[ChatBlock], width: u16) -> Vec<Line<'static>> {
-    let mut output = Vec::new();
+    let inner_w = width.saturating_sub(2) as usize;
+    let mut output = Vec::with_capacity(blocks.len().saturating_mul(3));
     for (i, block) in blocks.iter().enumerate() {
         // AgentMarker handles its own spacing; others get a blank separator.
         if i > 0 && !matches!(block, ChatBlock::AgentMarker { .. }) {
             output.push(Line::from(""));
         }
         match block {
-            ChatBlock::UserMessage { lines } => render_user_message(&mut output, lines),
-            ChatBlock::Thinking { lines } => render_thinking(&mut output, lines),
-            ChatBlock::AssistantText { lines } => render_assistant_text(&mut output, lines),
+            ChatBlock::UserMessage { lines } => render_user_message(&mut output, lines, inner_w),
+            ChatBlock::Thinking { lines } => render_thinking(&mut output, lines, inner_w),
+            ChatBlock::AssistantText { lines } => {
+                render_assistant_text(&mut output, lines, inner_w)
+            }
             ChatBlock::ToolCall {
                 tool,
                 lines,
                 status,
-            } => render_tool_call(&mut output, tool, lines, *status),
+            } => render_tool_call(&mut output, tool, lines, *status, inner_w),
             ChatBlock::CodeFence { lang, lines } => {
                 render_code_fence(&mut output, lang.as_deref(), lines, width)
             }
             ChatBlock::Diff { lines } => render_diff(&mut output, lines, width),
             ChatBlock::AgentMarker { agent } => render_agent_marker(&mut output, agent, width),
-            ChatBlock::StatusSignal { line } => render_status_signal(&mut output, line),
+            ChatBlock::StatusSignal { line } => render_status_signal(&mut output, line, inner_w),
         }
     }
     output
@@ -42,7 +76,8 @@ pub fn render_chat_blocks(blocks: &[ChatBlock], width: u16) -> Vec<Line<'static>
 
 // ── User Message ────────────────────────────────────────────────────────────
 
-fn render_user_message(output: &mut Vec<Line<'static>>, lines: &[String]) {
+fn render_user_message(output: &mut Vec<Line<'static>>, lines: &[String], inner_w: usize) {
+    let budget = inner_w.saturating_sub(2); // prefix "│ " = 2 chars
     for line in lines {
         output.push(Line::from(vec![
             Span::styled(
@@ -50,7 +85,7 @@ fn render_user_message(output: &mut Vec<Line<'static>>, lines: &[String]) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                line.clone(),
+                truncate_str(line, budget),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -61,13 +96,15 @@ fn render_user_message(output: &mut Vec<Line<'static>>, lines: &[String]) {
 
 // ── Thinking (summary-first collapse) ───────────────────────────────────────
 
-fn render_thinking(output: &mut Vec<Line<'static>>, lines: &[String]) {
+fn render_thinking(output: &mut Vec<Line<'static>>, lines: &[String], inner_w: usize) {
     let summary_style = Style::default()
         .fg(Color::Magenta)
         .add_modifier(Modifier::BOLD | Modifier::ITALIC);
     let body_style = Style::default()
         .fg(Color::Magenta)
         .add_modifier(Modifier::DIM | Modifier::ITALIC);
+
+    let budget = inner_w.saturating_sub(4); // prefix "  ~ " = 4 chars
 
     let summary = lines
         .iter()
@@ -77,13 +114,13 @@ fn render_thinking(output: &mut Vec<Line<'static>>, lines: &[String]) {
 
     output.push(Line::from(vec![
         Span::styled("  ~ ", summary_style),
-        Span::styled(summary, summary_style),
+        Span::styled(truncate_str(&summary, budget), summary_style),
     ]));
 
     if lines.len() <= 5 {
         for line in lines.iter().skip(1) {
             output.push(Line::from(Span::styled(
-                format!("    {line}"),
+                truncate_str(&format!("    {line}"), inner_w),
                 body_style,
             )));
         }
@@ -127,10 +164,7 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
 
     // Blockquotes
     if let Some(rest) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![Span::styled(
-            "\u{2502} ",
-            Style::default().fg(Color::Green),
-        )];
+        let mut spans = vec![Span::styled("\u{2502} ", Style::default().fg(Color::Green))];
         spans.extend(parse_inline_markdown(
             rest,
             Style::default().fg(Color::Green),
@@ -139,7 +173,9 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
     }
 
     // Unordered lists
-    let list_rest = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "));
+    let list_rest = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "));
     if let Some(rest) = list_rest {
         let indent = line.len() - trimmed.len();
         let prefix = " ".repeat(indent);
@@ -147,10 +183,7 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
             format!("{prefix} \u{2022} "),
             Style::default().fg(ACCENT),
         )];
-        spans.extend(parse_inline_markdown(
-            rest,
-            Style::default().fg(OUTPUT_FG),
-        ));
+        spans.extend(parse_inline_markdown(rest, Style::default().fg(OUTPUT_FG)));
         return spans;
     }
 
@@ -162,10 +195,7 @@ fn markdown_line_to_spans(line: &str) -> Vec<Span<'static>> {
             format!("{prefix} {num_str}. "),
             Style::default().fg(Color::Blue),
         )];
-        spans.extend(parse_inline_markdown(
-            rest,
-            Style::default().fg(OUTPUT_FG),
-        ));
+        spans.extend(parse_inline_markdown(rest, Style::default().fg(OUTPUT_FG)));
         return spans;
     }
 
@@ -184,7 +214,11 @@ fn try_parse_ordered_list(trimmed: &str) -> Option<(String, &str)> {
 }
 
 fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
+    if !text.contains('`') && !text.contains('*') {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+
+    let mut spans = Vec::with_capacity(4);
     let mut current = String::new();
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -195,10 +229,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
         if chars[i] == '`' {
             if let Some(end) = find_closing_marker(&chars, i + 1, '`') {
                 if !current.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut current),
-                        base_style,
-                    ));
+                    spans.push(Span::styled(std::mem::take(&mut current), base_style));
                 }
                 let code: String = chars[i + 1..end].iter().collect();
                 spans.push(Span::styled(code, Style::default().fg(ACCENT)));
@@ -211,10 +242,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
         if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*' {
             if let Some(end) = find_closing_triple_star(&chars, i + 3) {
                 if !current.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut current),
-                        base_style,
-                    ));
+                    spans.push(Span::styled(std::mem::take(&mut current), base_style));
                 }
                 let content: String = chars[i + 3..end].iter().collect();
                 spans.push(Span::styled(
@@ -236,10 +264,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_closing_double_star(&chars, i + 2) {
                 if !current.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut current),
-                        base_style,
-                    ));
+                    spans.push(Span::styled(std::mem::take(&mut current), base_style));
                 }
                 let content: String = chars[i + 2..end].iter().collect();
                 spans.push(Span::styled(
@@ -260,10 +285,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
         if chars[i] == '*' {
             if let Some(end) = find_closing_single_star(&chars, i + 1) {
                 if !current.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut current),
-                        base_style,
-                    ));
+                    spans.push(Span::styled(std::mem::take(&mut current), base_style));
                 }
                 let content: String = chars[i + 1..end].iter().collect();
                 spans.push(Span::styled(
@@ -291,12 +313,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
 }
 
 fn find_closing_marker(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len()).find(|&i| chars[i] == marker)
 }
 
 fn find_closing_triple_star(chars: &[char], start: usize) -> Option<usize> {
@@ -313,8 +330,7 @@ fn find_closing_triple_star(chars: &[char], start: usize) -> Option<usize> {
 fn find_closing_double_star(chars: &[char], start: usize) -> Option<usize> {
     let mut i = start;
     while i + 1 < chars.len() {
-        if chars[i] == '*' && chars[i + 1] == '*' && (i + 2 >= chars.len() || chars[i + 2] != '*')
-        {
+        if chars[i] == '*' && chars[i + 1] == '*' && (i + 2 >= chars.len() || chars[i + 2] != '*') {
             return Some(i);
         }
         i += 1;
@@ -323,22 +339,18 @@ fn find_closing_double_star(chars: &[char], start: usize) -> Option<usize> {
 }
 
 fn find_closing_single_star(chars: &[char], start: usize) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == '*' && (i + 1 >= chars.len() || chars[i + 1] != '*') {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len()).find(|&i| chars[i] == '*' && (i + 1 >= chars.len() || chars[i + 1] != '*'))
 }
 
 // ── Assistant Text (markdown-aware) ─────────────────────────────────────────
 
-fn render_assistant_text(output: &mut Vec<Line<'static>>, lines: &[String]) {
+fn render_assistant_text(output: &mut Vec<Line<'static>>, lines: &[String], inner_w: usize) {
     for line in lines {
         if line.trim().is_empty() {
             output.push(Line::from(""));
         } else {
-            output.push(Line::from(markdown_line_to_spans(line)));
+            let truncated = truncate_str(line, inner_w);
+            output.push(Line::from(markdown_line_to_spans(&truncated)));
         }
     }
 }
@@ -350,12 +362,16 @@ fn render_tool_call(
     tool: &str,
     lines: &[String],
     status: ToolStatus,
+    inner_w: usize,
 ) {
     let (indicator, indicator_color) = match status {
         ToolStatus::Succeeded => ("\u{25CF}", Color::Green),
         ToolStatus::Failed => ("\u{25CF}", Color::Red),
         ToolStatus::Running => ("\u{25CF}", Color::Yellow),
     };
+
+    let prefix_len = 3; // " ● " / " │ " / " └ "
+    let budget = inner_w.saturating_sub(prefix_len);
 
     // Extract command label from first non-empty line
     let command_label = lines
@@ -370,45 +386,40 @@ fn render_tool_call(
             Style::default().fg(indicator_color),
         ),
         Span::styled(
-            command_label,
+            truncate_str(&command_label, budget),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
 
-    // Body lines (skip the command line already shown as header)
-    let body_lines: Vec<&String> = if lines.is_empty() {
-        vec![]
-    } else {
-        lines.iter().skip(1).collect()
-    };
+    let body_len = lines.len().saturating_sub(1);
 
-    let max_visible = 8;
-    let head_count = 3;
-    let tail_count = 2;
+    // Detect if body contains edit/diff content → show more lines with red/green
+    let has_diff = lines.iter().skip(1).any(|l| is_tool_diff_line(l));
+    let (max_visible, head_count, tail_count) = if has_diff { (12, 5, 3) } else { (4, 2, 1) };
 
-    if body_lines.len() <= max_visible {
-        for (i, line) in body_lines.iter().enumerate() {
-            let prefix = if i == body_lines.len() - 1 {
+    if body_len <= max_visible {
+        for (i, line) in lines.iter().skip(1).enumerate() {
+            let prefix = if i + 1 == body_len {
                 " \u{2514} "
             } else {
                 " \u{2502} "
             };
             output.push(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(DIM)),
-                Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                Span::styled(truncate_str(line, budget), tool_line_style(line, has_diff)),
             ]));
         }
     } else {
         // Middle-truncation: first head_count + ellipsis + last tail_count
-        for line in body_lines.iter().take(head_count) {
+        for line in lines.iter().skip(1).take(head_count) {
             output.push(Line::from(vec![
                 Span::styled(" \u{2502} ", Style::default().fg(DIM)),
-                Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                Span::styled(truncate_str(line, budget), tool_line_style(line, has_diff)),
             ]));
         }
-        let hidden = body_lines.len() - head_count - tail_count;
+        let hidden = body_len - head_count - tail_count;
         output.push(Line::from(vec![
             Span::styled(" \u{2502} ", Style::default().fg(DIM)),
             Span::styled(
@@ -416,20 +427,35 @@ fn render_tool_call(
                 Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
             ),
         ]));
-        let tail: Vec<&&String> = body_lines.iter().rev().take(tail_count).collect();
-        for (i, line) in tail.iter().rev().enumerate() {
-            let is_last = i == tail_count - 1;
-            let prefix = if is_last {
-                " \u{2514} "
-            } else {
-                " \u{2502} "
-            };
+        let tail_start = lines.len().saturating_sub(tail_count);
+        for (i, line) in lines.iter().skip(tail_start).enumerate() {
+            let is_last = i + 1 == tail_count;
+            let prefix = if is_last { " \u{2514} " } else { " \u{2502} " };
             output.push(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(DIM)),
-                Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                Span::styled(truncate_str(line, budget), tool_line_style(line, has_diff)),
             ]));
         }
     }
+}
+
+/// Detect diff-like lines inside tool output (additions/deletions).
+fn is_tool_diff_line(line: &str) -> bool {
+    (line.starts_with('+') && !line.starts_with("+++"))
+        || (line.starts_with('-') && !line.starts_with("---"))
+}
+
+/// Style a tool body line: red/green for diff content, gray otherwise.
+fn tool_line_style(line: &str, has_diff: bool) -> Style {
+    if has_diff {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            return Style::default().fg(Color::Green);
+        }
+        if line.starts_with('-') && !line.starts_with("---") {
+            return Style::default().fg(Color::Red);
+        }
+    }
+    Style::default().fg(Color::Gray)
 }
 
 // ── Code Fence (with line numbers) ──────────────────────────────────────────
@@ -440,7 +466,8 @@ fn render_code_fence(
     lines: &[String],
     width: u16,
 ) {
-    let border_len = width.saturating_sub(4).max(8) as usize;
+    let inner_w = width.saturating_sub(2) as usize;
+    let border_len = inner_w.saturating_sub(2).max(8);
 
     // Top border with optional language label
     let top = if let Some(lang) = lang {
@@ -461,13 +488,18 @@ fn render_code_fence(
     output.push(top);
 
     let gutter_w = line_number_width(lines.len());
+    let gutter_prefix_len = gutter_w + 4; // " N │ "
+    let content_budget = inner_w.saturating_sub(gutter_prefix_len);
     for (i, line) in lines.iter().enumerate() {
         output.push(Line::from(vec![
             Span::styled(
                 format!(" {:>w$} \u{2502} ", i + 1, w = gutter_w),
                 Style::default().fg(DIM),
             ),
-            Span::styled(line.clone(), Style::default().fg(Color::Gray)),
+            Span::styled(
+                truncate_str(line, content_budget),
+                Style::default().fg(Color::Gray),
+            ),
         ]));
     }
 
@@ -482,30 +514,37 @@ fn line_number_width(count: usize) -> usize {
     if count == 0 {
         1
     } else {
-        (count as f64).log10().floor() as usize + 1
+        count.ilog10() as usize + 1
     }
 }
 
 // ── Diff (file headers + gutter) ────────────────────────────────────────────
 
 fn render_diff(output: &mut Vec<Line<'static>>, lines: &[String], width: u16) {
+    let inner_w = width.saturating_sub(2) as usize;
     let file_path = extract_diff_file_path(lines);
     let (additions, deletions) = count_diff_stats(lines);
 
     if let Some(path) = &file_path {
-        let border_len = width.saturating_sub(4).max(8) as usize;
+        let border_len = inner_w.saturating_sub(2).max(8);
         output.push(Line::from(vec![
             Span::styled(
                 format!("  {path}"),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  +{additions} -{deletions}"), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  +{additions} -{deletions}"),
+                Style::default().fg(DIM),
+            ),
         ]));
         output.push(Line::from(Span::styled(
             format!("  {}", "\u{2500}".repeat(border_len.saturating_sub(2))),
             Style::default().fg(DIM),
         )));
     }
+
+    let gutter_len = 11; // "NNNN NNNN │"
+    let content_budget = inner_w.saturating_sub(gutter_len);
 
     let mut line_num_old: usize = 0;
     let mut line_num_new: usize = 0;
@@ -535,7 +574,7 @@ fn render_diff(output: &mut Vec<Line<'static>>, lines: &[String], width: u16) {
         // Patch markers pass through with their own styling
         if is_patch_marker(line) {
             output.push(Line::from(Span::styled(
-                line.clone(),
+                truncate_str(line, inner_w),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )));
             continue;
@@ -547,10 +586,10 @@ fn render_diff(output: &mut Vec<Line<'static>>, lines: &[String], width: u16) {
             let gutter = format_diff_gutter(line, &mut line_num_old, &mut line_num_new);
             output.push(Line::from(vec![
                 Span::styled(gutter, Style::default().fg(DIM)),
-                Span::styled(line.clone(), style),
+                Span::styled(truncate_str(line, content_budget), style),
             ]));
         } else {
-            output.push(Line::from(Span::styled(line.clone(), style)));
+            output.push(Line::from(Span::styled(truncate_str(line, inner_w), style)));
         }
     }
 }
@@ -603,10 +642,15 @@ fn is_patch_marker(line: &str) -> bool {
 }
 
 fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let old_start = parts.get(1)?.strip_prefix('-')?.split(',').next()?.parse().ok()?;
-    let new_start = parts.get(2)?.strip_prefix('+')?.split(',').next()?.parse().ok()?;
+    let mut parts = line.split_whitespace();
+    let _marker = parts.next()?;
+    let old_start = parse_hunk_range_start(parts.next()?, '-')?;
+    let new_start = parse_hunk_range_start(parts.next()?, '+')?;
     Some((old_start, new_start))
+}
+
+fn parse_hunk_range_start(range: &str, prefix: char) -> Option<usize> {
+    range.strip_prefix(prefix)?.split(',').next()?.parse().ok()
 }
 
 fn format_diff_gutter(line: &str, old: &mut usize, new: &mut usize) -> String {
@@ -660,7 +704,7 @@ fn render_agent_marker(output: &mut Vec<Line<'static>>, agent: &str, width: u16)
 
 // ── Status Signal ───────────────────────────────────────────────────────────
 
-fn render_status_signal(output: &mut Vec<Line<'static>>, line: &str) {
+fn render_status_signal(output: &mut Vec<Line<'static>>, line: &str, inner_w: usize) {
     let lower = line.to_ascii_lowercase();
     let color = if lower.contains("[needs_human]") {
         Color::Yellow
@@ -672,7 +716,7 @@ fn render_status_signal(output: &mut Vec<Line<'static>>, line: &str) {
         Color::Yellow
     };
     output.push(Line::from(Span::styled(
-        line.to_string(),
+        truncate_str(line, inner_w),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
 }
@@ -881,8 +925,8 @@ mod tests {
         let rendered = render_chat_blocks(&blocks, 80);
         let text = spans_text(&rendered);
         assert!(text.iter().any(|t| t.contains("... +")));
-        // Total: header(1) + head(3) + ellipsis(1) + tail(2) = 7
-        assert_eq!(rendered.len(), 7);
+        // Non-diff: header(1) + head(2) + ellipsis(1) + tail(1) = 5
+        assert_eq!(rendered.len(), 5);
     }
 
     #[test]
@@ -1091,6 +1135,50 @@ mod tests {
         assert_eq!(rendered[0].spans[0].style.fg, Some(Color::Red));
     }
 
+    // ── Truncation ──
+
+    #[test]
+    fn truncate_str_preserves_short_strings() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_truncates_long_strings() {
+        let result = truncate_str("hello world", 8);
+        assert_eq!(result.chars().count(), 8);
+        assert!(result.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_respects_unicode_boundaries() {
+        let result = truncate_str("🙂🙂🙂", 2);
+        assert_eq!(result, "🙂\u{2026}");
+        assert_eq!(result.chars().count(), 2);
+    }
+
+    #[test]
+    fn truncate_str_single_char_budget_uses_ellipsis() {
+        assert_eq!(truncate_str("ab", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn long_line_truncated_in_code_fence() {
+        let long_line = "x".repeat(200);
+        let blocks = vec![ChatBlock::CodeFence {
+            lang: None,
+            lines: vec![long_line],
+        }];
+        let rendered = render_chat_blocks(&blocks, 40);
+        // Content line (index 1) should not exceed inner width (38)
+        let content_text: String = rendered[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(content_text.chars().count() <= 38);
+    }
+
     // ── Markdown inline parsing ──
 
     #[test]
@@ -1130,5 +1218,87 @@ mod tests {
     fn markdown_empty_line() {
         let spans = parse_inline_markdown("", Style::default().fg(OUTPUT_FG));
         assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn markdown_plain_line_stays_single_span() {
+        let spans = parse_inline_markdown("plain line", Style::default().fg(OUTPUT_FG));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "plain line");
+    }
+
+    #[test]
+    fn line_number_width_uses_decimal_digits() {
+        assert_eq!(line_number_width(0), 1);
+        assert_eq!(line_number_width(9), 1);
+        assert_eq!(line_number_width(10), 2);
+        assert_eq!(line_number_width(9_999), 4);
+    }
+
+    #[test]
+    fn parse_hunk_header_handles_single_line_ranges() {
+        assert_eq!(parse_hunk_header("@@ -12 +34 @@"), Some((12, 34)));
+    }
+
+    // ── Tool call diff detection ──
+
+    #[test]
+    fn tool_call_with_diff_content_uses_red_green() {
+        let blocks = vec![ChatBlock::ToolCall {
+            tool: "exec".to_string(),
+            lines: vec![
+                "edit src/main.rs".to_string(),
+                " context line".to_string(),
+                "+added line".to_string(),
+                "-removed line".to_string(),
+            ],
+            status: ToolStatus::Succeeded,
+        }];
+        let rendered = render_chat_blocks(&blocks, 80);
+        // Find the green span (+added)
+        let green_span = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("+added"));
+        assert_eq!(green_span.unwrap().style.fg, Some(Color::Green));
+        // Find the red span (-removed)
+        let red_span = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("-removed"));
+        assert_eq!(red_span.unwrap().style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn tool_call_with_diff_content_allows_more_lines() {
+        let mut lines = vec!["edit command".to_string()];
+        for i in 0..10 {
+            lines.push(format!("+added line {i}"));
+        }
+        let blocks = vec![ChatBlock::ToolCall {
+            tool: "exec".to_string(),
+            lines,
+            status: ToolStatus::Running,
+        }];
+        let rendered = render_chat_blocks(&blocks, 80);
+        // 10 body lines <= 12 max_visible for diff, so all shown
+        // header(1) + 10 body = 11
+        assert_eq!(rendered.len(), 11);
+    }
+
+    #[test]
+    fn tool_call_non_diff_truncates_aggressively() {
+        let mut lines = vec!["ls -la".to_string()];
+        for i in 0..10 {
+            lines.push(format!("file_{i}.txt"));
+        }
+        let blocks = vec![ChatBlock::ToolCall {
+            tool: "exec".to_string(),
+            lines,
+            status: ToolStatus::Succeeded,
+        }];
+        let rendered = render_chat_blocks(&blocks, 80);
+        // Non-diff: header(1) + head(2) + ellipsis(1) + tail(1) = 5
+        assert_eq!(rendered.len(), 5);
     }
 }

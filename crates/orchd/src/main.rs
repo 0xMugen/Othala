@@ -61,6 +61,23 @@ enum ChatAction {
     List,
 }
 
+fn print_task_list(tasks: &[Task]) {
+    if tasks.is_empty() {
+        println!("No chats found.");
+    } else {
+        println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
+        println!("{}", "-".repeat(70));
+        for task in tasks {
+            println!(
+                "{:<20} {:<10} {:<40}",
+                task.id.0,
+                format!("{:?}", task.state),
+                task.title
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -119,39 +136,11 @@ fn main() -> anyhow::Result<()> {
                 println!("Created chat: {} - {}", task_id, title);
             }
             ChatAction::List => {
-                let tasks = service.list_tasks()?;
-                if tasks.is_empty() {
-                    println!("No chats found.");
-                } else {
-                    println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
-                    println!("{}", "-".repeat(70));
-                    for task in tasks {
-                        println!(
-                            "{:<20} {:<10} {:<40}",
-                            task.id.0,
-                            format!("{:?}", task.state),
-                            task.title
-                        );
-                    }
-                }
+                print_task_list(&service.list_tasks()?);
             }
         },
         Commands::List => {
-            let tasks = service.list_tasks()?;
-            if tasks.is_empty() {
-                println!("No chats found.");
-            } else {
-                println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
-                println!("{}", "-".repeat(70));
-                for task in tasks {
-                    println!(
-                        "{:<20} {:<10} {:<40}",
-                        task.id.0,
-                        format!("{:?}", task.state),
-                        task.title
-                    );
-                }
-            }
+            print_task_list(&service.list_tasks()?);
         }
         Commands::Status { id } => {
             let task_id = TaskId::new(&id);

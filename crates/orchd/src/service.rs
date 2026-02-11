@@ -343,7 +343,7 @@ impl OrchdService {
                 run_id: format!(
                     "RUN-{}-{}-{tick_nonce}",
                     assignment.task_id.0,
-                    model_slug(assignment.model)
+                    assignment.model.as_str()
                 ),
                 task_id: assignment.task_id.clone(),
                 repo_id: assignment.repo_id.clone(),
@@ -360,14 +360,6 @@ impl OrchdService {
             scheduled: plan.assignments,
             blocked: plan.blocked,
         })
-    }
-}
-
-fn model_slug(model: orch_core::types::ModelKind) -> &'static str {
-    match model {
-        orch_core::types::ModelKind::Claude => "claude",
-        orch_core::types::ModelKind::Codex => "codex",
-        orch_core::types::ModelKind::Gemini => "gemini",
     }
 }
 

@@ -346,7 +346,7 @@ fn run() -> Result<(), MainError> {
 
         // Refresh task list periodically (every ~2s at 250ms tick).
         tick_counter = tick_counter.wrapping_add(1);
-        if tick_counter % 8 == 0 {
+        if tick_counter.is_multiple_of(8) {
             if let Ok(tasks) = service.list_tasks() {
                 app.apply_event(TuiEvent::TasksReplaced { tasks });
             }

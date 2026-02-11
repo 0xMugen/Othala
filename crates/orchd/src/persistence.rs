@@ -250,7 +250,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             params![
                 run.run_id,
                 run.task_id.0,
-                model_tag(run.model),
+                run.model.as_str(),
                 run.started_at.to_rfc3339(),
                 run.finished_at.map(|value| value.to_rfc3339()),
                 run.stop_reason,
@@ -350,14 +350,6 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::SubmitCompleted => "submit_completed",
         EventKind::NeedsHuman { .. } => "needs_human",
         EventKind::Error { .. } => "error",
-    }
-}
-
-fn model_tag(model: orch_core::types::ModelKind) -> &'static str {
-    match model {
-        orch_core::types::ModelKind::Claude => "claude",
-        orch_core::types::ModelKind::Codex => "codex",
-        orch_core::types::ModelKind::Gemini => "gemini",
     }
 }
 

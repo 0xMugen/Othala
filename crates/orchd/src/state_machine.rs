@@ -73,15 +73,16 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
 }
 
 /// Get a string tag for a task state (for event logging).
+///
+/// Delegates to `TaskState::Display`. Kept for backward compatibility.
 pub fn task_state_tag(state: TaskState) -> &'static str {
-    use TaskState::*;
     match state {
-        Chatting => "CHATTING",
-        Ready => "READY",
-        Submitting => "SUBMITTING",
-        Restacking => "RESTACKING",
-        AwaitingMerge => "AWAITING_MERGE",
-        Merged => "MERGED",
+        TaskState::Chatting => "CHATTING",
+        TaskState::Ready => "READY",
+        TaskState::Submitting => "SUBMITTING",
+        TaskState::Restacking => "RESTACKING",
+        TaskState::AwaitingMerge => "AWAITING_MERGE",
+        TaskState::Merged => "MERGED",
     }
 }
 

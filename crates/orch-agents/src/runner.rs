@@ -187,17 +187,17 @@ fn drain_output(
     stop_reason: &mut Option<EpochStopReason>,
 ) {
     while let Ok(line) = rx.try_recv() {
-        output.push(PtyChunk {
-            at: Utc::now(),
-            text: line.clone(),
-        });
-
         if let Some(signal) = adapter.detect_signal(&line) {
             if stop_reason.is_none() {
                 *stop_reason = signal_to_stop_reason(signal.kind);
             }
             signals.push(signal);
         }
+
+        output.push(PtyChunk {
+            at: Utc::now(),
+            text: line,
+        });
     }
 }
 
@@ -238,10 +238,7 @@ fn render_shell_invocation(
     rendered
 }
 
-fn shell_quote(value: &str) -> String {
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
-}
+use crate::util::shell_quote;
 
 #[cfg(test)]
 mod tests {
@@ -253,7 +250,8 @@ mod tests {
     use crate::error::AgentError;
     use crate::types::{AgentCommand, AgentSignalKind, EpochRequest, EpochStopReason};
 
-    use super::{render_shell_invocation, shell_quote, signal_to_stop_reason, EpochRunner};
+    use super::{render_shell_invocation, signal_to_stop_reason, EpochRunner};
+    use crate::util::shell_quote;
 
     fn mk_request() -> EpochRequest {
         EpochRequest {

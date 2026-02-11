@@ -532,11 +532,13 @@ mod tests {
 
     #[test]
     fn pane_window_with_history_keeps_live_tail_clean_until_scroll() {
-        let mut state = DashboardState::default();
-        state.panes = vec![
-            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
-            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1", "new 2"]),
-        ];
+        let state = DashboardState {
+            panes: vec![
+                pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+                pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1", "new 2"]),
+            ],
+            ..DashboardState::default()
+        };
 
         let window = state.pane_window_with_history(1, 20, 0);
         assert_eq!(window, vec!["new 1".to_string(), "new 2".to_string()]);
@@ -544,11 +546,13 @@ mod tests {
 
     #[test]
     fn pane_window_with_history_reveals_previous_chat_on_scroll_up() {
-        let mut state = DashboardState::default();
-        state.panes = vec![
-            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
-            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
-        ];
+        let state = DashboardState {
+            panes: vec![
+                pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+                pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
+            ],
+            ..DashboardState::default()
+        };
 
         let window = state.pane_window_with_history(1, 20, 1);
         assert!(window
@@ -560,12 +564,14 @@ mod tests {
 
     #[test]
     fn focused_scroll_budget_includes_previous_chat_history() {
-        let mut state = DashboardState::default();
-        state.panes = vec![
-            pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
-            pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
-        ];
-        state.focused_pane_idx = Some(1);
+        let mut state = DashboardState {
+            panes: vec![
+                pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
+                pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
+            ],
+            focused_pane_idx: Some(1),
+            ..DashboardState::default()
+        };
 
         state.scroll_up(50);
         assert!(state.scroll_back > state.panes[1].lines.len());

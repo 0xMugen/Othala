@@ -4,6 +4,7 @@ pub mod runner;
 pub mod setup;
 pub mod signal;
 pub mod types;
+pub(crate) mod util;
 
 pub use adapter::*;
 pub use error::*;

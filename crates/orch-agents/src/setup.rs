@@ -307,10 +307,7 @@ fn default_executable_for_model(model: ModelKind) -> &'static str {
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
-}
+use crate::util::shell_quote;
 
 #[cfg(test)]
 mod tests {

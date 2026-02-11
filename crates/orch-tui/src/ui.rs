@@ -7,7 +7,9 @@ use ratatui::Frame;
 use crate::app::TuiApp;
 use crate::chat_parse;
 use crate::chat_render;
+use crate::model::AgentPane;
 use crate::output_style::stylize_output_lines;
+use crate::ui_activity::pane_activity_indicator;
 #[cfg(test)]
 use crate::ui_activity::status_activity;
 #[cfg(test)]
@@ -234,6 +236,50 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(output, panes[1]);
 }
 
+// -- Chat input box (inline in focused views) -------------------------------
+
+fn render_chat_input_box(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if let Some((buffer, task_id)) = app.chat_input_display() {
+        let title = format!("Chat \u{2192} {} (Enter=send Esc=cancel)", task_id.0);
+        let line = Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(ACCENT)),
+        ]);
+        let widget = Paragraph::new(line)
+            .block(focused_block(&title))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, area);
+    } else {
+        let line = Line::from(Span::styled(
+            " i: send message  c: new chat",
+            Style::default().fg(DIM),
+        ));
+        let widget = Paragraph::new(line)
+            .block(normal_block("Chat"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, area);
+    }
+}
+
+fn render_activity_line(frame: &mut Frame<'_>, area: Rect, pane: Option<&AgentPane>) {
+    let line = if let Some((activity, color)) = pane.and_then(pane_activity_indicator) {
+        Line::from(vec![
+            Span::styled(" \u{25CF} ", Style::default().fg(color)),
+            Span::styled(
+                activity,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " \u{25CB} idle",
+            Style::default().fg(DIM),
+        ))
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 // -- Focused views ----------------------------------------------------------
 
 fn extend_rendered_chat(lines: &mut Vec<Line<'static>>, window: &[String], width: u16) {
@@ -249,15 +295,27 @@ fn extend_rendered_chat(lines: &mut Vec<Line<'static>>, window: &[String], width
 }
 
 fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let chat_area = chunks[0];
+    let activity_area = chunks[1];
+    let input_area = chunks[2];
+
     let pane_idx = app.state.focused_pane_idx;
     let pane = pane_idx.and_then(|idx| app.state.panes.get(idx));
 
-    let viewport_height = area.height.saturating_sub(2) as usize;
+    let viewport_height = chat_area.height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
 
     let (title, lines) = if let Some(pane) = pane {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
-        lines.push(divider_line(area.width));
+        lines.push(divider_line(chat_area.width));
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = pane_idx
             .map(|idx| {
@@ -265,7 +323,7 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .pane_window_with_history(idx, output_cap, scroll_back)
             })
             .unwrap_or_default();
-        extend_rendered_chat(&mut lines, &window, area.width);
+        extend_rendered_chat(&mut lines, &window, chat_area.width);
         (format!("Focused Chat {}", pane.instance_id), lines)
     } else {
         (
@@ -277,7 +335,10 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let widget = Paragraph::new(lines)
         .block(focused_block(&title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(widget, area);
+    frame.render_widget(widget, chat_area);
+
+    render_activity_line(frame, activity_area, pane);
+    render_chat_input_box(frame, input_area, app);
 }
 
 fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -300,7 +361,20 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    let viewport_height = cols[1].height.saturating_sub(2) as usize;
+    // Split right column: chat content, activity indicator, input box
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(cols[1]);
+    let chat_area = right_chunks[0];
+    let activity_area = right_chunks[1];
+    let input_area = right_chunks[2];
+
+    let viewport_height = chat_area.height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
 
     // Left: task status checklist
@@ -316,7 +390,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // Right: agent PTY output
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
-        lines.push(divider_line(cols[1].width));
+        lines.push(divider_line(chat_area.width));
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = task_pane_idx
             .map(|idx| {
@@ -324,7 +398,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .pane_window_with_history(idx, output_cap, scroll_back)
             })
             .unwrap_or_default();
-        extend_rendered_chat(&mut lines, &window, cols[1].width);
+        extend_rendered_chat(&mut lines, &window, chat_area.width);
         (format!("Agent {}", pane.instance_id), lines)
     } else {
         (
@@ -341,7 +415,10 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .border_style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(pty_widget, cols[1]);
+    frame.render_widget(pty_widget, chat_area);
+
+    render_activity_line(frame, activity_area, task_pane);
+    render_chat_input_box(frame, input_area, app);
 }
 
 // -- Footer -----------------------------------------------------------------

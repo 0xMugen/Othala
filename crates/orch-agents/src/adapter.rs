@@ -277,7 +277,7 @@ mod tests {
         );
         // Gemini places prompt right after -p (as its value), not at the end.
         assert!(
-            gemini.args[1] == "",
+            gemini.args[1].is_empty(),
             "gemini must place prompt right after -p even when empty"
         );
     }

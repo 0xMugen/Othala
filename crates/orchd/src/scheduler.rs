@@ -121,7 +121,10 @@ impl Scheduler {
             *model_counts.entry(running.model).or_insert(0) += 1;
         }
 
-        let available_models = available_model_set(&input.enabled_models, &input.availability);
+        let available_models = available_models_in_priority_order(
+            &input.enabled_models,
+            &input.availability,
+        );
         let mut assignments = Vec::new();
         let mut blocked = Vec::new();
 
@@ -135,35 +138,26 @@ impl Scheduler {
                 continue;
             }
 
-            // For MVP, just use preferred model or first available
-            let model = queued
-                .preferred_model
-                .filter(|m| available_models.contains(m))
-                .or_else(|| available_models.iter().copied().next());
-
-            let Some(model) = model else {
+            if available_models.is_empty() {
                 blocked.push(BlockedTask {
                     task_id: queued.task_id,
                     reason: BlockReason::NoAvailableModel,
                 });
                 continue;
-            };
+            }
 
-            let current = model_counts.get(&model).copied().unwrap_or(0);
-            let limit = self
-                .config
-                .per_model_limit
-                .get(&model)
-                .copied()
-                .unwrap_or(usize::MAX);
-
-            if current >= limit {
+            let Some(model) = select_model_with_capacity(
+                queued.preferred_model,
+                &available_models,
+                &model_counts,
+                &self.config.per_model_limit,
+            ) else {
                 blocked.push(BlockedTask {
                     task_id: queued.task_id,
                     reason: BlockReason::ModelLimitReached,
                 });
                 continue;
-            }
+            };
 
             *repo_counts.entry(queued.repo_id.clone()).or_insert(0) += 1;
             *model_counts.entry(model).or_insert(0) += 1;
@@ -181,20 +175,52 @@ impl Scheduler {
     }
 }
 
-fn available_model_set(
+fn available_models_in_priority_order(
     enabled_models: &[ModelKind],
     availability: &[ModelAvailability],
-) -> HashSet<ModelKind> {
-    let enabled: HashSet<ModelKind> = enabled_models.iter().copied().collect();
+) -> Vec<ModelKind> {
     let mut explicit_availability = HashMap::new();
     for status in availability {
         explicit_availability.insert(status.model, status.available);
     }
 
-    enabled
+    let mut seen = HashSet::new();
+    enabled_models
         .into_iter()
+        .copied()
+        .filter(|model| seen.insert(*model))
         .filter(|model| explicit_availability.get(model).copied().unwrap_or(true))
         .collect()
+}
+
+fn select_model_with_capacity(
+    preferred_model: Option<ModelKind>,
+    available_models: &[ModelKind],
+    model_counts: &HashMap<ModelKind, usize>,
+    per_model_limit: &HashMap<ModelKind, usize>,
+) -> Option<ModelKind> {
+    let preferred = preferred_model.filter(|model| available_models.contains(model));
+    if let Some(model) = preferred {
+        if model_has_capacity(model, model_counts, per_model_limit) {
+            return Some(model);
+        }
+    }
+
+    available_models
+        .iter()
+        .copied()
+        .filter(|model| Some(*model) != preferred)
+        .find(|model| model_has_capacity(*model, model_counts, per_model_limit))
+}
+
+fn model_has_capacity(
+    model: ModelKind,
+    model_counts: &HashMap<ModelKind, usize>,
+    per_model_limit: &HashMap<ModelKind, usize>,
+) -> bool {
+    let current = model_counts.get(&model).copied().unwrap_or(0);
+    let limit = per_model_limit.get(&model).copied().unwrap_or(usize::MAX);
+    current < limit
 }
 
 #[cfg(test)]
@@ -293,5 +319,46 @@ mod tests {
         assert!(plan.assignments.is_empty());
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].reason, BlockReason::NoAvailableModel);
+    }
+
+    #[test]
+    fn plan_falls_back_when_preferred_model_is_saturated() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 1), (ModelKind::Codex, 2)]);
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![mk_queued("T2", "repo-b", 1, Some(ModelKind::Claude))],
+            running: vec![RunningTask {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("repo-a".to_string()),
+                model: ModelKind::Claude,
+            }],
+            enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Codex);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_uses_enabled_model_order_for_default_selection() {
+        let scheduler = mk_scheduler(
+            10,
+            &[
+                (ModelKind::Claude, 10),
+                (ModelKind::Codex, 10),
+                (ModelKind::Gemini, 10),
+            ],
+        );
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![mk_queued("T1", "repo", 1, None)],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Gemini, ModelKind::Codex, ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].model, ModelKind::Gemini);
+        assert!(plan.blocked.is_empty());
     }
 }

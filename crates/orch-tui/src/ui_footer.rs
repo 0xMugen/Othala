@@ -21,6 +21,11 @@ pub(crate) struct FooterContent {
 }
 
 pub(crate) fn footer_height(app: &TuiApp, width: u16) -> u16 {
+    // When in focused view with ChatInput, the inline box handles display
+    let in_focused = app.state.focused_task || app.state.focused_pane_idx.is_some();
+    if in_focused && app.chat_input_display().is_some() {
+        return FOOTER_DEFAULT_HEIGHT;
+    }
     let Some(prompt) = app.input_prompt() else {
         return FOOTER_DEFAULT_HEIGHT;
     };
@@ -98,35 +103,41 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
         };
     }
 
-    if let Some(prompt) = app.input_prompt() {
-        let mut lines = vec![Line::from(Span::styled(
-            " prompt:",
-            Style::default().fg(DIM),
-        ))];
-        let prompt_lines: Vec<String> = prompt.split('\n').map(|line| line.to_string()).collect();
-        for (idx, prompt_line) in prompt_lines.iter().enumerate() {
-            let mut spans = vec![
-                Span::styled(" ", Style::default().fg(DIM)),
-                Span::styled(prompt_line.clone(), Style::default().fg(HEADER_FG)),
-            ];
-            if idx + 1 == prompt_lines.len() {
-                spans.push(Span::styled("_", Style::default().fg(ACCENT)));
+    // Skip inline prompt when focused view handles ChatInput display
+    let in_focused = app.state.focused_task || app.state.focused_pane_idx.is_some();
+    let chat_input_handled_inline = in_focused && app.chat_input_display().is_some();
+    if !chat_input_handled_inline {
+        if let Some(prompt) = app.input_prompt() {
+            let mut lines = vec![Line::from(Span::styled(
+                " prompt:",
+                Style::default().fg(DIM),
+            ))];
+            let prompt_lines: Vec<String> =
+                prompt.split('\n').map(|line| line.to_string()).collect();
+            for (idx, prompt_line) in prompt_lines.iter().enumerate() {
+                let mut spans = vec![
+                    Span::styled(" ", Style::default().fg(DIM)),
+                    Span::styled(prompt_line.clone(), Style::default().fg(HEADER_FG)),
+                ];
+                if idx + 1 == prompt_lines.len() {
+                    spans.push(Span::styled("_", Style::default().fg(ACCENT)));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
+            lines.push(Line::from(Span::styled(
+                " Enter=submit Esc=cancel (multiline paste supported)",
+                Style::default().fg(DIM),
+            )));
+            return FooterContent {
+                title: if app.chat_input_display().is_some() {
+                    "Chat Input"
+                } else {
+                    "New Chat"
+                },
+                lines,
+                wrap_trim: false,
+            };
         }
-        lines.push(Line::from(Span::styled(
-            " Enter=submit Esc=cancel (multiline paste supported)",
-            Style::default().fg(DIM),
-        )));
-        return FooterContent {
-            title: if app.chat_input_display().is_some() {
-                "Chat Input"
-            } else {
-                "New Chat"
-            },
-            lines,
-            wrap_trim: false,
-        };
     }
 
     let mut spans: Vec<Span<'static>> = Vec::new();
