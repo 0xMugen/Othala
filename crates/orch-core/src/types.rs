@@ -88,6 +88,21 @@ pub enum SubmitMode {
     Stack,
 }
 
+/// The type of work a task performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    /// Standard code implementation.
+    #[default]
+    Implement,
+    /// Write a test specification before implementation.
+    TestSpecWrite,
+    /// Validate code against a test specification.
+    TestValidate,
+    /// High-level orchestration / task decomposition.
+    Orchestrate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PullRequestRef {
     pub number: u64,
@@ -124,6 +139,34 @@ pub struct Task {
     pub verify_status: VerifyStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+
+    // --- Orchestrator extensions (all serde(default) for backward compat) ---
+
+    /// Current retry attempt (0 = first try).
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Maximum retries before giving up.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Models that have already failed on this task.
+    #[serde(default)]
+    pub failed_models: Vec<ModelKind>,
+    /// Why the last attempt failed.
+    #[serde(default)]
+    pub last_failure_reason: Option<String>,
+    /// The kind of work this task performs.
+    #[serde(default)]
+    pub task_type: TaskType,
+    /// Path to the test spec file for this task.
+    #[serde(default)]
+    pub test_spec_path: Option<PathBuf>,
+    /// Parent task ID (for decomposed sub-tasks).
+    #[serde(default)]
+    pub parent_task_id: Option<TaskId>,
+}
+
+fn default_max_retries() -> u32 {
+    3
 }
 
 impl Task {
@@ -144,6 +187,13 @@ impl Task {
             verify_status: VerifyStatus::NotRun,
             created_at: now,
             updated_at: now,
+            retry_count: 0,
+            max_retries: default_max_retries(),
+            failed_models: Vec::new(),
+            last_failure_reason: None,
+            task_type: TaskType::default(),
+            test_spec_path: None,
+            parent_task_id: None,
         }
     }
 

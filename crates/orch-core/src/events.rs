@@ -35,6 +35,26 @@ pub enum EventKind {
     NeedsHuman { reason: String },
     /// Error occurred
     Error { code: String, message: String },
+    /// A retry was scheduled after a failure.
+    RetryScheduled {
+        attempt: u32,
+        model: String,
+        reason: String,
+    },
+    /// Task failed (final or non-final).
+    TaskFailed {
+        reason: String,
+        is_final: bool,
+    },
+    /// Test spec was validated.
+    TestSpecValidated {
+        passed: bool,
+        details: String,
+    },
+    /// Orchestrator decomposed a task into sub-tasks.
+    OrchestratorDecomposed {
+        sub_task_ids: Vec<String>,
+    },
 }
 
 /// An event in the orchestrator.

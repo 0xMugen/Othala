@@ -10,7 +10,8 @@ use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{provision_chat_workspace, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
 
 #[derive(Parser)]
 #[command(name = "othala")]
@@ -59,6 +60,98 @@ enum ChatAction {
     },
     /// List all chats
     List,
+}
+
+fn print_banner() {
+    eprint!("\x1b[35m");
+    eprintln!();
+    eprintln!("       \u{2554}\u{2557}");
+    eprintln!("      \u{2554}\u{255d}\u{2558}\u{2557}        \u{2554}\u{2550}\u{2557}\u{2554}\u{2566}\u{2557}\u{2566} \u{2566}\u{2554}\u{2550}\u{2557}\u{2566}  \u{2554}\u{2550}\u{2557}");
+    eprintln!("     \u{2554}\u{255d}  \u{2558}\u{2557}       \u{2551} \u{2551} \u{2551} \u{2560}\u{2550}\u{2569}\u{2560}\u{2550}\u{2557}\u{2551}  \u{2560}\u{2550}\u{2557}");
+    eprintln!("     \u{2558}\u{2557}  \u{2554}\u{255d}       \u{255a}\u{2550}\u{255d} \u{2569} \u{2569} \u{2569}\u{2569} \u{2569}\u{2569}\u{2550}\u{255d}\u{2569} \u{2569}");
+    eprintln!("      \u{2558}\u{2557}\u{2554}\u{255d}");
+    eprintln!("      \u{2554}\u{255d}\u{2558}\u{2557}        autonomous code orchestrator");
+    eprintln!("     \u{2554}\u{255d}  \u{2558}\u{2557}");
+    eprintln!();
+    eprint!("\x1b[0m");
+}
+
+fn run_context_gen_with_status(
+    repo_root: &Path,
+    template_dir: &Path,
+    model: ModelKind,
+) -> anyhow::Result<()> {
+    use orchd::context_gen::{check_context_startup, parse_progress_line, ContextStartupStatus};
+
+    match check_context_startup(repo_root) {
+        ContextStartupStatus::UpToDate => {
+            eprintln!("  \x1b[32mContext up to date \u{2713}\x1b[0m");
+            return Ok(());
+        }
+        ContextStartupStatus::Stale => {
+            eprintln!("  \x1b[33mContext stale — will regenerate in background\x1b[0m");
+            return Ok(());
+        }
+        ContextStartupStatus::Missing => {
+            eprintln!("  \x1b[33mGenerating context...\x1b[0m");
+        }
+    }
+
+    let repo = repo_root.to_path_buf();
+    let tmpl = template_dir.to_path_buf();
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let ptx = progress_tx;
+        let result = orchd::context_gen::ensure_context_exists_blocking(
+            &repo,
+            &tmpl,
+            model,
+            move |line| { let _ = ptx.send(line.to_string()); },
+        );
+        let _ = result_tx.send(result);
+    });
+
+    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let mut frame = 0usize;
+    let mut last_status = String::from("starting agent...");
+
+    loop {
+        while let Ok(raw) = progress_rx.try_recv() {
+            if let Some(parsed) = parse_progress_line(&raw) {
+                last_status = parsed;
+            }
+        }
+
+        match result_rx.try_recv() {
+            Ok(result) => {
+                eprint!("\r\x1b[2K");
+                match &result {
+                    Ok(()) => eprintln!("  \x1b[32mContext generated \u{2713}\x1b[0m"),
+                    Err(e) => eprintln!("  \x1b[31mContext generation failed: {e}\x1b[0m"),
+                }
+                return result;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let spinner = spinner_frames[frame % spinner_frames.len()];
+                let display = if last_status.len() > 70 {
+                    format!("{}...", &last_status[..70])
+                } else {
+                    last_status.clone()
+                };
+                eprint!("\r\x1b[2K  \x1b[35m{spinner}\x1b[0m \x1b[2m{display}\x1b[0m");
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprint!("\r\x1b[2K");
+                eprintln!("  \x1b[31mContext generation thread panicked\x1b[0m");
+                anyhow::bail!("context generation thread panicked");
+            }
+        }
+    }
 }
 
 fn print_task_list(tasks: &[Task]) {
@@ -186,74 +279,41 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Daemon => {
-            println!("Othala daemon starting...");
-            println!("MVP daemon mode - spawning agents for active chats");
+            print_banner();
+
+            let repo_root = std::env::current_dir()?;
+            let template_dir = PathBuf::from("templates/prompts");
+
+            // Ensure context files exist before entering the loop.
+            if let Err(e) = run_context_gen_with_status(
+                &repo_root,
+                &template_dir,
+                ModelKind::Claude,
+            ) {
+                eprintln!("[daemon] Context generation failed (non-fatal): {e}");
+            }
+            eprintln!();
+
+            let context_gen_config = orchd::context_gen::ContextGenConfig::default();
 
             let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+            let mut daemon_state = orchd::daemon_loop::DaemonState::new();
+            let daemon_config = orchd::daemon_loop::DaemonConfig {
+                repo_root,
+                template_dir,
+                enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                context_config: orchd::context_graph::ContextLoadConfig::default(),
+                verify_command: Some("cargo check && cargo test --workspace".to_string()),
+                context_gen_config,
+            };
 
             loop {
-                // Spawn agents for Chatting tasks that don't have a session yet.
-                let chatting_tasks = service.list_tasks_by_state(TaskState::Chatting)?;
-                for task in &chatting_tasks {
-                    if !supervisor.has_session(&task.id) {
-                        if let Err(e) = supervisor.spawn_agent(
-                            &task.id,
-                            &task.repo_id,
-                            &task.worktree_path,
-                            &task.title,
-                            task.preferred_model,
-                        ) {
-                            eprintln!("[daemon] Failed to spawn agent for {}: {}", task.id.0, e);
-                        }
-                    }
-                }
-
-                // Poll for output and completed agents.
-                let result = supervisor.poll();
-                for chunk in &result.output {
-                    for line in &chunk.lines {
-                        println!("[{}] {}", chunk.task_id.0, line);
-                    }
-                }
-                for outcome in &result.completed {
-                    let now = Utc::now();
-                    if outcome.patch_ready || outcome.success {
-                        let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
-                        match service.mark_ready(&outcome.task_id, event_id, now) {
-                            Ok(_) => println!(
-                                "[daemon] {} -> Ready (exit={:?})",
-                                outcome.task_id.0, outcome.exit_code
-                            ),
-                            Err(e) => eprintln!(
-                                "[daemon] Failed to mark {} ready: {}",
-                                outcome.task_id.0, e
-                            ),
-                        }
-                    } else if outcome.needs_human {
-                        let event = Event {
-                            id: EventId(format!("E-HUMAN-{}", outcome.task_id.0)),
-                            task_id: Some(outcome.task_id.clone()),
-                            repo_id: None,
-                            at: now,
-                            kind: EventKind::NeedsHuman {
-                                reason: "Agent requested human assistance".to_string(),
-                            },
-                        };
-                        if let Err(e) = service.record_event(&event) {
-                            eprintln!(
-                                "[daemon] Failed to record needs_human for {}: {}",
-                                outcome.task_id.0, e
-                            );
-                        } else {
-                            println!("[daemon] {} needs human help", outcome.task_id.0);
-                        }
-                    } else {
-                        eprintln!(
-                            "[daemon] {} failed (exit={:?})",
-                            outcome.task_id.0, outcome.exit_code
-                        );
-                    }
-                }
+                orchd::daemon_loop::run_tick(
+                    &service,
+                    &mut supervisor,
+                    &mut daemon_state,
+                    &daemon_config,
+                );
 
                 // Print status summary.
                 let tasks = service.list_tasks()?;

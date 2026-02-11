@@ -32,6 +32,94 @@ enum MainError {
     Any(#[from] anyhow::Error),
 }
 
+fn print_banner() {
+    eprint!("\x1b[35m");
+    eprintln!();
+    eprintln!("       \u{2554}\u{2557}");
+    eprintln!("      \u{2554}\u{255d}\u{2558}\u{2557}        \u{2554}\u{2550}\u{2557}\u{2554}\u{2566}\u{2557}\u{2566} \u{2566}\u{2554}\u{2550}\u{2557}\u{2566}  \u{2554}\u{2550}\u{2557}");
+    eprintln!("     \u{2554}\u{255d}  \u{2558}\u{2557}       \u{2551} \u{2551} \u{2551} \u{2560}\u{2550}\u{2569}\u{2560}\u{2550}\u{2557}\u{2551}  \u{2560}\u{2550}\u{2557}");
+    eprintln!("     \u{2558}\u{2557}  \u{2554}\u{255d}       \u{255a}\u{2550}\u{255d} \u{2569} \u{2569} \u{2569}\u{2569} \u{2569}\u{2569}\u{2550}\u{255d}\u{2569} \u{2569}");
+    eprintln!("      \u{2558}\u{2557}\u{2554}\u{255d}");
+    eprintln!("      \u{2554}\u{255d}\u{2558}\u{2557}        autonomous code orchestrator");
+    eprintln!("     \u{2554}\u{255d}  \u{2558}\u{2557}");
+    eprintln!();
+    eprint!("\x1b[0m");
+}
+
+fn run_context_gen_with_status(repo_root: &Path, template_dir: &Path, model: ModelKind) {
+    use orchd::context_gen::{check_context_startup, parse_progress_line, ContextStartupStatus};
+
+    match check_context_startup(repo_root) {
+        ContextStartupStatus::UpToDate => {
+            eprintln!("  \x1b[32mContext up to date \u{2713}\x1b[0m");
+            return;
+        }
+        ContextStartupStatus::Stale => {
+            eprintln!("  \x1b[33mContext stale — will regenerate in background\x1b[0m");
+            return;
+        }
+        ContextStartupStatus::Missing => {
+            eprintln!("  \x1b[33mGenerating context...\x1b[0m");
+        }
+    }
+
+    let repo = repo_root.to_path_buf();
+    let tmpl = template_dir.to_path_buf();
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let ptx = progress_tx;
+        let result = orchd::context_gen::ensure_context_exists_blocking(
+            &repo,
+            &tmpl,
+            model,
+            move |line| { let _ = ptx.send(line.to_string()); },
+        );
+        let _ = result_tx.send(result);
+    });
+
+    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let mut frame = 0usize;
+    let mut last_status = String::from("starting agent...");
+
+    loop {
+        while let Ok(raw) = progress_rx.try_recv() {
+            if let Some(parsed) = parse_progress_line(&raw) {
+                last_status = parsed;
+            }
+        }
+
+        match result_rx.try_recv() {
+            Ok(result) => {
+                eprint!("\r\x1b[2K");
+                match result {
+                    Ok(()) => eprintln!("  \x1b[32mContext generated \u{2713}\x1b[0m"),
+                    Err(e) => eprintln!("  \x1b[31mContext generation failed: {e}\x1b[0m"),
+                }
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let spinner = spinner_frames[frame % spinner_frames.len()];
+                let display = if last_status.len() > 70 {
+                    format!("{}...", &last_status[..70])
+                } else {
+                    last_status.clone()
+                };
+                eprint!("\r\x1b[2K  \x1b[35m{spinner}\x1b[0m \x1b[2m{display}\x1b[0m");
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprint!("\r\x1b[2K");
+                eprintln!("  \x1b[31mContext generation failed\x1b[0m");
+                return;
+            }
+        }
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("orch-tui failed: {err}");
@@ -65,6 +153,15 @@ fn run() -> Result<(), MainError> {
 
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_path, scheduler)
         .map_err(|e| MainError::Any(e.into()))?;
+
+    // Show banner and handle context gen before TUI takes over the terminal.
+    print_banner();
+    {
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let template_dir = PathBuf::from("templates/prompts");
+        run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude);
+    }
+    eprintln!();
 
     let tasks = service.list_tasks().unwrap_or_default();
     let mut app = TuiApp::from_tasks(&tasks);

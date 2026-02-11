@@ -350,6 +350,10 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::SubmitCompleted => "submit_completed",
         EventKind::NeedsHuman { .. } => "needs_human",
         EventKind::Error { .. } => "error",
+        EventKind::RetryScheduled { .. } => "retry_scheduled",
+        EventKind::TaskFailed { .. } => "task_failed",
+        EventKind::TestSpecValidated { .. } => "test_spec_validated",
+        EventKind::OrchestratorDecomposed { .. } => "orchestrator_decomposed",
     }
 }
 
