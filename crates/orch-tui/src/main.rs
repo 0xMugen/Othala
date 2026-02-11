@@ -170,6 +170,89 @@ fn run() -> Result<(), MainError> {
                         });
                     }
                 }
+                UiAction::SendChatMessage => {
+                    if let (Some(task_id), Some(message)) = (&queued.task_id, &queued.prompt) {
+                        // Auto-spawn interactive session if none exists.
+                        if !supervisor.has_session(task_id) {
+                            if let Ok(Some(task)) = service.task(task_id) {
+                                let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                                if let Err(e) = supervisor.spawn_interactive(
+                                    &task.id,
+                                    &task.repo_id,
+                                    &task.worktree_path,
+                                    message,
+                                    Some(model),
+                                ) {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!("interactive spawn failed: {e}"),
+                                    });
+                                } else {
+                                    // Echo user message into the pane.
+                                    let instance_id = format!("agent-{}", task_id.0);
+                                    app.apply_event(TuiEvent::AgentPaneOutput {
+                                        instance_id,
+                                        task_id: task_id.clone(),
+                                        model,
+                                        lines: vec![format!("> {message}")],
+                                    });
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "started interactive {:?} agent for {}",
+                                            model, task_id.0
+                                        ),
+                                    });
+                                }
+                            }
+                        } else {
+                            // Session exists — send the message.
+                            match supervisor.send_input(task_id, message) {
+                                Ok(()) => {
+                                    let instance_id = format!("agent-{}", task_id.0);
+                                    let model = service
+                                        .task(task_id)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|t| t.preferred_model)
+                                        .unwrap_or(ModelKind::Claude);
+                                    app.apply_event(TuiEvent::AgentPaneOutput {
+                                        instance_id,
+                                        task_id: task_id.clone(),
+                                        model,
+                                        lines: vec![format!("> {message}")],
+                                    });
+                                }
+                                Err(e) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!("send failed: {e}"),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                UiAction::ApproveTask => {
+                    if let Some(task_id) = &queued.task_id {
+                        let now = Utc::now();
+                        let event_id = EventId(format!("E-READY-{}", task_id.0));
+                        match service.mark_ready(task_id, event_id, now) {
+                            Ok(_) => {
+                                let instance_id = format!("agent-{}", task_id.0);
+                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                    instance_id,
+                                    status: AgentPaneStatus::Exited,
+                                });
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("approved {} -> Ready", task_id.0),
+                                });
+                            }
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("approve failed: {e}"),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {
                     app.apply_event(TuiEvent::StatusLine {
                         message: format!("action not yet implemented: {:?}", queued.action),
@@ -193,11 +276,25 @@ fn run() -> Result<(), MainError> {
             let instance_id = format!("agent-{}", outcome.task_id.0);
             let now = Utc::now();
             if outcome.patch_ready || outcome.success {
-                let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
-                let _ = service.mark_ready(&outcome.task_id, event_id, now);
+                let event = Event {
+                    id: EventId(format!("E-HUMAN-REVIEW-{}", outcome.task_id.0)),
+                    task_id: Some(outcome.task_id.clone()),
+                    repo_id: None,
+                    at: now,
+                    kind: EventKind::NeedsHuman {
+                        reason: "review required".to_string(),
+                    },
+                };
+                let _ = service.record_event(&event);
                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                    instance_id,
-                    status: AgentPaneStatus::Exited,
+                    instance_id: instance_id.clone(),
+                    status: AgentPaneStatus::Waiting,
+                });
+                let task_label = &outcome.task_id.0;
+                app.apply_event(TuiEvent::StatusLine {
+                    message: format!(
+                        "[needs_human] {task_label} ready for review -- press 'a' to approve"
+                    ),
                 });
             } else if outcome.needs_human {
                 let event = Event {
@@ -223,9 +320,13 @@ fn run() -> Result<(), MainError> {
         }
 
         // Auto-spawn agents for Chatting tasks without a running session.
+        // Skip tasks whose pane is in Waiting status (needs human review).
         if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
             for task in &chatting {
-                if !supervisor.has_session(&task.id) {
+                let pane_waiting = app.state.panes.iter().any(|pane| {
+                    pane.task_id == task.id && pane.status == AgentPaneStatus::Waiting
+                });
+                if !supervisor.has_session(&task.id) && !pane_waiting {
                     let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                     if let Ok(()) = supervisor.spawn_agent(
                         &task.id,

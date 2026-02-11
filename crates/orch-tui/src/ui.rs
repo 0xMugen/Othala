@@ -687,6 +687,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         spans.push(Span::raw(" "));
         let keys: &[(&str, &str)] = &[
             ("c", "chat"),
+            ("i", "interact"),
             ("a", "approve"),
             ("g", "submit"),
             ("s", "start"),
@@ -745,6 +746,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         "Confirm Delete"
     } else if app.model_select_display().is_some() {
         "Select Model"
+    } else if app.chat_input_display().is_some() {
+        "Chat Input"
     } else if app.input_prompt().is_some() {
         "New Chat"
     } else {

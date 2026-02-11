@@ -30,6 +30,10 @@ pub enum InputMode {
         task_id: TaskId,
         branch: Option<String>,
     },
+    ChatInput {
+        buffer: String,
+        task_id: TaskId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +167,7 @@ impl TuiApp {
         match command {
             UiCommand::Dispatch(UiAction::CreateTask) => self.begin_new_chat_prompt(),
             UiCommand::Dispatch(UiAction::DeleteTask) => self.begin_delete_task_confirmation(),
+            UiCommand::Dispatch(UiAction::SendChatMessage) => self.begin_chat_input(),
             UiCommand::Dispatch(action) => self.push_action(action),
             UiCommand::SelectNextTask => self.state.move_task_selection_next(),
             UiCommand::SelectPreviousTask => self.state.move_task_selection_previous(),
@@ -205,10 +210,12 @@ impl TuiApp {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        let InputMode::NewChatPrompt { buffer } = &mut self.input_mode else {
-            return;
-        };
-        buffer.push_str(&normalize_paste_text(text));
+        match &mut self.input_mode {
+            InputMode::NewChatPrompt { buffer } | InputMode::ChatInput { buffer, .. } => {
+                buffer.push_str(&normalize_paste_text(text));
+            }
+            _ => {}
+        }
     }
 
     fn begin_new_chat_prompt(&mut self) {
@@ -217,6 +224,20 @@ impl TuiApp {
         };
         self.state.status_line =
             "new chat prompt: type feature request, Enter=submit Esc=cancel".to_string();
+    }
+
+    fn begin_chat_input(&mut self) {
+        let Some(task) = self.state.selected_task() else {
+            self.state.status_line = "no task selected for chat".to_string();
+            return;
+        };
+        let task_id = task.task_id.clone();
+        self.input_mode = InputMode::ChatInput {
+            buffer: String::new(),
+            task_id,
+        };
+        self.state.status_line =
+            "chat input: type message, Enter=send Esc=cancel".to_string();
     }
 
     fn begin_delete_task_confirmation(&mut self) {
@@ -243,6 +264,7 @@ impl TuiApp {
         match &self.input_mode {
             InputMode::Normal => None,
             InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
+            InputMode::ChatInput { buffer, .. } => Some(buffer.as_str()),
             InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
             InputMode::DeleteTaskConfirm { .. } => None,
         }
@@ -253,6 +275,13 @@ impl TuiApp {
             InputMode::ModelSelect {
                 models, selected, ..
             } => Some((models, *selected)),
+            _ => None,
+        }
+    }
+
+    pub fn chat_input_display(&self) -> Option<(&str, &TaskId)> {
+        match &self.input_mode {
+            InputMode::ChatInput { buffer, task_id } => Some((buffer.as_str(), task_id)),
             _ => None,
         }
     }
@@ -328,6 +357,38 @@ impl TuiApp {
                     self.input_mode = InputMode::Normal;
                     self.state.status_line =
                         format!("queued action=create_task (chat) model={:?}", chosen_model);
+                }
+                _ => {}
+            },
+            InputMode::ChatInput { buffer, task_id } => match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line = "chat input canceled".to_string();
+                }
+                KeyCode::Enter => {
+                    let message = buffer.trim().to_string();
+                    if message.is_empty() {
+                        self.state.status_line = "chat message cannot be empty".to_string();
+                        return true;
+                    }
+                    let tid = task_id.clone();
+                    self.action_queue.push_back(QueuedAction {
+                        action: UiAction::SendChatMessage,
+                        task_id: Some(tid.clone()),
+                        prompt: Some(message),
+                        model: None,
+                    });
+                    self.input_mode = InputMode::Normal;
+                    self.state.status_line =
+                        format!("queued action=send_chat_message task={}", tid.0);
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(ch) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        buffer.push(ch);
+                    }
                 }
                 _ => {}
             },

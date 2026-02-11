@@ -18,6 +18,7 @@ pub enum UiAction {
     OpenWebUiForTask,
     PauseTask,
     ResumeTask,
+    SendChatMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +66,7 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Char('w') => Some(UiCommand::Dispatch(UiAction::OpenWebUiForTask)),
         KeyCode::Char('p') => Some(UiCommand::Dispatch(UiAction::PauseTask)),
         KeyCode::Char('u') => Some(UiCommand::Dispatch(UiAction::ResumeTask)),
+        KeyCode::Char('i') => Some(UiCommand::Dispatch(UiAction::SendChatMessage)),
         _ => None,
     }
 }
@@ -85,6 +87,7 @@ pub fn action_label(action: UiAction) -> &'static str {
         UiAction::OpenWebUiForTask => "open_web_ui_for_task",
         UiAction::PauseTask => "pause_task",
         UiAction::ResumeTask => "resume_task",
+        UiAction::SendChatMessage => "send_chat_message",
     }
 }
 
@@ -148,6 +151,10 @@ mod tests {
             map_key_to_command(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(UiCommand::ToggleFocusedTask)
         );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(UiCommand::Dispatch(UiAction::SendChatMessage))
+        );
     }
 
     #[test]
@@ -185,5 +192,9 @@ mod tests {
         );
         assert_eq!(action_label(UiAction::PauseTask), "pause_task");
         assert_eq!(action_label(UiAction::ResumeTask), "resume_task");
+        assert_eq!(
+            action_label(UiAction::SendChatMessage),
+            "send_chat_message"
+        );
     }
 }

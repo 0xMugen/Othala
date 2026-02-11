@@ -16,6 +16,8 @@ use std::thread;
 pub struct AgentSession {
     pub child: Child,
     pub output_rx: mpsc::Receiver<String>,
+    /// Sender for writing to the agent's stdin (interactive sessions only).
+    pub input_tx: Option<mpsc::Sender<String>>,
     pub task_id: TaskId,
     pub model: ModelKind,
     pub started_at: DateTime<Utc>,
@@ -95,6 +97,7 @@ impl AgentSupervisor {
             .args(&cmd.args)
             .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(repo_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -130,6 +133,7 @@ impl AgentSupervisor {
         let session = AgentSession {
             child,
             output_rx: rx,
+            input_tx: None,
             task_id: task_id.clone(),
             model,
             started_at: Utc::now(),
@@ -139,6 +143,121 @@ impl AgentSupervisor {
 
         self.sessions.insert(task_id.0.clone(), session);
         Ok(())
+    }
+
+    /// Spawn an interactive agent process for a task.
+    ///
+    /// Unlike `spawn_agent`, the process's stdin is piped and `initial_prompt`
+    /// is written as the first message.  The caller can subsequently send
+    /// follow-up messages via `send_input`.
+    pub fn spawn_interactive(
+        &mut self,
+        task_id: &TaskId,
+        repo_id: &RepoId,
+        repo_path: &PathBuf,
+        initial_prompt: &str,
+        model: Option<ModelKind>,
+    ) -> anyhow::Result<()> {
+        let model = model.unwrap_or(self.default_model);
+        let adapter: Box<dyn AgentAdapter> = default_adapter_for(model)?;
+
+        let request = EpochRequest {
+            task_id: task_id.clone(),
+            repo_id: repo_id.clone(),
+            model,
+            repo_path: repo_path.clone(),
+            prompt: build_prompt(task_id, initial_prompt),
+            timeout_secs: 600,
+            extra_args: vec![],
+            env: vec![],
+        };
+
+        let cmd = adapter.build_interactive_command(&request);
+
+        let mut child = Command::new(&cmd.executable)
+            .args(&cmd.args)
+            .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(repo_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let (out_tx, out_rx) = mpsc::channel();
+
+        // Pipe stdout in a background thread.
+        if let Some(stdout) = child.stdout.take() {
+            let tx_out = out_tx.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let _ = tx_out.send(line);
+                    }
+                }
+            });
+        }
+
+        // Pipe stderr in a background thread.
+        if let Some(stderr) = child.stderr.take() {
+            let tx_err = out_tx;
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let _ = tx_err.send(line);
+                    }
+                }
+            });
+        }
+
+        // Create a channel + background thread for stdin writes.
+        let (in_tx, in_rx) = mpsc::channel::<String>();
+        if let Some(stdin) = child.stdin.take() {
+            use std::io::Write;
+            thread::spawn(move || {
+                let mut stdin = stdin;
+                while let Ok(msg) = in_rx.recv() {
+                    if writeln!(stdin, "{msg}").is_err() {
+                        break;
+                    }
+                    if stdin.flush().is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Send the initial prompt as the first message.
+        let _ = in_tx.send(request.prompt.clone());
+
+        let session = AgentSession {
+            child,
+            output_rx: out_rx,
+            input_tx: Some(in_tx),
+            task_id: task_id.clone(),
+            model,
+            started_at: Utc::now(),
+            patch_ready: false,
+            needs_human: false,
+        };
+
+        self.sessions.insert(task_id.0.clone(), session);
+        Ok(())
+    }
+
+    /// Send a message to the stdin of a running interactive agent session.
+    pub fn send_input(&self, task_id: &TaskId, message: &str) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .get(&task_id.0)
+            .ok_or_else(|| anyhow::anyhow!("no session for task {}", task_id.0))?;
+        let tx = session
+            .input_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session for {} is not interactive", task_id.0))?;
+        tx.send(message.to_string())
+            .map_err(|_| anyhow::anyhow!("stdin channel closed for {}", task_id.0))
     }
 
     /// Non-blocking poll: drain output, detect signals, collect finished sessions.

@@ -7,6 +7,12 @@ use crate::types::{AgentCommand, AgentSignal, EpochRequest};
 pub trait AgentAdapter: Send + Sync {
     fn model(&self) -> ModelKind;
     fn build_command(&self, request: &EpochRequest) -> AgentCommand;
+    /// Build a command for interactive (stdin-driven) sessions.
+    /// Omits headless flags (`-p`, `exec --full-auto`) so the agent
+    /// reads follow-up messages from stdin.
+    fn build_interactive_command(&self, request: &EpochRequest) -> AgentCommand {
+        self.build_command(request)
+    }
     fn detect_signal(&self, line: &str) -> Option<AgentSignal> {
         detect_common_signal(line)
     }
@@ -44,6 +50,19 @@ impl AgentAdapter for ClaudeAdapter {
             env: request.env.clone(),
         }
     }
+
+    fn build_interactive_command(&self, request: &EpochRequest) -> AgentCommand {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        args.extend(request.extra_args.iter().cloned());
+        AgentCommand {
+            executable: self.executable.clone(),
+            args,
+            env: request.env.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +93,16 @@ impl AgentAdapter for CodexAdapter {
             env: request.env.clone(),
         }
     }
+
+    fn build_interactive_command(&self, request: &EpochRequest) -> AgentCommand {
+        let mut args = Vec::new();
+        args.extend(request.extra_args.iter().cloned());
+        AgentCommand {
+            executable: self.executable.clone(),
+            args,
+            env: request.env.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,9 +124,22 @@ impl AgentAdapter for GeminiAdapter {
     }
 
     fn build_command(&self, request: &EpochRequest) -> AgentCommand {
-        let mut args = vec!["-p".to_string(), "--yolo".to_string()];
+        let mut args = vec![
+            "-p".to_string(),
+            request.prompt.clone(),
+            "--yolo".to_string(),
+        ];
         args.extend(request.extra_args.iter().cloned());
-        args.push(request.prompt.clone());
+        AgentCommand {
+            executable: self.executable.clone(),
+            args,
+            env: request.env.clone(),
+        }
+    }
+
+    fn build_interactive_command(&self, request: &EpochRequest) -> AgentCommand {
+        let mut args = vec!["--yolo".to_string()];
+        args.extend(request.extra_args.iter().cloned());
         AgentCommand {
             executable: self.executable.clone(),
             args,
@@ -189,10 +231,10 @@ mod tests {
             command.args,
             vec![
                 "-p".to_string(),
+                "implement feature".to_string(),
                 "--yolo".to_string(),
                 "--flag".to_string(),
                 "--json".to_string(),
-                "implement feature".to_string()
             ]
         );
         assert_eq!(command.env, vec![("FOO".to_string(), "BAR".to_string())]);
@@ -233,9 +275,64 @@ mod tests {
             codex.args.last() == Some(&"".to_string()),
             "codex must append prompt slot even when empty"
         );
+        // Gemini places prompt right after -p (as its value), not at the end.
         assert!(
-            gemini.args.last() == Some(&"".to_string()),
-            "gemini must append prompt slot even when empty"
+            gemini.args[1] == "",
+            "gemini must place prompt right after -p even when empty"
+        );
+    }
+
+    #[test]
+    fn claude_interactive_command_omits_headless_flags() {
+        let adapter = ClaudeAdapter::default();
+        let request = mk_request(ModelKind::Claude);
+        let command = adapter.build_interactive_command(&request);
+
+        assert_eq!(command.executable, "claude");
+        assert_eq!(
+            command.args,
+            vec![
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--flag".to_string(),
+                "--json".to_string(),
+            ]
+        );
+        // No -p flag and no prompt argument
+        assert!(!command.args.contains(&"-p".to_string()));
+        assert!(!command.args.contains(&"implement feature".to_string()));
+    }
+
+    #[test]
+    fn codex_interactive_command_omits_exec_subcommand() {
+        let adapter = CodexAdapter::default();
+        let request = mk_request(ModelKind::Codex);
+        let command = adapter.build_interactive_command(&request);
+
+        assert_eq!(command.executable, "codex");
+        assert!(!command.args.contains(&"exec".to_string()));
+        assert!(!command.args.contains(&"--full-auto".to_string()));
+        assert_eq!(
+            command.args,
+            vec!["--flag".to_string(), "--json".to_string()]
+        );
+    }
+
+    #[test]
+    fn gemini_interactive_command_omits_prompt_flag() {
+        let adapter = GeminiAdapter::default();
+        let request = mk_request(ModelKind::Gemini);
+        let command = adapter.build_interactive_command(&request);
+
+        assert_eq!(command.executable, "gemini");
+        assert!(!command.args.contains(&"-p".to_string()));
+        assert_eq!(
+            command.args,
+            vec![
+                "--yolo".to_string(),
+                "--flag".to_string(),
+                "--json".to_string(),
+            ]
         );
     }
 
