@@ -1134,21 +1134,32 @@ fn run() -> Result<(), MainError> {
                             mode,
                             task_id,
                         } => {
-                            let (args, label) = match mode {
-                                SubmitMode::Single => (
-                                    vec!["submit".to_string(), "--no-edit".to_string()],
-                                    "[submit: gt submit --no-edit]".to_string(),
-                                ),
-                                SubmitMode::Stack => (
-                                    vec!["ss".to_string(), "--no-edit".to_string()],
-                                    "[submit: gt ss --no-edit]".to_string(),
-                                ),
+                            // Commit pending changes with gt modify (the
+                            // Graphite-aware commit), then submit.  The
+                            // agent may have modified files without
+                            // committing them, so we must stage+commit
+                            // first.  `gt modify` fails if nothing to
+                            // commit, so `|| true` lets us continue to
+                            // submit regardless.
+                            let submit_cmd = match mode {
+                                SubmitMode::Single => {
+                                    "gt submit --no-edit --no-interactive"
+                                }
+                                SubmitMode::Stack => {
+                                    "gt submit --stack --no-edit --no-interactive"
+                                }
                             };
+                            let script = format!(
+                                "gt modify --all --commit \
+                                 -m 'feat: task implementation' \
+                                 --no-interactive 2>&1 || true; \
+                                 {submit_cmd}"
+                            );
                             Some((
-                                "gt".to_string(),
-                                args,
+                                "sh".to_string(),
+                                vec!["-c".to_string(), script.clone()],
                                 worktree_path.clone(),
-                                label,
+                                format!("[submit: gt modify + {submit_cmd}]"),
                                 task_id.clone(),
                             ))
                         }
