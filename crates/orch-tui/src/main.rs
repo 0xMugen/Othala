@@ -1235,6 +1235,12 @@ fn run() -> Result<(), MainError> {
                     }
                 }
 
+                // Detect "nothing to submit" from gt — it exits 0 but
+                // the branch has no changes, so treat it as a failure.
+                let nothing_to_submit = lines_buf
+                    .iter()
+                    .any(|l| l.contains("Nothing to submit"));
+
                 if !lines_buf.is_empty() {
                     let pipe_instance = format!("pipeline-{key}");
                     let task_id = TaskId(key.clone());
@@ -1256,13 +1262,55 @@ fn run() -> Result<(), MainError> {
                     pipeline_procs.remove(&key);
                     if let Some(pipeline) = pipelines.get_mut(&key) {
                         let stage = pipeline.stage;
-                        if success {
+                        if success && !nothing_to_submit {
                             pipeline.advance();
                             app.apply_event(TuiEvent::StatusLine {
                                 message: format!("{key} pipeline: {stage} passed"),
                             });
+
+                            // If pipeline reached Done, transition to AwaitingMerge
+                            // immediately (the Drive section skips terminal pipelines
+                            // so the Complete action would never fire otherwise).
+                            if pipeline.stage
+                                == stack_pipeline::PipelineStage::Done
+                            {
+                                let task_id = TaskId(key.clone());
+                                let event_id = EventId(format!(
+                                    "E-AWAIT-{}",
+                                    task_id.0
+                                ));
+                                let _ = service.transition_task_state(
+                                    &task_id,
+                                    TaskState::AwaitingMerge,
+                                    event_id,
+                                    Utc::now(),
+                                );
+                                let pipe_instance = format!("pipeline-{key}");
+                                app.apply_event(
+                                    TuiEvent::AgentPaneStatusChanged {
+                                        instance_id: pipe_instance,
+                                        status: AgentPaneStatus::Exited,
+                                    },
+                                );
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} -> AwaitingMerge (submitted)",
+                                        task_id.0
+                                    ),
+                                });
+                                if let Ok(tasks) = service.list_tasks() {
+                                    app.apply_event(TuiEvent::TasksReplaced {
+                                        tasks,
+                                    });
+                                }
+                            }
                         } else {
-                            pipeline.fail(detail.clone());
+                            let reason = if nothing_to_submit {
+                                "branch has no changes to submit".to_string()
+                            } else {
+                                detail.clone()
+                            };
+                            pipeline.fail(reason.clone());
                             let pipe_instance = format!("pipeline-{key}");
                             app.apply_event(TuiEvent::AgentPaneStatusChanged {
                                 instance_id: pipe_instance,
@@ -1270,7 +1318,7 @@ fn run() -> Result<(), MainError> {
                             });
                             app.apply_event(TuiEvent::StatusLine {
                                 message: format!(
-                                    "{key} pipeline: {stage} failed — {detail}"
+                                    "{key} pipeline: {stage} failed — {reason}"
                                 ),
                             });
                         }
