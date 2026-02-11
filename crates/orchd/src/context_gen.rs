@@ -541,34 +541,53 @@ pub fn poll_context_gen(
     let raw_output = output_lines.join("\n");
     let parsed = parse_context_gen_output(&raw_output);
 
-    if parsed.files.is_empty() {
-        eprintln!("[context-gen] Agent produced no parseable context files");
-        state.status = ContextGenStatus::Failed;
-        state.child_handle = None;
-        state.result_rx = None;
-        return None;
+    if !parsed.files.is_empty() {
+        // Agent output via stdout delimiters — write them.
+        match write_context_files(repo_root, &parsed) {
+            Ok(paths) => {
+                eprintln!(
+                    "[context-gen] Wrote {} context files",
+                    paths.len()
+                );
+                state.status = ContextGenStatus::Completed;
+                state.last_generated_at = Some(Utc::now());
+                state.child_handle = None;
+                state.result_rx = None;
+                return Some(paths);
+            }
+            Err(e) => {
+                eprintln!("[context-gen] Failed to write context files: {e}");
+                state.status = ContextGenStatus::Failed;
+                state.child_handle = None;
+                state.result_rx = None;
+                return None;
+            }
+        }
     }
 
-    match write_context_files(repo_root, &parsed) {
-        Ok(paths) => {
-            eprintln!(
-                "[context-gen] Wrote {} context files",
-                paths.len()
-            );
-            state.status = ContextGenStatus::Completed;
-            state.last_generated_at = Some(Utc::now());
-            state.child_handle = None;
-            state.result_rx = None;
-            Some(paths)
+    // Agent may have written files directly using its Write tool.
+    if repo_root.join(".othala/context/MAIN.md").exists() {
+        if let Some(hash) = get_head_sha(repo_root) {
+            let _ = write_stored_hash(repo_root, &hash);
         }
-        Err(e) => {
-            eprintln!("[context-gen] Failed to write context files: {e}");
-            state.status = ContextGenStatus::Failed;
-            state.child_handle = None;
-            state.result_rx = None;
-            None
-        }
+        let count = count_context_files(repo_root);
+        eprintln!(
+            "[context-gen] Agent wrote {} context files directly",
+            count
+        );
+        state.status = ContextGenStatus::Completed;
+        state.last_generated_at = Some(Utc::now());
+        state.child_handle = None;
+        state.result_rx = None;
+        // Return empty vec since we didn't write them ourselves.
+        return Some(Vec::new());
     }
+
+    eprintln!("[context-gen] Agent produced no context files");
+    state.status = ContextGenStatus::Failed;
+    state.child_handle = None;
+    state.result_rx = None;
+    None
 }
 
 /// Status of the blocking context generation.
@@ -678,17 +697,49 @@ pub fn ensure_context_exists_blocking(
     let raw = output_lines.join("\n");
     let parsed = parse_context_gen_output(&raw);
 
-    if parsed.files.is_empty() {
-        anyhow::bail!("context generation agent produced no parseable files");
+    if !parsed.files.is_empty() {
+        // Agent output files via stdout delimiters — write them.
+        let paths = write_context_files(repo_root, &parsed)?;
+        eprintln!(
+            "[context-gen] Generated {} context files at startup",
+            paths.len()
+        );
+    } else if repo_root.join(".othala/context/MAIN.md").exists() {
+        // Agent wrote files directly using its Write tool — just stamp the hash.
+        if let Some(hash) = get_head_sha(repo_root) {
+            write_stored_hash(repo_root, &hash)?;
+        }
+        let count = count_context_files(repo_root);
+        eprintln!(
+            "[context-gen] Agent wrote {} context files directly",
+            count
+        );
+    } else {
+        anyhow::bail!("context generation agent produced no context files");
     }
 
-    let paths = write_context_files(repo_root, &parsed)?;
-    eprintln!(
-        "[context-gen] Generated {} context files at startup",
-        paths.len()
-    );
-
     Ok(())
+}
+
+/// Count `.md` files under `.othala/context/`.
+fn count_context_files(repo_root: &Path) -> usize {
+    let context_dir = repo_root.join(".othala/context");
+    walkdir_md_count(&context_dir)
+}
+
+fn walkdir_md_count(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += walkdir_md_count(&path);
+            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
