@@ -176,7 +176,7 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
         ));
     } else {
         spans.push(Span::styled(
-            "| \u{2191}\u{2193}=select \u{21B9}=focus \u{23CE}=detail esc=quit",
+            "| \u{2191}\u{2193}=select \u{2190}\u{2192}=pane \u{21B9}=focus \u{23CE}=detail esc=quit",
             Style::default().fg(DIM),
         ));
     }

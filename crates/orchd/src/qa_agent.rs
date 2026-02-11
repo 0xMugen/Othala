@@ -516,6 +516,23 @@ pub fn spawn_qa_agent(
     Ok(())
 }
 
+/// Drain pending output lines from a running QA agent without checking for
+/// completion.  Returns the lines for display in a TUI pane.
+pub fn drain_qa_output(state: &mut QAState) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(rx) = &state.result_rx {
+        while let Ok(line) = rx.try_recv() {
+            if let Some(signal) = detect_common_signal(&line) {
+                if signal.kind == AgentSignalKind::QAComplete {
+                    state.qa_complete = true;
+                }
+            }
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Non-blocking poll of a running QA agent.
 ///
 /// Returns `Some(QAResult)` when the agent has completed.

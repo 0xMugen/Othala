@@ -311,6 +311,7 @@ impl DashboardState {
             return;
         }
         self.selected_task_idx = (self.selected_task_idx + 1) % self.tasks.len();
+        self.snap_pane_to_task();
     }
 
     pub fn move_task_selection_previous(&mut self) {
@@ -323,12 +324,42 @@ impl DashboardState {
         } else {
             self.selected_task_idx - 1
         };
+        self.snap_pane_to_task();
+    }
+
+    /// Jump `selected_pane_idx` to the first pane belonging to the selected task.
+    fn snap_pane_to_task(&mut self) {
+        if let Some(task) = self.tasks.get(self.selected_task_idx) {
+            let tid = &task.task_id;
+            if let Some(idx) = self.panes.iter().position(|p| &p.task_id == tid) {
+                self.selected_pane_idx = idx;
+            }
+        }
     }
 
     pub fn move_pane_selection_next(&mut self) {
         if self.panes.is_empty() {
             self.selected_pane_idx = 0;
             return;
+        }
+        // Scope navigation to panes belonging to the selected task.
+        if let Some(task) = self.selected_task() {
+            let task_id = task.task_id.clone();
+            let indices: Vec<usize> = self
+                .panes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.task_id == task_id)
+                .map(|(i, _)| i)
+                .collect();
+            if !indices.is_empty() {
+                let cur = indices
+                    .iter()
+                    .position(|&i| i == self.selected_pane_idx)
+                    .unwrap_or(0);
+                self.selected_pane_idx = indices[(cur + 1) % indices.len()];
+                return;
+            }
         }
         self.selected_pane_idx = (self.selected_pane_idx + 1) % self.panes.len();
     }
@@ -337,6 +368,29 @@ impl DashboardState {
         if self.panes.is_empty() {
             self.selected_pane_idx = 0;
             return;
+        }
+        // Scope navigation to panes belonging to the selected task.
+        if let Some(task) = self.selected_task() {
+            let task_id = task.task_id.clone();
+            let indices: Vec<usize> = self
+                .panes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.task_id == task_id)
+                .map(|(i, _)| i)
+                .collect();
+            if !indices.is_empty() {
+                let cur = indices
+                    .iter()
+                    .position(|&i| i == self.selected_pane_idx)
+                    .unwrap_or(0);
+                self.selected_pane_idx = if cur == 0 {
+                    indices[indices.len() - 1]
+                } else {
+                    indices[cur - 1]
+                };
+                return;
+            }
         }
         self.selected_pane_idx = if self.selected_pane_idx == 0 {
             self.panes.len() - 1

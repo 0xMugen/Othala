@@ -481,6 +481,18 @@ fn run() -> Result<(), MainError> {
                                 .as_deref()
                                 .map(|s| extract_targets(s))
                                 .unwrap_or_default();
+                            // Create a TUI pane for QA agent output.
+                            let qa_instance = format!("qa-{}", outcome.task_id.0);
+                            app.apply_event(TuiEvent::AgentPaneOutput {
+                                instance_id: qa_instance.clone(),
+                                task_id: outcome.task_id.clone(),
+                                model: outcome.model,
+                                lines: vec!["[QA validation starting...]".to_string()],
+                            });
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id: qa_instance,
+                                status: AgentPaneStatus::Starting,
+                            });
                             app.apply_event(TuiEvent::QAUpdate {
                                 task_id: outcome.task_id.clone(),
                                 status: "validation running".to_string(),
@@ -636,6 +648,18 @@ fn run() -> Result<(), MainError> {
                                     ) {
                                         Ok(()) => {
                                             qa_agents.insert(qa_key, qa_state);
+                                            // Create a TUI pane for QA agent output.
+                                            let qa_instance = format!("qa-{}", task.id.0);
+                                            app.apply_event(TuiEvent::AgentPaneOutput {
+                                                instance_id: qa_instance.clone(),
+                                                task_id: task.id.clone(),
+                                                model,
+                                                lines: vec!["[QA baseline starting...]".to_string()],
+                                            });
+                                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                                instance_id: qa_instance,
+                                                status: AgentPaneStatus::Starting,
+                                            });
                                             app.apply_event(TuiEvent::QAUpdate {
                                                 task_id: task.id.clone(),
                                                 status: "baseline running".to_string(),
@@ -704,6 +728,18 @@ fn run() -> Result<(), MainError> {
                             &repo_root, &prompt, model, &mut qa_state,
                         ) {
                             qa_agents.insert(qa_key, qa_state);
+                            // Create a TUI pane for QA agent output.
+                            let qa_instance = format!("qa-{}", task.id.0);
+                            app.apply_event(TuiEvent::AgentPaneOutput {
+                                instance_id: qa_instance.clone(),
+                                task_id: task.id.clone(),
+                                model,
+                                lines: vec!["[QA baseline starting...]".to_string()],
+                            });
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id: qa_instance,
+                                status: AgentPaneStatus::Starting,
+                            });
                             app.apply_event(TuiEvent::QAUpdate {
                                 task_id: task.id.clone(),
                                 status: "baseline running".to_string(),
@@ -722,6 +758,28 @@ fn run() -> Result<(), MainError> {
                         }
                     }
                 }
+            }
+        }
+
+        // Drain QA agent output lines into their TUI panes.
+        for (qa_key, qa_state) in qa_agents.iter_mut() {
+            let task_id_str = qa_key.strip_prefix("qa-").unwrap_or(qa_key);
+            let qa_lines = qa_agent::drain_qa_output(qa_state);
+            if !qa_lines.is_empty() {
+                let qa_instance = format!("qa-{task_id_str}");
+                let task_id = TaskId(task_id_str.to_string());
+                let model = service
+                    .task(&task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.preferred_model)
+                    .unwrap_or(ModelKind::Claude);
+                app.apply_event(TuiEvent::AgentPaneOutput {
+                    instance_id: qa_instance,
+                    task_id,
+                    model,
+                    lines: qa_lines,
+                });
             }
         }
 
@@ -768,6 +826,17 @@ fn run() -> Result<(), MainError> {
                 let targets = qa_agent::load_task_spec(&repo_root, &task_id)
                     .map(|s| extract_targets(&s))
                     .unwrap_or_default();
+
+                // Mark the QA pane as exited.
+                let qa_instance = format!("qa-{}", task_id.0);
+                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                    instance_id: qa_instance,
+                    status: if all_passed {
+                        AgentPaneStatus::Exited
+                    } else {
+                        AgentPaneStatus::Failed
+                    },
+                });
 
                 app.apply_event(TuiEvent::QAUpdate {
                     task_id: task_id.clone(),
