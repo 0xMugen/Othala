@@ -7,10 +7,12 @@ use orch_agents::{
 use orch_core::types::{ModelKind, RepoId, TaskId};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+
+use crate::context_graph::{load_context_graph, render_context_for_prompt, ContextLoadConfig};
 
 /// A running agent session.
 pub struct AgentSession {
@@ -109,7 +111,7 @@ impl AgentSupervisor {
             repo_id: repo_id.clone(),
             model,
             repo_path: repo_path.clone(),
-            prompt: build_prompt(task_id, prompt),
+            prompt: build_prompt(task_id, prompt, repo_path),
             timeout_secs: 600,
             extra_args: vec![],
             env: vec![],
@@ -165,7 +167,7 @@ impl AgentSupervisor {
             repo_id: repo_id.clone(),
             model,
             repo_path: repo_path.clone(),
-            prompt: build_prompt(task_id, initial_prompt),
+            prompt: build_prompt(task_id, initial_prompt, repo_path),
             timeout_secs: 600,
             extra_args: vec![],
             env: vec![],
@@ -316,14 +318,34 @@ impl AgentSupervisor {
 }
 
 /// Build the prompt sent to the agent CLI.
-pub fn build_prompt(task_id: &TaskId, title: &str) -> String {
-    format!(
-        "Task {task_id}: {title}\n\n\
-         Instructions:\n\
-         - Complete the task described above.\n\
-         - When you are done and the code is ready, print exactly: [patch_ready]\n\
-         - If you are blocked and need human help, print exactly: [needs_human]\n",
-        task_id = task_id.0,
-        title = title,
-    )
+///
+/// Loads the `.othala/context/` graph (if present) and injects it so the agent
+/// understands the project architecture, patterns, and conventions.
+pub fn build_prompt(task_id: &TaskId, title: &str, repo_root: &Path) -> String {
+    let mut sections = Vec::new();
+
+    // Load and inject codebase context from .othala/context/.
+    if let Some(graph) = load_context_graph(repo_root, &ContextLoadConfig::default()) {
+        if !graph.nodes.is_empty() {
+            sections.push(render_context_for_prompt(&graph));
+        }
+    }
+
+    // Task assignment.
+    sections.push(format!(
+        "# Task Assignment\n\n\
+         **Task ID:** {}\n\
+         **Title:** {}\n",
+        task_id.0, title,
+    ));
+
+    // Signal definitions.
+    sections.push(
+        "# Signals\n\n\
+         - When you are done and the code is ready, print exactly: `[patch_ready]`\n\
+         - If you are blocked and need human help, print exactly: `[needs_human]`\n"
+            .to_string(),
+    );
+
+    sections.join("\n---\n\n")
 }

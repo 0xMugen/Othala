@@ -64,9 +64,32 @@ impl TuiApp {
     }
 
     pub fn set_tasks(&mut self, tasks: &[Task]) {
+        // Build a lookup of existing QA data so we can carry it across refreshes.
+        // (QA status is set by QAUpdate events and has no backing in the Task struct.)
+        let prev_qa: std::collections::HashMap<_, _> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.qa_status.is_some() || !t.qa_tests.is_empty() || !t.qa_targets.is_empty())
+            .map(|t| {
+                (
+                    t.task_id.clone(),
+                    (t.qa_status.clone(), t.qa_tests.clone(), t.qa_targets.clone()),
+                )
+            })
+            .collect();
+
         self.state.tasks = tasks
             .iter()
-            .map(crate::model::TaskOverviewRow::from_task)
+            .map(|task| {
+                let mut row = crate::model::TaskOverviewRow::from_task(task);
+                if let Some((status, tests, targets)) = prev_qa.get(&row.task_id) {
+                    row.qa_status = status.clone();
+                    row.qa_tests = tests.clone();
+                    row.qa_targets = targets.clone();
+                }
+                row
+            })
             .collect();
         if self.state.selected_task_idx >= self.state.tasks.len() {
             self.state.selected_task_idx = self.state.tasks.len().saturating_sub(1);
@@ -1133,5 +1156,50 @@ mod tests {
         });
         // No panic, no tasks added
         assert!(app.state.tasks.is_empty());
+    }
+
+    #[test]
+    fn tasks_replaced_preserves_qa_data() {
+        use crate::model::QATestDisplay;
+        use orch_core::types::Task;
+        use std::path::PathBuf;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: Some("baseline running".to_string()),
+            qa_tests: vec![QATestDisplay {
+                name: "build".to_string(),
+                suite: "build".to_string(),
+                passed: true,
+                detail: String::new(),
+            }],
+            qa_targets: vec!["check endpoint".to_string()],
+        }];
+
+        // Simulate a TasksReplaced event (same task, fresh data from DB).
+        let task = Task::new(
+            TaskId("T1".to_string()),
+            RepoId("example".to_string()),
+            "Task T1".to_string(),
+            PathBuf::from(".orch/wt/T1"),
+        );
+        app.apply_event(TuiEvent::TasksReplaced {
+            tasks: vec![task],
+        });
+
+        // QA data should be preserved.
+        let row = &app.state.tasks[0];
+        assert_eq!(row.qa_status.as_deref(), Some("baseline running"));
+        assert_eq!(row.qa_tests.len(), 1);
+        assert_eq!(row.qa_targets, vec!["check endpoint"]);
     }
 }

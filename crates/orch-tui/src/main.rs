@@ -195,6 +195,9 @@ fn run() -> Result<(), MainError> {
 
     let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
     let mut tick_counter: u32 = 0;
+    let mut qa_agents: HashMap<String, qa_agent::QAState> = HashMap::new();
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let template_dir = PathBuf::from("templates/prompts");
 
     run_tui_with_hook(&mut app, Duration::from_millis(args.tick_ms), |app| {
         // Process queued actions from the UI.
@@ -437,26 +440,100 @@ fn run() -> Result<(), MainError> {
             let instance_id = format!("agent-{}", outcome.task_id.0);
             let now = Utc::now();
             if outcome.patch_ready || outcome.success {
-                let event = Event {
-                    id: EventId(format!("E-DONE-{}", outcome.task_id.0)),
-                    task_id: Some(outcome.task_id.clone()),
-                    repo_id: None,
-                    at: now,
-                    kind: EventKind::NeedsHuman {
-                        reason: "agent completed".to_string(),
-                    },
-                };
-                let _ = service.record_event(&event);
                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
                     instance_id: instance_id.clone(),
                     status: AgentPaneStatus::Exited,
                 });
-                let task_label = &outcome.task_id.0;
-                app.apply_event(TuiEvent::StatusLine {
-                    message: format!(
-                        "{task_label} done -- press 'a' to approve or 'i' to chat"
-                    ),
-                });
+
+                // If baseline.md exists, spawn QA validation before advancing.
+                // The task stays at Chatting until QA passes.
+                let qa_key = format!("qa-{}", outcome.task_id.0);
+                let has_baseline = qa_agent::load_baseline(&repo_root).is_some();
+                if has_baseline && !qa_agents.contains_key(&qa_key) {
+                    let baseline = qa_agent::load_baseline(&repo_root).unwrap();
+                    let task_spec =
+                        qa_agent::load_task_spec(&repo_root, &outcome.task_id);
+                    let previous = service
+                        .task(&outcome.task_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.branch_name)
+                        .as_deref()
+                        .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
+                    let prompt = qa_agent::build_qa_prompt(
+                        &baseline,
+                        task_spec.as_deref(),
+                        previous.as_ref(),
+                        &repo_root,
+                        &template_dir,
+                    );
+                    let mut qa_state =
+                        qa_agent::QAState::new(qa_agent::QAType::Validation);
+                    match qa_agent::spawn_qa_agent(
+                        &repo_root,
+                        &prompt,
+                        outcome.model,
+                        &mut qa_state,
+                    ) {
+                        Ok(()) => {
+                            qa_agents.insert(qa_key, qa_state);
+                            let targets = task_spec
+                                .as_deref()
+                                .map(|s| extract_targets(s))
+                                .unwrap_or_default();
+                            app.apply_event(TuiEvent::QAUpdate {
+                                task_id: outcome.task_id.clone(),
+                                status: "validation running".to_string(),
+                                tests: vec![],
+                                targets,
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "QA validation started for {} (patch_ready)",
+                                    outcome.task_id.0
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            // QA spawn failed — advance anyway.
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "QA validation spawn failed for {}: {e} — advancing",
+                                    outcome.task_id.0
+                                ),
+                            });
+                            let event_id =
+                                EventId(format!("E-READY-{}", outcome.task_id.0));
+                            let _ = service.mark_ready(&outcome.task_id, event_id, now);
+                        }
+                    }
+                } else {
+                    // No baseline.md — advance directly to Ready.
+                    let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
+                    match service.mark_ready(&outcome.task_id, event_id, now) {
+                        Ok(_) => {
+                            let reason = if outcome.patch_ready {
+                                "patch_ready"
+                            } else {
+                                "exit 0"
+                            };
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{} -> Ready ({reason})",
+                                    outcome.task_id.0
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{} done but mark_ready failed: {e}",
+                                    outcome.task_id.0
+                                ),
+                            });
+                        }
+                    }
+                }
             } else if outcome.needs_human {
                 let event = Event {
                     id: EventId(format!("E-HUMAN-{}", outcome.task_id.0)),
@@ -477,6 +554,14 @@ fn run() -> Result<(), MainError> {
                     instance_id,
                     status: AgentPaneStatus::Failed,
                 });
+            }
+        }
+
+        // Refresh task list immediately when any agents completed so
+        // state changes (Chatting → Ready) show up without delay.
+        if !result.completed.is_empty() {
+            if let Ok(tasks) = service.list_tasks() {
+                app.apply_event(TuiEvent::TasksReplaced { tasks });
             }
         }
 
@@ -522,6 +607,62 @@ fn run() -> Result<(), MainError> {
                                     model, task.id.0
                                 ),
                             });
+
+                            // Spawn QA baseline in parallel if baseline.md exists
+                            // and no QA agent is already running for this task.
+                            let qa_key = format!("qa-{}", task.id.0);
+                            if !qa_agents.contains_key(&qa_key) {
+                                if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
+                                    let task_spec =
+                                        qa_agent::load_task_spec(&repo_root, &task.id);
+                                    let previous =
+                                        task.branch_name.as_deref().and_then(|b| {
+                                            qa_agent::load_latest_result(&repo_root, b)
+                                        });
+                                    let prompt = qa_agent::build_qa_prompt(
+                                        &baseline,
+                                        task_spec.as_deref(),
+                                        previous.as_ref(),
+                                        &repo_root,
+                                        &template_dir,
+                                    );
+                                    let mut qa_state =
+                                        qa_agent::QAState::new(qa_agent::QAType::Baseline);
+                                    match qa_agent::spawn_qa_agent(
+                                        &repo_root,
+                                        &prompt,
+                                        model,
+                                        &mut qa_state,
+                                    ) {
+                                        Ok(()) => {
+                                            qa_agents.insert(qa_key, qa_state);
+                                            app.apply_event(TuiEvent::QAUpdate {
+                                                task_id: task.id.clone(),
+                                                status: "baseline running".to_string(),
+                                                tests: vec![],
+                                                targets: task_spec
+                                                    .as_deref()
+                                                    .map(|s| extract_targets(s))
+                                                    .unwrap_or_default(),
+                                            });
+                                            app.apply_event(TuiEvent::StatusLine {
+                                                message: format!(
+                                                    "QA baseline started for {}",
+                                                    task.id.0
+                                                ),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            app.apply_event(TuiEvent::StatusLine {
+                                                message: format!(
+                                                    "QA spawn failed for {}: {e}",
+                                                    task.id.0
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             app.apply_event(TuiEvent::StatusLine {
@@ -533,6 +674,151 @@ fn run() -> Result<(), MainError> {
                         }
                     }
                 }
+            }
+        }
+
+        // Spawn QA baseline for any chatting task that has an agent
+        // running but no QA agent yet (catches tasks started before
+        // baseline.md existed or before this code was deployed).
+        if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
+            for task in &chatting {
+                let qa_key = format!("qa-{}", task.id.0);
+                if !qa_agents.contains_key(&qa_key) && supervisor.has_session(&task.id) {
+                    if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
+                        let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                        let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
+                        let previous = task
+                            .branch_name
+                            .as_deref()
+                            .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
+                        let prompt = qa_agent::build_qa_prompt(
+                            &baseline,
+                            task_spec.as_deref(),
+                            previous.as_ref(),
+                            &repo_root,
+                            &template_dir,
+                        );
+                        let mut qa_state =
+                            qa_agent::QAState::new(qa_agent::QAType::Baseline);
+                        if let Ok(()) = qa_agent::spawn_qa_agent(
+                            &repo_root, &prompt, model, &mut qa_state,
+                        ) {
+                            qa_agents.insert(qa_key, qa_state);
+                            app.apply_event(TuiEvent::QAUpdate {
+                                task_id: task.id.clone(),
+                                status: "baseline running".to_string(),
+                                tests: vec![],
+                                targets: task_spec
+                                    .as_deref()
+                                    .map(|s| extract_targets(s))
+                                    .unwrap_or_default(),
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "QA baseline started for {} (catch-up)",
+                                    task.id.0
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Poll QA agents and handle completions.
+        let qa_keys: Vec<String> = qa_agents.keys().cloned().collect();
+        for qa_key in qa_keys {
+            let task_id_str = qa_key.strip_prefix("qa-").unwrap_or(&qa_key);
+            let task_id = TaskId(task_id_str.to_string());
+
+            let qa_state = qa_agents.get_mut(&qa_key).unwrap();
+            let qa_type = qa_state.qa_type;
+            if let Some(qa_result) = qa_agent::poll_qa_agent(qa_state) {
+                // QA agent completed — save result and update UI.
+                let _ = qa_agent::save_qa_result(&repo_root, &qa_result);
+
+                let all_passed = qa_result.summary.failed == 0;
+                let status = if all_passed {
+                    format!(
+                        "{} passed {}/{}",
+                        qa_type,
+                        qa_result.summary.passed,
+                        qa_result.summary.total
+                    )
+                } else {
+                    format!(
+                        "{} failed {}/{}",
+                        qa_type,
+                        qa_result.summary.passed,
+                        qa_result.summary.total
+                    )
+                };
+
+                let tests: Vec<QATestDisplay> = qa_result
+                    .tests
+                    .iter()
+                    .map(|t| QATestDisplay {
+                        name: t.name.clone(),
+                        suite: t.suite.clone(),
+                        passed: t.passed,
+                        detail: t.detail.clone(),
+                    })
+                    .collect();
+
+                let targets = qa_agent::load_task_spec(&repo_root, &task_id)
+                    .map(|s| extract_targets(&s))
+                    .unwrap_or_default();
+
+                app.apply_event(TuiEvent::QAUpdate {
+                    task_id: task_id.clone(),
+                    status: status.clone(),
+                    tests,
+                    targets,
+                });
+                app.apply_event(TuiEvent::StatusLine {
+                    message: format!("QA {status} for {}", task_id.0),
+                });
+
+                // If this was a validation run, advance the task based on result.
+                if qa_type == qa_agent::QAType::Validation {
+                    let now = Utc::now();
+                    if all_passed {
+                        let event_id =
+                            EventId(format!("E-READY-QA-{}", task_id.0));
+                        match service.mark_ready(&task_id, event_id, now) {
+                            Ok(_) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} -> Ready (QA validation passed)",
+                                        task_id.0
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} QA passed but mark_ready failed: {e}",
+                                        task_id.0
+                                    ),
+                                });
+                            }
+                        }
+                        // Refresh tasks so UI shows the state change.
+                        if let Ok(tasks) = service.list_tasks() {
+                            app.apply_event(TuiEvent::TasksReplaced { tasks });
+                        }
+                    } else {
+                        // QA failed — task stays at Chatting for retry.
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!(
+                                "{} QA validation failed — needs fixes",
+                                task_id.0
+                            ),
+                        });
+                    }
+                }
+
+                qa_agents.remove(&qa_key);
             }
         }
 
@@ -554,7 +840,24 @@ fn run() -> Result<(), MainError> {
     })?;
 
     supervisor.stop_all();
+    // Kill any running QA agents.
+    for (_key, mut qa_state) in qa_agents.drain() {
+        if let Some(mut child) = qa_state.child_handle.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
     Ok(())
+}
+
+// -- QA helpers -------------------------------------------------------------
+
+/// Extract acceptance target lines from a task QA spec.
+fn extract_targets(spec: &str) -> Vec<String> {
+    spec.lines()
+        .filter(|line| line.trim().starts_with("- "))
+        .map(|line| line.trim().strip_prefix("- ").unwrap_or(line.trim()).to_string())
+        .collect()
 }
 
 // -- QA display loading -----------------------------------------------------
