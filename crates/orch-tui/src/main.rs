@@ -1,9 +1,10 @@
 use chrono::Utc;
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
 use orch_tui::{run_tui_with_hook, AgentPaneStatus, QATestDisplay, TuiApp, TuiEvent, UiAction};
 use orchd::qa_agent;
+use orchd::stack_pipeline::{self, PipelineState};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
@@ -15,6 +16,78 @@ const DEFAULT_TICK_MS: u64 = 250;
 const DEFAULT_SQLITE_PATH: &str = ".orch/state.sqlite";
 const DEFAULT_EVENT_LOG_PATH: &str = ".orch/events";
 const CHAT_LOG_DIR: &str = ".orch/chat";
+
+// -- Pipeline subprocess tracking -------------------------------------------
+
+enum PipelineProcMsg {
+    Output(String),
+    Done { success: bool, detail: String },
+}
+
+struct PipelineProc {
+    output_rx: std::sync::mpsc::Receiver<PipelineProcMsg>,
+}
+
+fn spawn_pipeline_cmd(cmd: &str, args: &[String], cwd: &Path) -> PipelineProc {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cmd_owned = cmd.to_string();
+    let args_owned = args.to_vec();
+    let cwd_owned = cwd.to_path_buf();
+
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+
+        let child = std::process::Command::new(&cmd_owned)
+            .args(&args_owned)
+            .current_dir(&cwd_owned)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(PipelineProcMsg::Done {
+                    success: false,
+                    detail: format!("spawn failed: {e}"),
+                });
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let tx_out = tx.clone();
+        let h1 = std::thread::spawn(move || {
+            if let Some(out) = stdout {
+                for line in std::io::BufReader::new(out).lines().flatten() {
+                    let _ = tx_out.send(PipelineProcMsg::Output(line));
+                }
+            }
+        });
+
+        let tx_err = tx.clone();
+        let h2 = std::thread::spawn(move || {
+            if let Some(err) = stderr {
+                for line in std::io::BufReader::new(err).lines().flatten() {
+                    let _ = tx_err.send(PipelineProcMsg::Output(line));
+                }
+            }
+        });
+
+        let _ = h1.join();
+        let _ = h2.join();
+
+        let (success, detail) = match child.wait() {
+            Ok(s) => (s.success(), format!("exit {}", s.code().unwrap_or(-1))),
+            Err(e) => (false, format!("wait error: {e}")),
+        };
+        let _ = tx.send(PipelineProcMsg::Done { success, detail });
+    });
+
+    PipelineProc { output_rx: rx }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
@@ -196,6 +269,8 @@ fn run() -> Result<(), MainError> {
     let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
     let mut tick_counter: u32 = 0;
     let mut qa_agents: HashMap<String, qa_agent::QAState> = HashMap::new();
+    let mut pipelines: HashMap<String, PipelineState> = HashMap::new();
+    let mut pipeline_procs: HashMap<String, PipelineProc> = HashMap::new();
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let template_dir = PathBuf::from("templates/prompts");
 
@@ -416,9 +491,76 @@ fn run() -> Result<(), MainError> {
                         }
                     }
                 }
+                UiAction::SubmitTask => {
+                    if let Some(task_id) = &queued.task_id {
+                        if let Ok(Some(task)) = service.task(task_id) {
+                            if task.state == TaskState::Ready
+                                && !pipelines.contains_key(&task_id.0)
+                            {
+                                let parent_branch = task
+                                    .parent_task_id
+                                    .as_ref()
+                                    .and_then(|pid| service.task(pid).ok().flatten())
+                                    .and_then(|p| p.branch_name);
+                                let pipeline = PipelineState::new(
+                                    task_id.clone(),
+                                    task.branch_name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("task/{}", task_id.0)),
+                                    task.worktree_path.clone(),
+                                    task.submit_mode,
+                                    parent_branch,
+                                );
+                                pipelines.insert(task_id.0.clone(), pipeline);
+                                let event_id =
+                                    EventId(format!("E-SUBMITTING-{}", task_id.0));
+                                let _ = service.transition_task_state(
+                                    task_id,
+                                    TaskState::Submitting,
+                                    event_id,
+                                    Utc::now(),
+                                );
+                                let pipe_instance = format!("pipeline-{}", task_id.0);
+                                let model =
+                                    task.preferred_model.unwrap_or(ModelKind::Claude);
+                                app.apply_event(TuiEvent::AgentPaneOutput {
+                                    instance_id: pipe_instance.clone(),
+                                    task_id: task_id.clone(),
+                                    model,
+                                    lines: vec![
+                                        "[Submit pipeline starting...]".to_string(),
+                                    ],
+                                });
+                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                    instance_id: pipe_instance,
+                                    status: AgentPaneStatus::Starting,
+                                });
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} -> Submitting (manual)",
+                                        task_id.0
+                                    ),
+                                });
+                                if let Ok(tasks) = service.list_tasks() {
+                                    app.apply_event(TuiEvent::TasksReplaced { tasks });
+                                }
+                            } else {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} not Ready or pipeline already running",
+                                        task_id.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {
                     app.apply_event(TuiEvent::StatusLine {
-                        message: format!("action not yet implemented: {:?}", queued.action),
+                        message: format!(
+                            "action not yet implemented: {:?}",
+                            queued.action
+                        ),
                     });
                 }
             }
@@ -891,6 +1033,248 @@ fn run() -> Result<(), MainError> {
             }
         }
 
+        // --- Drive submit pipelines for Ready tasks ---
+
+        // Auto-create pipelines for Ready tasks that don't have one yet.
+        if let Ok(ready_tasks) = service.list_tasks_by_state(TaskState::Ready) {
+            for task in &ready_tasks {
+                if !pipelines.contains_key(&task.id.0) {
+                    let parent_branch = task
+                        .parent_task_id
+                        .as_ref()
+                        .and_then(|pid| service.task(pid).ok().flatten())
+                        .and_then(|p| p.branch_name);
+                    let pipeline = PipelineState::new(
+                        task.id.clone(),
+                        task.branch_name
+                            .clone()
+                            .unwrap_or_else(|| format!("task/{}", task.id.0)),
+                        task.worktree_path.clone(),
+                        task.submit_mode,
+                        parent_branch,
+                    );
+                    pipelines.insert(task.id.0.clone(), pipeline);
+
+                    let event_id = EventId(format!("E-SUBMITTING-{}", task.id.0));
+                    let _ = service.transition_task_state(
+                        &task.id,
+                        TaskState::Submitting,
+                        event_id,
+                        Utc::now(),
+                    );
+
+                    let pipe_instance = format!("pipeline-{}", task.id.0);
+                    let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                    app.apply_event(TuiEvent::AgentPaneOutput {
+                        instance_id: pipe_instance.clone(),
+                        task_id: task.id.clone(),
+                        model,
+                        lines: vec!["[Submit pipeline starting...]".to_string()],
+                    });
+                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                        instance_id: pipe_instance,
+                        status: AgentPaneStatus::Starting,
+                    });
+                    app.apply_event(TuiEvent::StatusLine {
+                        message: format!("{} -> Submitting (auto-pipeline)", task.id.0),
+                    });
+                }
+            }
+        }
+
+        // Drive each pipeline: spawn subprocess for next step if none running.
+        {
+            let keys: Vec<String> = pipelines.keys().cloned().collect();
+            for key in keys {
+                let pipeline = pipelines.get(&key).unwrap();
+                if pipeline.is_terminal() || pipeline_procs.contains_key(&key) {
+                    continue;
+                }
+
+                let action = stack_pipeline::next_action(pipeline);
+                let spawn_info: Option<(String, Vec<String>, PathBuf, String, TaskId)> =
+                    match &action {
+                        stack_pipeline::PipelineAction::RunVerify {
+                            worktree_path,
+                            task_id,
+                        } => {
+                            let stage = pipeline.stage.to_string();
+                            Some((
+                                "cargo".to_string(),
+                                vec!["test".to_string(), "--workspace".to_string()],
+                                worktree_path.clone(),
+                                format!("[{stage}: cargo test --workspace]"),
+                                task_id.clone(),
+                            ))
+                        }
+                        stack_pipeline::PipelineAction::StackOnParent {
+                            worktree_path,
+                            parent_branch,
+                            task_id,
+                        } => Some((
+                            "gt".to_string(),
+                            vec![
+                                "upstack".to_string(),
+                                "onto".to_string(),
+                                parent_branch.clone(),
+                            ],
+                            worktree_path.clone(),
+                            format!("[stack: gt upstack onto {parent_branch}]"),
+                            task_id.clone(),
+                        )),
+                        stack_pipeline::PipelineAction::Submit {
+                            worktree_path,
+                            mode,
+                            task_id,
+                        } => {
+                            let (args, label) = match mode {
+                                SubmitMode::Single => (
+                                    vec!["submit".to_string(), "--no-edit".to_string()],
+                                    "[submit: gt submit --no-edit]".to_string(),
+                                ),
+                                SubmitMode::Stack => (
+                                    vec!["ss".to_string(), "--no-edit".to_string()],
+                                    "[submit: gt ss --no-edit]".to_string(),
+                                ),
+                            };
+                            Some((
+                                "gt".to_string(),
+                                args,
+                                worktree_path.clone(),
+                                label,
+                                task_id.clone(),
+                            ))
+                        }
+                        stack_pipeline::PipelineAction::Complete { task_id } => {
+                            let event_id =
+                                EventId(format!("E-AWAIT-{}", task_id.0));
+                            let _ = service.transition_task_state(
+                                task_id,
+                                TaskState::AwaitingMerge,
+                                event_id,
+                                Utc::now(),
+                            );
+                            let pipe_instance = format!("pipeline-{key}");
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id: pipe_instance,
+                                status: AgentPaneStatus::Exited,
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{} -> AwaitingMerge (submitted)",
+                                    task_id.0
+                                ),
+                            });
+                            if let Ok(tasks) = service.list_tasks() {
+                                app.apply_event(TuiEvent::TasksReplaced { tasks });
+                            }
+                            None
+                        }
+                        stack_pipeline::PipelineAction::Failed {
+                            task_id,
+                            stage,
+                            error,
+                        } => {
+                            let pipe_instance = format!("pipeline-{key}");
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id: pipe_instance,
+                                status: AgentPaneStatus::Failed,
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{} pipeline failed at {}: {}",
+                                    task_id.0, stage, error
+                                ),
+                            });
+                            None
+                        }
+                    };
+
+                if let Some((cmd, args, cwd, label, task_id)) = spawn_info {
+                    let pipe_instance = format!("pipeline-{key}");
+                    let model = service
+                        .task(&task_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.preferred_model)
+                        .unwrap_or(ModelKind::Claude);
+                    app.apply_event(TuiEvent::AgentPaneOutput {
+                        instance_id: pipe_instance,
+                        task_id,
+                        model,
+                        lines: vec![label],
+                    });
+                    let proc = spawn_pipeline_cmd(&cmd, &args, &cwd);
+                    pipeline_procs.insert(key, proc);
+                }
+            }
+        }
+
+        // Poll pipeline subprocess output and completions.
+        {
+            let keys: Vec<String> = pipeline_procs.keys().cloned().collect();
+            for key in keys {
+                let proc = pipeline_procs.get(&key).unwrap();
+                let mut lines_buf = Vec::new();
+                let mut done = None;
+
+                while let Ok(msg) = proc.output_rx.try_recv() {
+                    match msg {
+                        PipelineProcMsg::Output(line) => lines_buf.push(line),
+                        PipelineProcMsg::Done { success, detail } => {
+                            done = Some((success, detail));
+                            break;
+                        }
+                    }
+                }
+
+                if !lines_buf.is_empty() {
+                    let pipe_instance = format!("pipeline-{key}");
+                    let task_id = TaskId(key.clone());
+                    let model = service
+                        .task(&task_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.preferred_model)
+                        .unwrap_or(ModelKind::Claude);
+                    app.apply_event(TuiEvent::AgentPaneOutput {
+                        instance_id: pipe_instance,
+                        task_id,
+                        model,
+                        lines: lines_buf,
+                    });
+                }
+
+                if let Some((success, detail)) = done {
+                    pipeline_procs.remove(&key);
+                    if let Some(pipeline) = pipelines.get_mut(&key) {
+                        let stage = pipeline.stage;
+                        if success {
+                            pipeline.advance();
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!("{key} pipeline: {stage} passed"),
+                            });
+                        } else {
+                            pipeline.fail(detail.clone());
+                            let pipe_instance = format!("pipeline-{key}");
+                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                instance_id: pipe_instance,
+                                status: AgentPaneStatus::Failed,
+                            });
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{key} pipeline: {stage} failed — {detail}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up terminal pipelines.
+        pipelines.retain(|_, p| !p.is_terminal());
+
         // Refresh task list periodically (every ~2s at 250ms tick).
         tick_counter = tick_counter.wrapping_add(1);
         if tick_counter.is_multiple_of(8) {
@@ -909,6 +1293,9 @@ fn run() -> Result<(), MainError> {
     })?;
 
     supervisor.stop_all();
+    // Drop pipeline subprocess trackers (threads will clean up).
+    pipeline_procs.clear();
+    pipelines.clear();
     // Kill any running QA agents.
     for (_key, mut qa_state) in qa_agents.drain() {
         if let Some(mut child) = qa_state.child_handle.take() {
