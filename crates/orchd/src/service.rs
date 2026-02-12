@@ -150,6 +150,24 @@ impl OrchdService {
         Ok(task)
     }
 
+    /// Increment the retry count for a task and store the failure reason.
+    pub fn increment_retry(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+    ) -> Result<(), ServiceError> {
+        let mut task =
+            self.store
+                .load_task(task_id)?
+                .ok_or_else(|| ServiceError::TaskNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
+        task.retry_count += 1;
+        task.last_failure_reason = Some(reason.to_string());
+        self.store.upsert_task(&task)?;
+        Ok(())
+    }
+
     /// Mark a chat as ready (coding complete, verified).
     pub fn mark_ready(
         &self,

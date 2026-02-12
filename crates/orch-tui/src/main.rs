@@ -120,6 +120,85 @@ fn print_banner() {
     eprint!("\x1b[0m");
 }
 
+fn run_qa_spec_gen_with_status(repo_root: &Path, template_dir: &Path, model: ModelKind) {
+    use orchd::qa_spec_gen::{
+        check_qa_spec_startup, QASpecStartupStatus,
+    };
+    use orchd::context_gen::parse_progress_line;
+
+    match check_qa_spec_startup(repo_root) {
+        QASpecStartupStatus::UpToDate => {
+            eprintln!("  \x1b[32mQA spec up to date \u{2713}\x1b[0m");
+            return;
+        }
+        QASpecStartupStatus::Stale => {
+            eprintln!("  \x1b[33mQA spec stale — will regenerate in background\x1b[0m");
+            return;
+        }
+        QASpecStartupStatus::Missing => {
+            eprintln!("  \x1b[33mGenerating QA spec...\x1b[0m");
+        }
+    }
+
+    let repo = repo_root.to_path_buf();
+    let tmpl = template_dir.to_path_buf();
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let ptx = progress_tx;
+        let result = orchd::qa_spec_gen::ensure_qa_spec_exists_blocking(
+            &repo,
+            &tmpl,
+            model,
+            move |line| {
+                let _ = ptx.send(line.to_string());
+            },
+        );
+        let _ = result_tx.send(result);
+    });
+
+    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let mut frame = 0usize;
+    let mut last_status = String::from("analysing repository...");
+
+    loop {
+        while let Ok(raw) = progress_rx.try_recv() {
+            if let Some(parsed) = parse_progress_line(&raw) {
+                last_status = parsed;
+            }
+        }
+
+        match result_rx.try_recv() {
+            Ok(result) => {
+                eprint!("\r\x1b[2K");
+                match result {
+                    Ok(()) => eprintln!("  \x1b[32mQA spec generated \u{2713}\x1b[0m"),
+                    Err(e) => eprintln!("  \x1b[31mQA spec generation failed: {e}\x1b[0m"),
+                }
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let spinner = spinner_frames[frame % spinner_frames.len()];
+                let display = if last_status.len() > 70 {
+                    format!("{}...", &last_status[..70])
+                } else {
+                    last_status.clone()
+                };
+                eprint!("\r\x1b[2K  \x1b[35m{spinner}\x1b[0m \x1b[2m{display}\x1b[0m");
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprint!("\r\x1b[2K");
+                eprintln!("  \x1b[31mQA spec generation failed\x1b[0m");
+                return;
+            }
+        }
+    }
+}
+
 fn run_context_gen_with_status(repo_root: &Path, template_dir: &Path, model: ModelKind) {
     use orchd::context_gen::{check_context_startup, parse_progress_line, ContextStartupStatus};
 
@@ -228,12 +307,13 @@ fn run() -> Result<(), MainError> {
     let service = OrchdService::open(&args.sqlite_path, &args.event_log_path, scheduler)
         .map_err(|e| MainError::Any(e.into()))?;
 
-    // Show banner and handle context gen before TUI takes over the terminal.
+    // Show banner and handle context gen + QA spec gen before TUI takes over the terminal.
     print_banner();
     {
         let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let template_dir = PathBuf::from("templates/prompts");
         run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude);
+        run_qa_spec_gen_with_status(&repo_root, &template_dir, ModelKind::Claude);
     }
     eprintln!();
 
@@ -1034,13 +1114,101 @@ fn run() -> Result<(), MainError> {
                             app.apply_event(TuiEvent::TasksReplaced { tasks });
                         }
                     } else {
-                        // QA failed — task stays at Chatting for retry.
-                        app.apply_event(TuiEvent::StatusLine {
-                            message: format!(
-                                "{} QA validation failed — needs fixes",
-                                task_id.0
-                            ),
-                        });
+                        // QA failed — spawn a fix agent and retry.
+                        if let Ok(Some(task)) = service.task(&task_id) {
+                            if task.retry_count < task.max_retries {
+                                // Build QA failure context and spawn fix agent.
+                                let qa_ctx =
+                                    qa_agent::build_qa_failure_context(&qa_result);
+                                let retry_prompt =
+                                    format!("{}\n\n{}", task.title, qa_ctx);
+                                let model = task
+                                    .preferred_model
+                                    .unwrap_or(ModelKind::Claude);
+                                let instance_id =
+                                    format!("agent-{}", task_id.0);
+
+                                // Stop any existing session first.
+                                supervisor.stop(&task_id);
+
+                                match supervisor.spawn_agent(
+                                    &task.id,
+                                    &task.repo_id,
+                                    &task.worktree_path,
+                                    &retry_prompt,
+                                    Some(model),
+                                ) {
+                                    Ok(()) => {
+                                        // Increment retry count.
+                                        let _ = service.increment_retry(
+                                            &task_id,
+                                            &format!(
+                                                "QA validation failed {}/{}",
+                                                qa_result.summary.passed,
+                                                qa_result.summary.total
+                                            ),
+                                        );
+
+                                        app.apply_event(
+                                            TuiEvent::AgentPaneOutput {
+                                                instance_id: instance_id
+                                                    .clone(),
+                                                task_id: task_id.clone(),
+                                                model,
+                                                lines: vec![format!(
+                                                    "[QA fix retry {}/{} — {} tests failed]",
+                                                    task.retry_count + 1,
+                                                    task.max_retries,
+                                                    qa_result.summary.failed
+                                                )],
+                                            },
+                                        );
+                                        app.apply_event(
+                                            TuiEvent::AgentPaneStatusChanged {
+                                                instance_id,
+                                                status:
+                                                    AgentPaneStatus::Starting,
+                                            },
+                                        );
+                                        app.apply_event(
+                                            TuiEvent::StatusLine {
+                                                message: format!(
+                                                    "{} QA failed — fix agent spawned (retry {}/{})",
+                                                    task_id.0,
+                                                    task.retry_count + 1,
+                                                    task.max_retries
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.apply_event(
+                                            TuiEvent::StatusLine {
+                                                message: format!(
+                                                    "{} QA failed, fix agent spawn failed: {e}",
+                                                    task_id.0
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Max retries exhausted — give up.
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "{} QA validation failed — max retries ({}) exhausted",
+                                        task_id.0, task.max_retries
+                                    ),
+                                });
+                            }
+                        } else {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "{} QA validation failed — task not found",
+                                    task_id.0
+                                ),
+                            });
+                        }
                     }
                 }
 
