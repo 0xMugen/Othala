@@ -893,4 +893,58 @@ mod tests {
         assert!(!text.iter().any(|line| line.contains("qa tests")));
         assert!(!text.iter().any(|line| line.contains("qa targets")));
     }
+
+    #[test]
+    fn format_category_tabs_shows_agent_and_qa_tabs() {
+        use crate::model::{AgentPane, PaneCategory};
+        use crate::ui_format::format_category_tabs;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![mk_row("T1")];
+        app.state.panes = vec![
+            AgentPane::new("agent-T1", TaskId("T1".to_string()), ModelKind::Claude),
+            AgentPane::new("qa-T1", TaskId("T1".to_string()), ModelKind::Claude),
+        ];
+        app.state.selected_pane_category = PaneCategory::Agent;
+
+        let tabs = format_category_tabs(&app);
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Agent"));
+        assert!(text.contains("QA"));
+        assert!(text.contains("switch"));
+    }
+
+    #[test]
+    fn format_category_tabs_highlights_selected_category() {
+        use crate::model::{AgentPane, PaneCategory};
+        use crate::ui_format::format_category_tabs;
+
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![mk_row("T1")];
+        app.state.panes = vec![
+            AgentPane::new("agent-T1", TaskId("T1".to_string()), ModelKind::Claude),
+            AgentPane::new("qa-T1", TaskId("T1".to_string()), ModelKind::Claude),
+        ];
+
+        // When Agent is selected, the Agent tab should have the selection indicator
+        app.state.selected_pane_category = PaneCategory::Agent;
+        let tabs = format_category_tabs(&app);
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        // The selection indicator (▸) should appear before "Agent"
+        let agent_pos = text.find("Agent").unwrap();
+        let qa_pos = text.find("QA").unwrap();
+        let indicator_pos = text.find('\u{25B8}').unwrap();
+        assert!(indicator_pos < agent_pos);
+        assert!(indicator_pos < qa_pos);
+
+        // When QA is selected, the indicator should be near QA
+        app.state.selected_pane_category = PaneCategory::QA;
+        let tabs = format_category_tabs(&app);
+        let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
+        let agent_pos = text.find("Agent").unwrap();
+        let qa_pos = text.find("QA").unwrap();
+        let indicator_pos = text.find('\u{25B8}').unwrap();
+        assert!(indicator_pos > agent_pos);
+        assert!(indicator_pos < qa_pos);
+    }
 }
