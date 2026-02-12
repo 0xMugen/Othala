@@ -897,4 +897,161 @@ Running tests...
         assert_eq!(format!("{}", QAType::Baseline), "baseline");
         assert_eq!(format!("{}", QAType::Validation), "validation");
     }
+
+    #[test]
+    fn drain_qa_output_accumulates_lines_and_detects_qa_complete() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = QAState::new(QAType::Baseline);
+        state.result_rx = Some(rx);
+
+        tx.send("line 1".to_string()).unwrap();
+        tx.send("running tests...".to_string()).unwrap();
+        tx.send("[qa_complete]".to_string()).unwrap();
+
+        let lines = drain_qa_output(&mut state);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line 1");
+        assert_eq!(lines[1], "running tests...");
+        assert_eq!(lines[2], "[qa_complete]");
+
+        // Lines should also be accumulated in output_buffer.
+        assert_eq!(state.output_buffer.len(), 3);
+
+        // qa_complete signal should be detected.
+        assert!(state.qa_complete);
+    }
+
+    #[test]
+    fn drain_qa_output_returns_empty_when_no_lines() {
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut state = QAState::new(QAType::Validation);
+        state.result_rx = Some(rx);
+
+        let lines = drain_qa_output(&mut state);
+        assert!(lines.is_empty());
+        assert!(state.output_buffer.is_empty());
+        assert!(!state.qa_complete);
+    }
+
+    #[test]
+    fn drain_qa_output_accumulates_across_multiple_calls() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = QAState::new(QAType::Baseline);
+        state.result_rx = Some(rx);
+
+        tx.send("first batch".to_string()).unwrap();
+        let lines1 = drain_qa_output(&mut state);
+        assert_eq!(lines1.len(), 1);
+        assert_eq!(state.output_buffer.len(), 1);
+
+        tx.send("second batch".to_string()).unwrap();
+        let lines2 = drain_qa_output(&mut state);
+        assert_eq!(lines2.len(), 1);
+        assert_eq!(state.output_buffer.len(), 2);
+        assert_eq!(state.output_buffer[0], "first batch");
+        assert_eq!(state.output_buffer[1], "second batch");
+    }
+
+    #[test]
+    fn drain_qa_output_handles_no_receiver() {
+        let mut state = QAState::new(QAType::Baseline);
+        // result_rx is None
+        let lines = drain_qa_output(&mut state);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn poll_qa_agent_returns_none_when_idle() {
+        let mut state = QAState::new(QAType::Baseline);
+        state.status = QAStatus::Idle;
+        assert!(poll_qa_agent(&mut state).is_none());
+    }
+
+    #[test]
+    fn poll_qa_agent_returns_none_when_no_child_handle() {
+        let mut state = QAState::new(QAType::Baseline);
+        // status is RunningBaseline but no child_handle
+        assert!(poll_qa_agent(&mut state).is_none());
+        assert_eq!(state.status, QAStatus::Failed);
+    }
+
+    #[test]
+    fn parse_qa_output_handles_multiple_suites() {
+        let raw = "\
+<!-- QA_META: main | abc1234 -->
+<!-- QA_RESULT: build.cargo_check | PASS | exit code 0 -->
+<!-- QA_RESULT: build.cargo_test | PASS | 42 tests passed -->
+<!-- QA_RESULT: tui.startup | PASS | tui started -->
+<!-- QA_RESULT: tui.create_chat | FAIL | branch not created -->
+<!-- QA_RESULT: database.integrity | PASS | ok -->
+";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.branch, "main");
+        assert_eq!(result.commit, "abc1234");
+        assert_eq!(result.tests.len(), 5);
+        assert_eq!(result.summary.total, 5);
+        assert_eq!(result.summary.passed, 4);
+        assert_eq!(result.summary.failed, 1);
+
+        // Verify suite/name extraction.
+        assert_eq!(result.tests[0].suite, "build");
+        assert_eq!(result.tests[0].name, "cargo_check");
+        assert_eq!(result.tests[3].suite, "tui");
+        assert_eq!(result.tests[3].name, "create_chat");
+        assert!(!result.tests[3].passed);
+    }
+
+    #[test]
+    fn parse_qa_output_handles_no_suite_prefix() {
+        let raw = "<!-- QA_RESULT: standalone_test | PASS | ok -->";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].suite, "general");
+        assert_eq!(result.tests[0].name, "standalone_test");
+    }
+
+    #[test]
+    fn parse_qa_output_handles_no_detail() {
+        let raw = "<!-- QA_RESULT: build.check | PASS -->";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.tests.len(), 1);
+        assert!(result.tests[0].passed);
+        assert!(result.tests[0].detail.is_empty());
+    }
+
+    #[test]
+    fn qa_spec_parse_long_test_name_truncated() {
+        let long_name = "a".repeat(100);
+        let content = format!("## Suite\n- {long_name}\n");
+        let spec = parse_qa_spec(&content);
+        assert_eq!(spec.tests.len(), 1);
+        assert!(spec.tests[0].name.len() <= 60);
+    }
+
+    #[test]
+    fn build_qa_prompt_with_template() {
+        let tmp = std::env::temp_dir().join(format!(
+            "othala-qa-tmpl-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("qa-validator.md"),
+            "# QA Validator Instructions\n\nRun all tests.\n",
+        )
+        .unwrap();
+
+        let baseline = QASpec {
+            raw: "## Build\n- check cargo\n".to_string(),
+            tests: vec![],
+        };
+
+        let prompt = build_qa_prompt(&baseline, None, None, std::path::Path::new("/repo"), &tmp);
+        assert!(prompt.contains("QA Validator Instructions"));
+        assert!(prompt.contains("QA Baseline Spec"));
+        assert!(prompt.contains("check cargo"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

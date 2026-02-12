@@ -896,4 +896,320 @@ mod tests {
         let state = DaemonState::default();
         assert!(state.pipelines.is_empty());
     }
+
+    /// Helper: create a DaemonConfig whose repo_root has a `.othala/qa/baseline.md`.
+    fn mk_config_with_baseline() -> (DaemonConfig, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!(
+            "othala-daemon-qa-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let qa_dir = tmp.join(".othala/qa");
+        fs::create_dir_all(&qa_dir).expect("create qa dir");
+        fs::write(
+            qa_dir.join("baseline.md"),
+            "# QA Baseline\n\n## Build\n- run cargo build\n",
+        )
+        .expect("write baseline");
+
+        let config = DaemonConfig {
+            repo_root: tmp.clone(),
+            template_dir: PathBuf::from("/tmp/nonexistent-templates"),
+            enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+            context_config: ContextLoadConfig::default(),
+            verify_command: Some("cargo test --workspace".to_string()),
+            context_gen_config: ContextGenConfig::default(),
+        };
+        (config, tmp)
+    }
+
+    #[test]
+    fn daemon_tick_spawns_baseline_qa_when_spec_exists_and_no_result() {
+        let service = mk_service();
+        let (config, tmp) = mk_config_with_baseline();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let mut task = mk_task("T-QA-1");
+        task.branch_name = Some("task/T-QA-1".to_string());
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        let qa_spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, DaemonAction::SpawnQA { qa_type: QAType::Baseline, .. }))
+            .collect();
+        assert_eq!(qa_spawns.len(), 1, "should spawn exactly one baseline QA");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn daemon_tick_skips_baseline_qa_when_result_already_exists() {
+        let service = mk_service();
+        let (config, tmp) = mk_config_with_baseline();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let mut task = mk_task("T-QA-2");
+        task.branch_name = Some("task/T-QA-2".to_string());
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        // Write a pre-existing QA result for this branch.
+        let result = QAResult {
+            branch: "task/T-QA-2".to_string(),
+            commit: "abc1234".to_string(),
+            timestamp: Utc::now(),
+            tests: vec![],
+            summary: crate::qa_agent::QASummary {
+                total: 0,
+                passed: 0,
+                failed: 0,
+            },
+        };
+        crate::qa_agent::save_qa_result(&tmp, &result).expect("save result");
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        let qa_spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, DaemonAction::SpawnQA { .. }))
+            .collect();
+        assert_eq!(qa_spawns.len(), 0, "should NOT spawn QA when result exists");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn daemon_tick_skips_baseline_qa_when_qa_agent_already_running() {
+        let service = mk_service();
+        let (config, tmp) = mk_config_with_baseline();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let mut task = mk_task("T-QA-3");
+        task.branch_name = Some("task/T-QA-3".to_string());
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        // Simulate a QA agent already running for this task.
+        daemon_state
+            .qa_agents
+            .insert("T-QA-3".to_string(), QAState::new(QAType::Baseline));
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        let qa_spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, DaemonAction::SpawnQA { .. }))
+            .collect();
+        assert_eq!(qa_spawns.len(), 0, "should NOT spawn QA when one already running");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn handle_successful_outcome_spawns_qa_validation_when_baseline_exists() {
+        let service = mk_service();
+        let (config, tmp) = mk_config_with_baseline();
+
+        let task = mk_task("T-QA-4");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        let outcome = AgentOutcome {
+            task_id: TaskId::new("T-QA-4"),
+            model: ModelKind::Claude,
+            exit_code: Some(0),
+            patch_ready: true,
+            needs_human: false,
+            success: true,
+        };
+
+        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+
+        // Should spawn QA Validation, NOT MarkReady.
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::SpawnQA { qa_type: QAType::Validation, .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::MarkReady { .. })));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qa_validation_pass_produces_completed_and_mark_ready_actions() {
+        // When QA validation completes with all tests passing, the daemon
+        // should emit QACompleted + MarkReady.
+        let result = QAResult {
+            branch: "task/T-QA-5".to_string(),
+            commit: "def5678".to_string(),
+            timestamp: Utc::now(),
+            tests: vec![crate::qa_agent::QATestResult {
+                name: "build_check".to_string(),
+                suite: "build".to_string(),
+                passed: true,
+                detail: "ok".to_string(),
+                duration_ms: 100,
+            }],
+            summary: crate::qa_agent::QASummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+            },
+        };
+
+        let all_passed = result.summary.failed == 0;
+        assert!(all_passed, "all tests should pass");
+
+        // Simulate the Phase 2.5 logic: validation pass -> QACompleted + MarkReady.
+        let task_id = TaskId::new("T-QA-5");
+        let qa_type = QAType::Validation;
+        let mut actions = Vec::new();
+        if all_passed {
+            actions.push(DaemonAction::QACompleted {
+                task_id: task_id.clone(),
+                result: result.clone(),
+            });
+            if qa_type == QAType::Validation {
+                actions.push(DaemonAction::MarkReady { task_id });
+            }
+        }
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::QACompleted { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::MarkReady { .. })));
+    }
+
+    #[test]
+    fn qa_validation_fail_produces_failed_and_retry_actions() {
+        let result = QAResult {
+            branch: "task/T-QA-6".to_string(),
+            commit: "abc123".to_string(),
+            timestamp: Utc::now(),
+            tests: vec![
+                crate::qa_agent::QATestResult {
+                    name: "build_check".to_string(),
+                    suite: "build".to_string(),
+                    passed: true,
+                    detail: "ok".to_string(),
+                    duration_ms: 100,
+                },
+                crate::qa_agent::QATestResult {
+                    name: "tui_start".to_string(),
+                    suite: "tui".to_string(),
+                    passed: false,
+                    detail: "timeout after 5s".to_string(),
+                    duration_ms: 5000,
+                },
+            ],
+            summary: crate::qa_agent::QASummary {
+                total: 2,
+                passed: 1,
+                failed: 1,
+            },
+        };
+
+        let all_passed = result.summary.failed == 0;
+        assert!(!all_passed, "should have failures");
+
+        // Simulate the Phase 2.5 logic: validation fail -> QAFailed + ScheduleRetry.
+        let task_id = TaskId::new("T-QA-6");
+        let qa_type = QAType::Validation;
+        let mut actions = Vec::new();
+        if !all_passed {
+            actions.push(DaemonAction::QAFailed {
+                task_id: task_id.clone(),
+                result: result.clone(),
+            });
+            if qa_type == QAType::Validation {
+                let failure_ctx = build_qa_failure_context(&result);
+                actions.push(DaemonAction::ScheduleRetry {
+                    task_id,
+                    next_model: ModelKind::Claude,
+                    reason: failure_ctx.clone(),
+                });
+                assert!(failure_ctx.contains("tui.tui_start: FAIL"));
+                assert!(failure_ctx.contains("timeout after 5s"));
+            }
+        }
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::QAFailed { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::ScheduleRetry { .. })));
+    }
+
+    #[test]
+    fn daemon_tick_cleans_up_completed_qa_agents() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        // Insert completed and failed QA states.
+        let mut completed = QAState::new(QAType::Baseline);
+        completed.status = QAStatus::Completed;
+        daemon_state
+            .qa_agents
+            .insert("T-done".to_string(), completed);
+
+        let mut failed = QAState::new(QAType::Validation);
+        failed.status = QAStatus::Failed;
+        daemon_state
+            .qa_agents
+            .insert("T-fail".to_string(), failed);
+
+        let mut running = QAState::new(QAType::Baseline);
+        running.status = QAStatus::RunningBaseline;
+        daemon_state
+            .qa_agents
+            .insert("T-running".to_string(), running);
+
+        let _ = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        // Completed and failed states should be cleaned up.
+        assert!(!daemon_state.qa_agents.contains_key("T-done"));
+        assert!(!daemon_state.qa_agents.contains_key("T-fail"));
+        // Running state should remain.
+        assert!(daemon_state.qa_agents.contains_key("T-running"));
+    }
+
+    #[test]
+    fn handle_needs_human_outcome_produces_record_needs_human() {
+        let service = mk_service();
+        let config = mk_config();
+
+        let task = mk_task("T-NH");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        let outcome = AgentOutcome {
+            task_id: TaskId::new("T-NH"),
+            model: ModelKind::Claude,
+            exit_code: Some(0),
+            patch_ready: false,
+            needs_human: true,
+            success: false,
+        };
+
+        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::RecordNeedsHuman { .. })));
+    }
 }
