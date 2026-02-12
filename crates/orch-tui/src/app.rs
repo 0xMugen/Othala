@@ -163,6 +163,14 @@ impl TuiApp {
                     self.state.scroll_down(1);
                     return;
                 }
+                KeyCode::Left | KeyCode::Right => {
+                    self.state.toggle_pane_category();
+                    if self.state.focused_pane_idx.is_some() {
+                        self.state.focused_pane_idx = Some(self.state.selected_pane_idx);
+                    }
+                    self.state.scroll_back = 0;
+                    return;
+                }
                 KeyCode::PageUp => {
                     self.state.scroll_up(20);
                     return;

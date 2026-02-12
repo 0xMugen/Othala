@@ -71,6 +71,31 @@ impl TaskOverviewRow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCategory {
+    #[default]
+    Agent,
+    QA,
+}
+
+/// Check whether a pane instance ID belongs to a given category.
+pub fn pane_matches_category(instance_id: &str, category: PaneCategory) -> bool {
+    match category {
+        PaneCategory::Agent => !instance_id.starts_with("qa-"),
+        PaneCategory::QA => instance_id.starts_with("qa-"),
+    }
+}
+
+/// Infer the category of a pane from its instance ID.
+pub fn pane_category_of(instance_id: &str) -> PaneCategory {
+    if instance_id.starts_with("qa-") {
+        PaneCategory::QA
+    } else {
+        PaneCategory::Agent
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPaneStatus {
@@ -268,6 +293,8 @@ pub struct DashboardState {
     pub status_line: String,
     /// Lines scrolled back from the bottom in focused views.
     pub scroll_back: usize,
+    /// Which pane category (Agent / QA) is currently selected.
+    pub selected_pane_category: PaneCategory,
 }
 
 impl Default for DashboardState {
@@ -282,6 +309,7 @@ impl Default for DashboardState {
             focused_task: false,
             status_line: "ready".to_string(),
             scroll_back: 0,
+            selected_pane_category: PaneCategory::Agent,
         }
     }
 }
@@ -329,76 +357,64 @@ impl DashboardState {
         self.snap_pane_to_task();
     }
 
-    /// Jump `selected_pane_idx` to the first pane belonging to the selected task.
-    fn snap_pane_to_task(&mut self) {
+    /// Find the pane index matching a task + category.
+    pub fn pane_index_for_task_category(
+        &self,
+        task_id: &TaskId,
+        category: PaneCategory,
+    ) -> Option<usize> {
+        self.panes
+            .iter()
+            .position(|p| p.task_id == *task_id && pane_matches_category(&p.instance_id, category))
+    }
+
+    /// Check whether a pane exists for the given task + category.
+    pub fn has_pane_in_category(&self, task_id: &TaskId, category: PaneCategory) -> bool {
+        self.panes
+            .iter()
+            .any(|p| p.task_id == *task_id && pane_matches_category(&p.instance_id, category))
+    }
+
+    /// Toggle between Agent and QA pane categories, updating `selected_pane_idx`.
+    pub fn toggle_pane_category(&mut self) {
+        self.selected_pane_category = match self.selected_pane_category {
+            PaneCategory::Agent => PaneCategory::QA,
+            PaneCategory::QA => PaneCategory::Agent,
+        };
         if let Some(task) = self.tasks.get(self.selected_task_idx) {
-            let tid = &task.task_id;
-            if let Some(idx) = self.panes.iter().position(|p| &p.task_id == tid) {
+            let tid = task.task_id.clone();
+            if let Some(idx) =
+                self.pane_index_for_task_category(&tid, self.selected_pane_category)
+            {
                 self.selected_pane_idx = idx;
             }
         }
     }
 
-    pub fn move_pane_selection_next(&mut self) {
-        if self.panes.is_empty() {
-            self.selected_pane_idx = 0;
-            return;
-        }
-        // Scope navigation to panes belonging to the selected task.
-        if let Some(task) = self.selected_task() {
-            let task_id = task.task_id.clone();
-            let indices: Vec<usize> = self
-                .panes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.task_id == task_id)
-                .map(|(i, _)| i)
-                .collect();
-            if !indices.is_empty() {
-                let cur = indices
-                    .iter()
-                    .position(|&i| i == self.selected_pane_idx)
-                    .unwrap_or(0);
-                self.selected_pane_idx = indices[(cur + 1) % indices.len()];
-                return;
+    /// Jump `selected_pane_idx` to the first pane belonging to the selected task,
+    /// preferring the current category.
+    fn snap_pane_to_task(&mut self) {
+        if let Some(task) = self.tasks.get(self.selected_task_idx) {
+            let tid = &task.task_id;
+            // Try current category first.
+            if let Some(idx) =
+                self.pane_index_for_task_category(tid, self.selected_pane_category)
+            {
+                self.selected_pane_idx = idx;
+            } else if let Some(idx) = self.panes.iter().position(|p| &p.task_id == tid) {
+                // Fall back to first pane and update category.
+                self.selected_pane_idx = idx;
+                self.selected_pane_category = pane_category_of(&self.panes[idx].instance_id);
             }
         }
-        self.selected_pane_idx = (self.selected_pane_idx + 1) % self.panes.len();
+    }
+
+    pub fn move_pane_selection_next(&mut self) {
+        self.toggle_pane_category();
     }
 
     pub fn move_pane_selection_previous(&mut self) {
-        if self.panes.is_empty() {
-            self.selected_pane_idx = 0;
-            return;
-        }
-        // Scope navigation to panes belonging to the selected task.
-        if let Some(task) = self.selected_task() {
-            let task_id = task.task_id.clone();
-            let indices: Vec<usize> = self
-                .panes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.task_id == task_id)
-                .map(|(i, _)| i)
-                .collect();
-            if !indices.is_empty() {
-                let cur = indices
-                    .iter()
-                    .position(|&i| i == self.selected_pane_idx)
-                    .unwrap_or(0);
-                self.selected_pane_idx = if cur == 0 {
-                    indices[indices.len() - 1]
-                } else {
-                    indices[cur - 1]
-                };
-                return;
-            }
-        }
-        self.selected_pane_idx = if self.selected_pane_idx == 0 {
-            self.panes.len() - 1
-        } else {
-            self.selected_pane_idx - 1
-        };
+        self.toggle_pane_category();
     }
 
     pub fn pane_window_with_history(

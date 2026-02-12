@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, AgentPaneStatus, QATestDisplay, TaskOverviewRow};
+use crate::model::{AgentPane, AgentPaneStatus, PaneCategory, QATestDisplay, TaskOverviewRow};
 
 const ACCENT: Color = Color::Cyan;
 const HEADER_FG: Color = Color::White;
@@ -108,6 +108,7 @@ pub(crate) fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) 
     ])
 }
 
+#[allow(dead_code)] // Used in ui.rs tests
 pub(crate) fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
     if app.state.panes.is_empty() {
         return Line::from(Span::styled(" none", Style::default().fg(DIM)));
@@ -151,6 +152,55 @@ pub(crate) fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
         spans.push(Span::styled(format!("{tag} "), status_style));
         spans.push(Span::styled(format!("{}l ", pane.lines.len()), meta_style));
     }
+    Line::from(spans)
+}
+
+pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
+    let selected = app.state.selected_pane_category;
+    let task_id = app.state.selected_task().map(|t| &t.task_id);
+
+    let has_agent = task_id
+        .map_or(false, |tid| app.state.has_pane_in_category(tid, PaneCategory::Agent));
+    let has_qa = task_id
+        .map_or(false, |tid| app.state.has_pane_in_category(tid, PaneCategory::QA));
+
+    let sel_style = Style::default()
+        .fg(Color::White)
+        .bg(SELECTED_BG)
+        .add_modifier(Modifier::BOLD);
+    let active_style = Style::default().fg(MUTED);
+    let dim_style = Style::default().fg(DIM);
+
+    let mut spans = Vec::new();
+    spans.push(Span::raw(" "));
+
+    // Agent tab
+    let agent_sel = selected == PaneCategory::Agent;
+    if agent_sel {
+        spans.push(Span::styled("\u{25B8} ", Style::default().fg(ACCENT)));
+        spans.push(Span::styled(" Agent ", sel_style));
+    } else if has_agent {
+        spans.push(Span::styled("  Agent ", active_style));
+    } else {
+        spans.push(Span::styled("  Agent ", dim_style));
+    }
+
+    spans.push(Span::styled(" \u{2502} ", Style::default().fg(DIM)));
+
+    // QA tab
+    let qa_sel = selected == PaneCategory::QA;
+    if qa_sel {
+        spans.push(Span::styled("\u{25B8} ", Style::default().fg(ACCENT)));
+        spans.push(Span::styled(" QA ", sel_style));
+    } else if has_qa {
+        spans.push(Span::styled("  QA ", active_style));
+    } else {
+        spans.push(Span::styled("  QA ", dim_style));
+    }
+
+    // Hint
+    spans.push(Span::styled("  \u{2190}\u{2192} switch", Style::default().fg(DIM)));
+
     Line::from(spans)
 }
 

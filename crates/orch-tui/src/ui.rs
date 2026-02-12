@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::app::TuiApp;
 use crate::chat_parse;
 use crate::chat_render;
-use crate::model::AgentPane;
+use crate::model::{AgentPane, PaneCategory};
 use crate::output_style::stylize_output_lines;
 use crate::ui_activity::pane_activity_indicator;
 #[cfg(test)]
@@ -16,10 +16,10 @@ use crate::ui_activity::status_activity;
 use crate::ui_footer::wrapped_visual_line_count;
 use crate::ui_footer::{build_footer_content, footer_height};
 use crate::ui_format::{
-    divider_line, format_pane_tabs, format_task_row, pane_meta_lines, status_sidebar_lines,
+    divider_line, format_category_tabs, format_task_row, pane_meta_lines, status_sidebar_lines,
 };
 #[cfg(test)]
-use crate::ui_format::{pane_status_tag, status_line_color, to_local_time};
+use crate::ui_format::{format_pane_tabs, pane_status_tag, status_line_color, to_local_time};
 
 // -- Color palette ----------------------------------------------------------
 
@@ -178,9 +178,9 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
 
-    let pane_tabs = format_pane_tabs(app);
+    let pane_tabs = format_category_tabs(app);
     let tabs = Paragraph::new(pane_tabs)
-        .block(normal_block("Agent Panes"))
+        .block(normal_block("Panes"))
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
@@ -344,12 +344,12 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .map(|t| t.task_id.0.clone())
         .unwrap_or_else(|| "-".to_string());
 
-    // Find the agent pane for this task.
+    // Find the pane for the currently selected category.
     let task_pane_idx = selected_task.and_then(|task| {
-        app.state
-            .panes
-            .iter()
-            .position(|p| p.task_id == task.task_id)
+        app.state.pane_index_for_task_category(
+            &task.task_id,
+            app.state.selected_pane_category,
+        )
     });
     let task_pane = task_pane_idx.and_then(|idx| app.state.panes.get(idx));
 
@@ -358,18 +358,20 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    // Split right column: chat content, activity indicator, input box
+    // Split right column: category tabs, chat content, activity indicator, input box
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Min(5),
             Constraint::Length(1),
             Constraint::Length(3),
         ])
         .split(cols[1]);
-    let chat_area = right_chunks[0];
-    let activity_area = right_chunks[1];
-    let input_area = right_chunks[2];
+    let tab_area = right_chunks[0];
+    let chat_area = right_chunks[1];
+    let activity_area = right_chunks[2];
+    let input_area = right_chunks[3];
 
     let viewport_height = chat_area.height.saturating_sub(2) as usize;
     let scroll_back = app.state.scroll_back;
@@ -384,7 +386,19 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
 
-    // Right: agent PTY output
+    // Right top: category tabs
+    let cat_tabs = format_category_tabs(app);
+    let tabs_widget = Paragraph::new(cat_tabs)
+        .block(normal_block("Panes"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(tabs_widget, tab_area);
+
+    // Right: pane PTY output (Agent or QA based on selected category)
+    let category_label = match app.state.selected_pane_category {
+        PaneCategory::Agent => "Agent",
+        PaneCategory::QA => "QA",
+    };
+
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
         let mut lines = pane_meta_lines(pane, Some(scroll_back));
         lines.push(divider_line(chat_area.width));
@@ -396,11 +410,15 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             })
             .unwrap_or_default();
         extend_rendered_chat(&mut lines, &window, chat_area.width);
-        (format!("Agent {}", pane.instance_id), lines)
+        (format!("{category_label} {}", pane.instance_id), lines)
     } else {
+        let no_pane_msg = match app.state.selected_pane_category {
+            PaneCategory::Agent => "no agent running for this task",
+            PaneCategory::QA => "no QA agent running for this task",
+        };
         (
-            format!("Agent (task={task_id_str})"),
-            vec![Line::from("no agent running for this task")],
+            format!("{category_label} (task={task_id_str})"),
+            vec![Line::from(no_pane_msg)],
         )
     };
 
