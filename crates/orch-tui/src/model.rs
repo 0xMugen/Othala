@@ -669,4 +669,172 @@ mod tests {
         state.scroll_up(50);
         assert!(state.scroll_back > state.panes[1].lines.len());
     }
+
+    #[test]
+    fn pane_matches_category_classifies_by_prefix() {
+        assert!(pane_matches_category("agent-T1", PaneCategory::Agent));
+        assert!(!pane_matches_category("agent-T1", PaneCategory::QA));
+        assert!(pane_matches_category("qa-T1", PaneCategory::QA));
+        assert!(!pane_matches_category("qa-T1", PaneCategory::Agent));
+        assert!(pane_matches_category("pipeline-T1", PaneCategory::Agent));
+    }
+
+    #[test]
+    fn pane_category_of_infers_from_instance_id() {
+        assert_eq!(pane_category_of("agent-T1"), PaneCategory::Agent);
+        assert_eq!(pane_category_of("qa-T1"), PaneCategory::QA);
+        assert_eq!(pane_category_of("pipeline-T1"), PaneCategory::Agent);
+        assert_eq!(pane_category_of("qa-post-T1"), PaneCategory::QA);
+    }
+
+    #[test]
+    fn toggle_pane_category_switches_between_agent_and_qa() {
+        let mut state = DashboardState::default();
+        assert_eq!(state.selected_pane_category, PaneCategory::Agent);
+
+        state.toggle_pane_category();
+        assert_eq!(state.selected_pane_category, PaneCategory::QA);
+
+        state.toggle_pane_category();
+        assert_eq!(state.selected_pane_category, PaneCategory::Agent);
+    }
+
+    #[test]
+    fn toggle_pane_category_snaps_to_matching_pane() {
+        let mut state = DashboardState {
+            tasks: vec![TaskOverviewRow::from_task(&mk_task("T1"))],
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent output"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa output"]),
+            ],
+            selected_task_idx: 0,
+            selected_pane_idx: 0,
+            selected_pane_category: PaneCategory::Agent,
+            ..DashboardState::default()
+        };
+
+        // Toggle to QA — should snap to the QA pane
+        state.toggle_pane_category();
+        assert_eq!(state.selected_pane_category, PaneCategory::QA);
+        assert_eq!(state.selected_pane_idx, 1);
+
+        // Toggle back to Agent — should snap to the Agent pane
+        state.toggle_pane_category();
+        assert_eq!(state.selected_pane_category, PaneCategory::Agent);
+        assert_eq!(state.selected_pane_idx, 0);
+    }
+
+    #[test]
+    fn pane_index_for_task_category_finds_correct_pane() {
+        let state = DashboardState {
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
+                pane_with_lines("agent-T2", "T2", ModelKind::Codex, &["agent2"]),
+            ],
+            ..DashboardState::default()
+        };
+
+        let tid = TaskId("T1".to_string());
+        assert_eq!(state.pane_index_for_task_category(&tid, PaneCategory::Agent), Some(0));
+        assert_eq!(state.pane_index_for_task_category(&tid, PaneCategory::QA), Some(1));
+
+        let tid2 = TaskId("T2".to_string());
+        assert_eq!(state.pane_index_for_task_category(&tid2, PaneCategory::Agent), Some(2));
+        assert_eq!(state.pane_index_for_task_category(&tid2, PaneCategory::QA), None);
+    }
+
+    #[test]
+    fn has_pane_in_category_checks_existence() {
+        let state = DashboardState {
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
+            ],
+            ..DashboardState::default()
+        };
+
+        let tid = TaskId("T1".to_string());
+        assert!(state.has_pane_in_category(&tid, PaneCategory::Agent));
+        assert!(state.has_pane_in_category(&tid, PaneCategory::QA));
+
+        let tid2 = TaskId("T2".to_string());
+        assert!(!state.has_pane_in_category(&tid2, PaneCategory::Agent));
+        assert!(!state.has_pane_in_category(&tid2, PaneCategory::QA));
+    }
+
+    #[test]
+    fn snap_pane_to_task_prefers_current_category() {
+        let mut state = DashboardState {
+            tasks: vec![
+                TaskOverviewRow::from_task(&mk_task("T1")),
+                TaskOverviewRow::from_task(&mk_task("T2")),
+            ],
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["a1"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["q1"]),
+                pane_with_lines("agent-T2", "T2", ModelKind::Codex, &["a2"]),
+                pane_with_lines("qa-T2", "T2", ModelKind::Codex, &["q2"]),
+            ],
+            selected_task_idx: 0,
+            selected_pane_idx: 0,
+            selected_pane_category: PaneCategory::QA,
+            ..DashboardState::default()
+        };
+
+        // Move to T2 — should snap to QA pane for T2 (current category)
+        state.move_task_selection_next();
+        assert_eq!(state.selected_task_idx, 1);
+        assert_eq!(state.selected_pane_idx, 3); // qa-T2
+        assert_eq!(state.selected_pane_category, PaneCategory::QA);
+    }
+
+    #[test]
+    fn snap_pane_to_task_falls_back_when_category_missing() {
+        let mut state = DashboardState {
+            tasks: vec![
+                TaskOverviewRow::from_task(&mk_task("T1")),
+                TaskOverviewRow::from_task(&mk_task("T2")),
+            ],
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["a1"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["q1"]),
+                pane_with_lines("agent-T2", "T2", ModelKind::Codex, &["a2"]),
+                // No QA pane for T2
+            ],
+            selected_task_idx: 0,
+            selected_pane_idx: 1, // qa-T1
+            selected_pane_category: PaneCategory::QA,
+            ..DashboardState::default()
+        };
+
+        // Move to T2 — QA not available, should fall back to Agent pane
+        state.move_task_selection_next();
+        assert_eq!(state.selected_task_idx, 1);
+        assert_eq!(state.selected_pane_idx, 2); // agent-T2
+        assert_eq!(state.selected_pane_category, PaneCategory::Agent);
+    }
+
+    #[test]
+    fn move_pane_selection_toggles_category() {
+        let mut state = DashboardState {
+            tasks: vec![TaskOverviewRow::from_task(&mk_task("T1"))],
+            panes: vec![
+                pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent"]),
+                pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
+            ],
+            selected_task_idx: 0,
+            selected_pane_idx: 0,
+            selected_pane_category: PaneCategory::Agent,
+            ..DashboardState::default()
+        };
+
+        state.move_pane_selection_next();
+        assert_eq!(state.selected_pane_category, PaneCategory::QA);
+        assert_eq!(state.selected_pane_idx, 1);
+
+        state.move_pane_selection_previous();
+        assert_eq!(state.selected_pane_category, PaneCategory::Agent);
+        assert_eq!(state.selected_pane_idx, 0);
+    }
 }

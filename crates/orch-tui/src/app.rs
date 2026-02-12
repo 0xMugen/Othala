@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use crate::action::{action_label, map_key_to_command, UiAction, UiCommand};
 use crate::event::TuiEvent;
-use crate::model::{AgentPane, AgentPaneStatus, DashboardState};
+use crate::model::{pane_category_of, AgentPane, AgentPaneStatus, DashboardState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedAction {
@@ -526,11 +526,19 @@ impl TuiApp {
             return idx;
         }
 
+        // Only reuse a non-running pane for the same task AND same category
+        // (agent vs QA). This prevents QA from overwriting agent pane slots
+        // and vice versa.
+        let new_category = pane_category_of(instance_id);
         if let Some(idx) = self
             .state
             .panes
             .iter()
-            .position(|pane| pane.task_id == task_id && pane.status != AgentPaneStatus::Running)
+            .position(|pane| {
+                pane.task_id == task_id
+                    && pane.status != AgentPaneStatus::Running
+                    && pane_category_of(&pane.instance_id) == new_category
+            })
         {
             let pane = &mut self.state.panes[idx];
             pane.instance_id = instance_id.to_string();
@@ -1171,6 +1179,256 @@ mod tests {
     }
 
     #[test]
+    fn chat_input_key_enters_chat_mode_and_enter_queues_send() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        // Press 'i' to enter chat input mode
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::ChatInput { .. }
+        ));
+        assert_eq!(
+            app.state.status_line,
+            "chat input: type message, Enter=send Esc=cancel"
+        );
+
+        // Type a message
+        for ch in "fix the bug".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input_prompt(), Some("fix the bug"));
+        assert_eq!(
+            app.chat_input_display(),
+            Some(("fix the bug", &TaskId("T1".to_string())))
+        );
+
+        // Press Enter to send
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(
+            app.state.status_line,
+            "queued action=send_chat_message task=T1"
+        );
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::SendChatMessage);
+        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
+        assert_eq!(drained[0].prompt.as_deref(), Some("fix the bug"));
+        assert_eq!(drained[0].model, None);
+    }
+
+    #[test]
+    fn chat_input_escape_cancels_without_queueing_action() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "partial msg".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "chat input canceled");
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn chat_input_empty_message_is_rejected() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        // Press Enter immediately with empty buffer
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Should stay in ChatInput mode, not queue anything
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::ChatInput { .. }
+        ));
+        assert_eq!(app.state.status_line, "chat message cannot be empty");
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn chat_input_whitespace_only_message_is_rejected() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        // Type only spaces
+        for _ in 0..3 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::ChatInput { .. }
+        ));
+        assert_eq!(app.state.status_line, "chat message cannot be empty");
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn chat_input_backspace_removes_characters() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "hello".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input_prompt(), Some("hello"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("hel"));
+
+        // Backspace on empty buffer does nothing
+        for _ in 0..10 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(app.input_prompt(), Some(""));
+    }
+
+    #[test]
+    fn chat_input_control_chars_are_ignored() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        // Ctrl+C should not add to buffer
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        assert_eq!(app.input_prompt(), Some("ab"));
+    }
+
+    #[test]
+    fn chat_input_no_task_selected_shows_error() {
+        let mut app = TuiApp::default();
+        // No tasks in list
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        // Should stay in Normal mode
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert_eq!(app.state.status_line, "no task selected for chat");
+    }
+
+    #[test]
+    fn chat_input_paste_appends_multiline_text() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_paste("line 1\r\nline 2\nline 3");
+        assert_eq!(app.input_prompt(), Some("line 1\nline 2\nline 3"));
+    }
+
+    #[test]
+    fn chat_input_display_returns_none_in_normal_mode() {
+        let app = TuiApp::default();
+        assert!(app.chat_input_display().is_none());
+    }
+
+    #[test]
     fn tasks_replaced_preserves_qa_data() {
         use crate::model::QATestDisplay;
         use orch_core::types::Task;
@@ -1213,5 +1471,108 @@ mod tests {
         assert_eq!(row.qa_status.as_deref(), Some("baseline running"));
         assert_eq!(row.qa_tests.len(), 1);
         assert_eq!(row.qa_targets, vec!["check endpoint"]);
+    }
+
+    #[test]
+    fn ensure_pane_index_does_not_reuse_qa_pane_for_agent_output() {
+        let mut app = TuiApp::default();
+
+        // Create an exited QA pane for T1.
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "qa-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["qa baseline".to_string()],
+        });
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "qa-T1".to_string(),
+            status: AgentPaneStatus::Exited,
+        });
+
+        // Now send agent output for T1 — should NOT reuse the QA pane.
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["agent work".to_string()],
+        });
+
+        // Should have 2 separate panes.
+        assert_eq!(app.state.panes.len(), 2);
+        assert_eq!(app.state.panes[0].instance_id, "qa-T1");
+        assert_eq!(app.state.panes[1].instance_id, "agent-T1");
+    }
+
+    #[test]
+    fn ensure_pane_index_reuses_same_category_pane() {
+        let mut app = TuiApp::default();
+
+        // Create an exited agent pane for T1.
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["first run".to_string()],
+        });
+        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+            instance_id: "agent-T1".to_string(),
+            status: AgentPaneStatus::Exited,
+        });
+
+        // New agent output for same task — should reuse the exited agent pane.
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1-retry".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["retry run".to_string()],
+        });
+
+        // Should still be 1 pane (reused).
+        assert_eq!(app.state.panes.len(), 1);
+        assert_eq!(app.state.panes[0].instance_id, "agent-T1-retry");
+        assert_eq!(app.state.panes[0].model, ModelKind::Codex);
+        assert_eq!(app.state.panes[0].status, AgentPaneStatus::Running);
+    }
+
+    #[test]
+    fn left_right_arrow_keys_toggle_pane_category_in_focused_task_view() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.state.focused_task = true;
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::Agent
+        );
+
+        // Right arrow should toggle to QA
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::QA
+        );
+        assert_eq!(app.state.scroll_back, 0);
+
+        // Left arrow should toggle back to Agent
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::Agent
+        );
+
+        // Ensure no actions were queued (arrows don't dispatch actions)
+        assert!(app.drain_actions().is_empty());
     }
 }
