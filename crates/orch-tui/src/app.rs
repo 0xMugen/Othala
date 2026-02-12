@@ -315,7 +315,19 @@ impl TuiApp {
         }
     }
 
+    fn last_chat_message(&self) -> Option<String> {
+        last_chat_message_in_panes(&self.state.panes)
+    }
+
     fn handle_input_mode_key(&mut self, key: KeyEvent) -> bool {
+        let recalled_message = if matches!(self.input_mode, InputMode::NewChatPrompt { .. })
+            && key.code == KeyCode::Up
+        {
+            self.last_chat_message()
+        } else {
+            None
+        };
+
         match &mut self.input_mode {
             InputMode::Normal => return false,
             InputMode::NewChatPrompt { buffer } => match key.code {
@@ -336,6 +348,11 @@ impl TuiApp {
                     };
                     self.state.status_line =
                         "select model: Up/Down=cycle Enter=confirm Esc=cancel".to_string();
+                }
+                KeyCode::Up => {
+                    if let Some(message) = recalled_message {
+                        *buffer = message;
+                    }
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -543,6 +560,45 @@ impl TuiApp {
 
 fn normalize_paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn last_chat_message_in_panes(panes: &[AgentPane]) -> Option<String> {
+    panes
+        .iter()
+        .filter_map(|pane| {
+            last_user_message_in_lines(&pane.lines).map(|message| (pane.updated_at, message))
+        })
+        .max_by_key(|(updated_at, _)| *updated_at)
+        .map(|(_, message)| message)
+}
+
+fn last_user_message_in_lines(lines: &VecDeque<String>) -> Option<String> {
+    let mut collected = Vec::new();
+    let mut capturing = false;
+
+    for line in lines.iter().rev() {
+        if let Some(content) = line.strip_prefix("> ") {
+            capturing = true;
+            collected.push(content.to_string());
+            continue;
+        }
+
+        if capturing {
+            break;
+        }
+    }
+
+    if collected.is_empty() {
+        return None;
+    }
+
+    collected.reverse();
+    let message = collected.join("\n").trim().to_string();
+    if message.is_empty() {
+        None
+    } else {
+        Some(message)
+    }
 }
 
 #[cfg(test)]
@@ -920,6 +976,40 @@ mod tests {
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
         assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
         assert_eq!(drained[0].model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn new_chat_prompt_arrow_up_recalls_last_chat_message() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Codex,
+            lines: vec![
+                "intro".to_string(),
+                "> first line".to_string(),
+                "> second line".to_string(),
+                "assistant reply".to_string(),
+            ],
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.input_prompt(), Some("first line\nsecond line"));
+    }
+
+    #[test]
+    fn new_chat_prompt_arrow_up_keeps_existing_text_when_no_history() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        for ch in "new request".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.input_prompt(), Some("new request"));
     }
 
     #[test]
