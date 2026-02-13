@@ -1,3 +1,4 @@
+use anyhow::Context;
 use chrono::Utc;
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
@@ -160,6 +161,41 @@ fn qa_failures_no_worse_than_baseline(
     let validation_failed = failed_test_keys(validation);
     let baseline_failed = failed_test_keys(baseline);
     !validation_failed.is_empty() && validation_failed.is_subset(&baseline_failed)
+}
+
+fn ensure_baseline_qa_workspace(repo_root: &Path, task_id: &TaskId) -> anyhow::Result<PathBuf> {
+    let qa_task_id = TaskId::new(format!("qa-base-{}", task_id.0));
+    let expected = repo_root.join(".orch/wt").join(&qa_task_id.0);
+    if expected.exists() {
+        return Ok(expected);
+    }
+
+    if let Ok(ws) = orchd::provision_chat_workspace_on_base(repo_root, &qa_task_id, Some("main")) {
+        return Ok(ws.worktree_path);
+    }
+
+    // Fallback: branch may already exist but worktree entry is stale.
+    let git = orch_git::GitCli::default();
+    let repo = orch_git::discover_repo(repo_root, &git)?;
+    let _ = git.run(&repo.root, ["worktree", "prune"]);
+    let manager = orch_git::WorktreeManager::default();
+    let spec = orch_git::WorktreeSpec {
+        task_id: qa_task_id.clone(),
+        branch: format!("task/{}", qa_task_id.0),
+    };
+    manager
+        .create_for_existing_branch(&repo, &spec)
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("failed to recreate baseline QA worktree")?;
+
+    if expected.exists() {
+        Ok(expected)
+    } else {
+        Err(anyhow::anyhow!(
+            "baseline QA worktree missing after recovery: {}",
+            expected.display()
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -950,20 +986,27 @@ fn run() -> Result<(), MainError> {
                         let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                         let baseline = qa_agent::load_baseline(&repo_root).unwrap();
                         let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
+                        let qa_cwd = match ensure_baseline_qa_workspace(&repo_root, &task.id) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "QA baseline skipped for {}: isolated workspace unavailable ({e})",
+                                        task.id.0
+                                    ),
+                                });
+                                continue;
+                            }
+                        };
                         let prompt = qa_agent::build_qa_prompt(
                             &baseline,
                             None,
                             None,
-                            &repo_root,
+                            &qa_cwd,
                             &template_dir,
                         );
                         let mut qa_state = qa_agent::QAState::new(qa_agent::QAType::Baseline);
-                        match spawn_qa_agent_with_fallback(
-                            &repo_root,
-                            &prompt,
-                            model,
-                            &mut qa_state,
-                        ) {
+                        match spawn_qa_agent_with_fallback(&qa_cwd, &prompt, model, &mut qa_state) {
                             Ok(qa_model) => {
                                 qa_agents.insert(baseline_key.clone(), qa_state);
                                 app.apply_event(TuiEvent::AgentPaneOutput {
@@ -987,7 +1030,7 @@ fn run() -> Result<(), MainError> {
                                 });
                                 app.apply_event(TuiEvent::StatusLine {
                                     message: format!(
-                                        "QA baseline started on main for {} (model {}); agent will run in parallel",
+                                        "QA baseline started in isolated main worktree for {} (model {}); agent running in parallel",
                                         task.id.0,
                                         qa_model.as_str()
                                     ),
@@ -1298,6 +1341,14 @@ fn run() -> Result<(), MainError> {
                 }
 
                 qa_agents.remove(&qa_key);
+                if qa_type == qa_agent::QAType::Baseline && qa_key.starts_with("qa-base-") {
+                    let qa_task_id = TaskId::new(format!("qa-base-{}", task_id.0));
+                    let git = orch_git::GitCli::default();
+                    if let Ok(repo) = orch_git::discover_repo(&repo_root, &git) {
+                        let manager = orch_git::WorktreeManager::default();
+                        let _ = manager.remove(&repo, &qa_task_id, true);
+                    }
+                }
             } else if qa_failed {
                 // QA agent process died without producing results.
                 // Remove the dead entry so it doesn't block future QA spawns.
@@ -1346,6 +1397,14 @@ fn run() -> Result<(), MainError> {
                     });
                 }
                 qa_agents.remove(&qa_key);
+                if qa_type == qa_agent::QAType::Baseline && qa_key.starts_with("qa-base-") {
+                    let qa_task_id = TaskId::new(format!("qa-base-{}", task_id.0));
+                    let git = orch_git::GitCli::default();
+                    if let Ok(repo) = orch_git::discover_repo(&repo_root, &git) {
+                        let manager = orch_git::WorktreeManager::default();
+                        let _ = manager.remove(&repo, &qa_task_id, true);
+                    }
+                }
             }
         }
 
