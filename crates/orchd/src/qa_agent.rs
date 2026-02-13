@@ -465,7 +465,7 @@ pub fn build_qa_failure_context(result: &QAResult) -> String {
 
 /// Spawn a QA agent process.
 pub fn spawn_qa_agent(
-    repo_root: &Path,
+    cwd: &Path,
     prompt: &str,
     model: ModelKind,
     state: &mut QAState,
@@ -476,7 +476,7 @@ pub fn spawn_qa_agent(
         task_id: TaskId::new("qa-agent"),
         repo_id: RepoId("default".to_string()),
         model,
-        repo_path: repo_root.to_path_buf(),
+        repo_path: cwd.to_path_buf(),
         prompt: prompt.to_string(),
         timeout_secs: 900, // QA runs can be longer
         extra_args: vec![],
@@ -489,7 +489,7 @@ pub fn spawn_qa_agent(
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .env_remove("CLAUDECODE")
-        .current_dir(repo_root)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

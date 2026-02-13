@@ -56,7 +56,9 @@ pub fn evaluate_retry(
 
     // Pick the next model: try the current preferred model first, then fall
     // back to any enabled model that hasn't failed on this task yet.
-    let next_model = pick_next_model(task, enabled_models);
+    // Pass the just-failed model so it's excluded even before being recorded
+    // in task.failed_models.
+    let next_model = pick_next_model(task, outcome.model, enabled_models);
 
     match next_model {
         Some(model) => RetryDecision {
@@ -80,20 +82,33 @@ pub fn evaluate_retry(
 /// Choose the next model for a retry attempt.
 ///
 /// Strategy:
-/// 1. If the task's preferred model hasn't failed yet, use it again.
-/// 2. Otherwise, pick the first enabled model that isn't in `failed_models`.
-fn pick_next_model(task: &Task, enabled_models: &[ModelKind]) -> Option<ModelKind> {
-    // If preferred model hasn't been exhausted, keep using it.
+/// 1. If the task's preferred model hasn't failed yet AND isn't the one that
+///    just failed, use it.
+/// 2. Otherwise, pick the first enabled model that isn't in `failed_models`
+///    and isn't the just-failed model.
+///
+/// `just_failed` is needed because at evaluation time the failure hasn't been
+/// recorded into `task.failed_models` yet, so without it the function would
+/// re-select the model that just crashed.
+fn pick_next_model(
+    task: &Task,
+    just_failed: ModelKind,
+    enabled_models: &[ModelKind],
+) -> Option<ModelKind> {
+    // If preferred model hasn't been exhausted and isn't the one that just failed, keep using it.
     if let Some(preferred) = task.preferred_model {
-        if !task.failed_models.contains(&preferred) && enabled_models.contains(&preferred) {
+        if preferred != just_failed
+            && !task.failed_models.contains(&preferred)
+            && enabled_models.contains(&preferred)
+        {
             return Some(preferred);
         }
     }
 
-    // Fall back to first enabled model not yet failed.
+    // Fall back to first enabled model not yet failed (and not just-failed).
     enabled_models
         .iter()
-        .find(|m| !task.failed_models.contains(m))
+        .find(|m| **m != just_failed && !task.failed_models.contains(m))
         .copied()
 }
 
@@ -148,15 +163,30 @@ mod tests {
     }
 
     #[test]
-    fn retries_with_preferred_model() {
+    fn retries_with_preferred_model_when_different_model_failed() {
         let mut task = mk_task();
         task.preferred_model = Some(ModelKind::Claude);
 
-        let outcome = mk_outcome(false);
+        // Codex failed — preferred Claude should still be selected.
+        let mut outcome = mk_outcome(false);
+        outcome.model = ModelKind::Codex;
         let decision = evaluate_retry(&task, &outcome, &all_models());
 
         assert!(decision.should_retry);
         assert_eq!(decision.next_model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn switches_model_when_preferred_just_failed() {
+        let mut task = mk_task();
+        task.preferred_model = Some(ModelKind::Claude);
+
+        // Claude just failed — should switch to Codex.
+        let outcome = mk_outcome(false); // model: Claude
+        let decision = evaluate_retry(&task, &outcome, &all_models());
+
+        assert!(decision.should_retry);
+        assert_eq!(decision.next_model, Some(ModelKind::Codex));
     }
 
     #[test]
@@ -201,11 +231,12 @@ mod tests {
     fn picks_first_available_when_no_preferred() {
         let task = mk_task(); // preferred_model = None
 
+        // Claude just failed → first available that isn't Claude = Codex.
         let outcome = mk_outcome(false);
         let decision = evaluate_retry(&task, &outcome, &all_models());
 
         assert!(decision.should_retry);
-        assert_eq!(decision.next_model, Some(ModelKind::Claude));
+        assert_eq!(decision.next_model, Some(ModelKind::Codex));
     }
 
     #[test]
@@ -213,11 +244,25 @@ mod tests {
         let mut task = mk_task();
         task.preferred_model = Some(ModelKind::Gemini);
 
-        let outcome = mk_outcome(false);
-        // Only Claude enabled, but preferred is Gemini
-        let decision = evaluate_retry(&task, &outcome, &[ModelKind::Claude]);
+        // Gemini just failed, only Claude and Codex enabled.
+        let mut outcome = mk_outcome(false);
+        outcome.model = ModelKind::Gemini;
+        let decision = evaluate_retry(&task, &outcome, &[ModelKind::Claude, ModelKind::Codex]);
 
         assert!(decision.should_retry);
         assert_eq!(decision.next_model, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn no_retry_when_just_failed_is_only_enabled_model() {
+        let mut task = mk_task();
+        task.preferred_model = Some(ModelKind::Claude);
+
+        // Claude just failed, and it's the only enabled model.
+        let outcome = mk_outcome(false); // model: Claude
+        let decision = evaluate_retry(&task, &outcome, &[ModelKind::Claude]);
+
+        assert!(!decision.should_retry);
+        assert!(decision.reason.contains("no available models"));
     }
 }

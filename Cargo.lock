@@ -663,6 +663,7 @@ dependencies = [
  "crossterm",
  "orch-agents",
  "orch-core",
+ "orch-git",
  "orchd",
  "ratatui",
  "rusqlite",

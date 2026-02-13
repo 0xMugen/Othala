@@ -158,13 +158,13 @@ fn print_task_list(tasks: &[Task]) {
     if tasks.is_empty() {
         println!("No chats found.");
     } else {
-        println!("{:<20} {:<10} {:<40}", "ID", "STATE", "TITLE");
-        println!("{}", "-".repeat(70));
+        println!("{:<20} {:<16} {:<40}", "ID", "STATE", "TITLE");
+        println!("{}", "-".repeat(76));
         for task in tasks {
             println!(
-                "{:<20} {:<10} {:<40}",
+                "{:<20} {:<16} {:<40}",
                 task.id.0,
-                format!("{:?}", task.state),
+                format!("{}", task.state),
                 task.title
             );
         }
@@ -251,7 +251,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Chat: {}", task.id.0);
                     println!("Title: {}", task.title);
                     println!("Repo: {}", task.repo_id.0);
-                    println!("State: {:?}", task.state);
+                    println!("State: {}", task.state);
                     if let Some(model) = task.preferred_model {
                         println!("Model: {:?}", model);
                     }
@@ -335,7 +335,11 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter(|t| t.state == TaskState::Merged)
                         .count();
-                    println!(
+                    let stopped = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Stopped)
+                        .count();
+                    let mut status = format!(
                         "[{}] {} chatting, {} ready, {} submitting, {} awaiting, {} merged",
                         chrono::Local::now().format("%H:%M:%S"),
                         chatting,
@@ -344,6 +348,10 @@ fn main() -> anyhow::Result<()> {
                         awaiting,
                         merged
                     );
+                    if stopped > 0 {
+                        status.push_str(&format!(", {} stopped", stopped));
+                    }
+                    println!("{status}");
                 }
 
                 std::thread::sleep(std::time::Duration::from_secs(2));

@@ -85,6 +85,38 @@ fn provision_inner(
     })
 }
 
+/// Validate that a task's worktree directory exists, and attempt recovery if it
+/// was deleted externally (e.g. `rm -rf .orch/wt/`).
+///
+/// Recovery: prune stale git worktree refs, then re-add the worktree for the
+/// existing branch.  This avoids creating a new branch/commit — it simply
+/// restores the checkout.
+pub fn ensure_worktree_exists(repo_root: &Path, task: &orch_core::types::Task) -> Result<()> {
+    if task.worktree_path.exists() {
+        return Ok(());
+    }
+    // Worktree directory missing — attempt recovery.
+    let git = GitCli::default();
+    let repo = discover_repo(repo_root, &git)?;
+    let manager = WorktreeManager::default();
+    let default_branch = format!("task/{}", task.id.0);
+    let branch = task
+        .branch_name
+        .as_deref()
+        .unwrap_or(&default_branch);
+    let spec = WorktreeSpec {
+        task_id: task.id.clone(),
+        branch: branch.to_string(),
+    };
+    // Prune stale worktree refs so git doesn't complain about a locked entry.
+    let _ = git.run(&repo.root, ["worktree", "prune"]);
+    manager
+        .create_for_existing_branch(&repo, &spec)
+        .map_err(|e| anyhow!(e))
+        .context("worktree recovery failed")?;
+    Ok(())
+}
+
 pub fn branch_name_for_task(task_id: &TaskId) -> String {
     let sanitized = sanitize_branch_component(&task_id.0);
     format!("task/{sanitized}")

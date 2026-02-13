@@ -229,10 +229,18 @@ pub fn daemon_tick(
 
                     if qa_type == QAType::Validation {
                         // Validation failed — retry implementation with QA context.
+                        // Re-use the task's current preferred model — QA failure
+                        // means the code needs fixing, not that the model is broken.
                         let failure_ctx = build_qa_failure_context(&result);
+                        let retry_model = service
+                            .task(&task_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|t| t.preferred_model)
+                            .unwrap_or(ModelKind::Claude);
                         actions.push(DaemonAction::ScheduleRetry {
                             task_id,
-                            next_model: ModelKind::Claude,
+                            next_model: retry_model,
                             reason: failure_ctx,
                         });
                     }
@@ -614,11 +622,24 @@ pub fn execute_actions(
                     let task_spec = load_qa_task_spec(&config.repo_root, task_id);
                     let previous = load_latest_result(&config.repo_root, &branch);
 
+                    // Determine cwd: baseline runs from repo root,
+                    // validation runs from the task's worktree.
+                    let cwd = if *qa_type == QAType::Validation {
+                        service
+                            .task(task_id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.worktree_path.clone())
+                            .unwrap_or_else(|| config.repo_root.clone())
+                    } else {
+                        config.repo_root.clone()
+                    };
+
                     let prompt = build_qa_prompt(
                         &baseline,
                         task_spec.as_deref(),
                         previous.as_ref(),
-                        &config.repo_root,
+                        &cwd,
                         &config.template_dir,
                     );
 
@@ -630,7 +651,7 @@ pub fn execute_actions(
 
                     let mut qa_state = QAState::new(*qa_type);
                     if let Err(e) =
-                        spawn_qa_agent(&config.repo_root, &prompt, model, &mut qa_state)
+                        spawn_qa_agent(&cwd, &prompt, model, &mut qa_state)
                     {
                         eprintln!(
                             "[daemon] Failed to spawn QA {} for {}: {}",

@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 crossterm = "0.28"
 orch-agents = { path = "../orch-agents" }
 orch-core = { path = "../orch-core" }
+orch-git = { path = "../orch-git" }
 orchd = { path = "../orchd" }
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }

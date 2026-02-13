@@ -317,7 +317,7 @@ fn run() -> Result<(), MainError> {
     }
     eprintln!();
 
-    let tasks = service.list_tasks().unwrap_or_default();
+    let tasks = service.list_top_level_tasks().unwrap_or_default();
     let mut app = TuiApp::from_tasks(&tasks);
 
     // Restore chat history from log files.
@@ -373,11 +373,17 @@ fn run() -> Result<(), MainError> {
                         let start_path =
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-                        // Try workspace provisioning; fall back to cwd on failure.
+                        // Provision workspace — fail visibly instead of silently
+                        // falling back to cwd (which would run agents in the main repo).
                         let (worktree_path, branch_name) =
                             match orchd::provision_chat_workspace(&start_path, &task_id) {
                                 Ok(ws) => (ws.worktree_path, Some(ws.branch_name)),
-                                Err(_) => (start_path.clone(), None),
+                                Err(e) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!("workspace provision failed: {e}"),
+                                    });
+                                    continue;
+                                }
                             };
 
                         let mut task = Task::new(
@@ -407,7 +413,7 @@ fn run() -> Result<(), MainError> {
                                     ),
                                 });
                                 // Immediately refresh task list so it appears.
-                                if let Ok(tasks) = service.list_tasks() {
+                                if let Ok(tasks) = service.list_top_level_tasks() {
                                     app.apply_event(TuiEvent::TasksReplaced { tasks });
                                 }
                             }
@@ -422,6 +428,14 @@ fn run() -> Result<(), MainError> {
                 UiAction::DeleteTask => {
                     if let Some(task_id) = &queued.task_id {
                         supervisor.stop(task_id);
+                        // Clean up the worktree before deleting the task.
+                        if let Ok(Some(_task)) = service.task(task_id) {
+                            let git = orch_git::GitCli::default();
+                            if let Ok(repo) = orch_git::discover_repo(&repo_root, &git) {
+                                let manager = orch_git::WorktreeManager::default();
+                                let _ = manager.remove(&repo, task_id, true);
+                            }
+                        }
                         // Remove chat log file.
                         let _ = std::fs::remove_file(chat_log_path(&chat_log_dir, task_id));
                         match service.delete_task(task_id) {
@@ -446,6 +460,16 @@ fn run() -> Result<(), MainError> {
                 UiAction::StartAgent => {
                     if let Some(task_id) = &queued.task_id {
                         if let Ok(Some(task)) = service.task(task_id) {
+                            // Validate/recover worktree before spawning.
+                            if let Err(e) = orchd::ensure_worktree_exists(&repo_root, &task) {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "worktree recovery failed for {}: {e}",
+                                        task_id.0
+                                    ),
+                                });
+                                continue;
+                            }
                             let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                             let instance_id = format!("agent-{}", task_id.0);
                             match supervisor.spawn_agent(
@@ -627,7 +651,7 @@ fn run() -> Result<(), MainError> {
                                         task_id.0
                                     ),
                                 });
-                                if let Ok(tasks) = service.list_tasks() {
+                                if let Ok(tasks) = service.list_top_level_tasks() {
                                     app.apply_event(TuiEvent::TasksReplaced { tasks });
                                 }
                             } else {
@@ -678,6 +702,13 @@ fn run() -> Result<(), MainError> {
                 let qa_key = format!("qa-{}", outcome.task_id.0);
                 let has_baseline = qa_agent::load_baseline(&repo_root).is_some();
                 if has_baseline && !qa_agents.contains_key(&qa_key) {
+                    // Validation QA runs from the task's worktree, not repo root.
+                    let qa_cwd = service
+                        .task(&outcome.task_id)
+                        .ok()
+                        .flatten()
+                        .map(|t| t.worktree_path.clone())
+                        .unwrap_or_else(|| repo_root.clone());
                     let baseline = qa_agent::load_baseline(&repo_root).unwrap();
                     let task_spec =
                         qa_agent::load_task_spec(&repo_root, &outcome.task_id);
@@ -692,13 +723,13 @@ fn run() -> Result<(), MainError> {
                         &baseline,
                         task_spec.as_deref(),
                         previous.as_ref(),
-                        &repo_root,
+                        &qa_cwd,
                         &template_dir,
                     );
                     let mut qa_state =
                         qa_agent::QAState::new(qa_agent::QAType::Validation);
                     match qa_agent::spawn_qa_agent(
-                        &repo_root,
+                        &qa_cwd,
                         &prompt,
                         outcome.model,
                         &mut qa_state,
@@ -800,7 +831,7 @@ fn run() -> Result<(), MainError> {
         // Refresh task list immediately when any agents completed so
         // state changes (Chatting → Ready) show up without delay.
         if !result.completed.is_empty() {
-            if let Ok(tasks) = service.list_tasks() {
+            if let Ok(tasks) = service.list_top_level_tasks() {
                 app.apply_event(TuiEvent::TasksReplaced { tasks });
             }
         }
@@ -820,6 +851,16 @@ fn run() -> Result<(), MainError> {
                         )
                 });
                 if !supervisor.has_session(&task.id) && !pane_stopped {
+                    // Validate/recover worktree before spawning.
+                    if let Err(e) = orchd::ensure_worktree_exists(&repo_root, task) {
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!(
+                                "worktree recovery failed for {}: {e}",
+                                task.id.0
+                            ),
+                        });
+                        continue;
+                    }
                     let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                     let instance_id = format!("agent-{}", task.id.0);
                     match supervisor.spawn_agent(
@@ -1113,7 +1154,7 @@ fn run() -> Result<(), MainError> {
                             }
                         }
                         // Refresh tasks so UI shows the state change.
-                        if let Ok(tasks) = service.list_tasks() {
+                        if let Ok(tasks) = service.list_top_level_tasks() {
                             app.apply_event(TuiEvent::TasksReplaced { tasks });
                         }
                     } else {
@@ -1377,7 +1418,7 @@ fn run() -> Result<(), MainError> {
                                     task_id.0
                                 ),
                             });
-                            if let Ok(tasks) = service.list_tasks() {
+                            if let Ok(tasks) = service.list_top_level_tasks() {
                                 app.apply_event(TuiEvent::TasksReplaced { tasks });
                             }
                             None
@@ -1503,7 +1544,7 @@ fn run() -> Result<(), MainError> {
                                         task_id.0
                                     ),
                                 });
-                                if let Ok(tasks) = service.list_tasks() {
+                                if let Ok(tasks) = service.list_top_level_tasks() {
                                     app.apply_event(TuiEvent::TasksReplaced {
                                         tasks,
                                     });
@@ -1515,6 +1556,13 @@ fn run() -> Result<(), MainError> {
                                     if let Some(baseline) =
                                         qa_agent::load_baseline(&repo_root)
                                     {
+                                        // Validation runs from the task's worktree.
+                                        let qa_cwd = service
+                                            .task(&task_id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|t| t.worktree_path.clone())
+                                            .unwrap_or_else(|| repo_root.clone());
                                         let task_spec = qa_agent::load_task_spec(
                                             &repo_root, &task_id,
                                         );
@@ -1533,7 +1581,7 @@ fn run() -> Result<(), MainError> {
                                             &baseline,
                                             task_spec.as_deref(),
                                             previous.as_ref(),
-                                            &repo_root,
+                                            &qa_cwd,
                                             &template_dir,
                                         );
                                         let model = service
@@ -1546,7 +1594,7 @@ fn run() -> Result<(), MainError> {
                                             qa_agent::QAType::Validation,
                                         );
                                         match qa_agent::spawn_qa_agent(
-                                            &repo_root,
+                                            &qa_cwd,
                                             &prompt,
                                             model,
                                             &mut qa_state,
@@ -1643,7 +1691,7 @@ fn run() -> Result<(), MainError> {
         // Refresh task list periodically (every ~2s at 250ms tick).
         tick_counter = tick_counter.wrapping_add(1);
         if tick_counter.is_multiple_of(8) {
-            if let Ok(tasks) = service.list_tasks() {
+            if let Ok(tasks) = service.list_top_level_tasks() {
                 app.apply_event(TuiEvent::TasksReplaced { tasks: tasks.clone() });
                 // Load QA data from disk for each task.
                 let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
