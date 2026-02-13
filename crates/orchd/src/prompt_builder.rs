@@ -242,12 +242,14 @@ mod tests {
         fs::write(tmp.join("tests-specialist.md"), "# Tests\nWrite tests.\n").unwrap();
         fs::write(tmp.join("reviewer.md"), "# Reviewer\nReview code.\n").unwrap();
         fs::write(tmp.join("stack-captain.md"), "# Stack Captain\nManage stacks.\n").unwrap();
+        fs::write(tmp.join("qa-validator.md"), "# QA Validator\nValidate quality.\n").unwrap();
 
         for (role, expected) in [
             (PromptRole::Implement, "Implement things"),
             (PromptRole::TestSpecWrite, "Write tests"),
             (PromptRole::Review, "Review code"),
             (PromptRole::StackCaptain, "Manage stacks"),
+            (PromptRole::QAValidate, "Validate quality"),
         ] {
             let mut config = mk_config();
             config.role = role;
@@ -261,5 +263,22 @@ mod tests {
         }
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prompt_includes_qa_failure_context() {
+        let mut config = mk_config();
+        config.qa_failure_context = Some(
+            "## QA Failures (from previous attempt)\n\n\
+             - startup.banner: PASS\n\
+             - tui.create_chat: FAIL — branch not created\n\n\
+             Fix the failing tests before signaling [patch_ready].\n"
+                .to_string(),
+        );
+
+        let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
+        assert!(prompt.contains("QA Failures"));
+        assert!(prompt.contains("tui.create_chat: FAIL"));
+        assert!(prompt.contains("branch not created"));
     }
 }

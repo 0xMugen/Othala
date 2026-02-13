@@ -347,6 +347,15 @@ fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction
         orch_core::types::TaskType::Orchestrate => PromptRole::Implement,
     };
 
+    // If the last failure reason looks like structured QA output, inject it
+    // through the dedicated qa_failure_context field so the prompt builder
+    // renders it in its own section rather than buried inside retry context.
+    let qa_failure_context = task
+        .last_failure_reason
+        .as_ref()
+        .filter(|r| r.starts_with("## QA Failures"))
+        .cloned();
+
     let prompt_config = PromptConfig {
         task_id: task.id.clone(),
         task_title: task.title.clone(),
@@ -355,7 +364,7 @@ fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction
         test_spec: test_spec_content,
         retry,
         verify_command: config.verify_command.clone(),
-        qa_failure_context: None,
+        qa_failure_context,
     };
 
     let prompt = build_rich_prompt(&prompt_config, &config.template_dir);
@@ -1544,5 +1553,66 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, DaemonAction::RecordNeedsHuman { .. })));
+    }
+
+    #[test]
+    fn build_spawn_action_injects_qa_failure_context_on_retry() {
+        let config = mk_config();
+
+        let mut task = mk_task("T-QA-RETRY");
+        task.retry_count = 1;
+        task.max_retries = 3;
+        task.preferred_model = Some(ModelKind::Claude);
+        task.last_failure_reason = Some(
+            "## QA Failures (from previous attempt)\n\n\
+             - startup.banner: PASS\n\
+             - tui.create_chat: FAIL — branch not created\n\n\
+             Fix the failing tests before signaling [patch_ready].\n"
+                .to_string(),
+        );
+
+        let action = build_spawn_action(&task, &config).expect("should produce action");
+        match action {
+            DaemonAction::SpawnAgent { prompt, .. } => {
+                assert!(
+                    prompt.contains("QA Failures"),
+                    "prompt should contain QA failure context section"
+                );
+                assert!(
+                    prompt.contains("tui.create_chat: FAIL"),
+                    "prompt should contain specific failure details"
+                );
+            }
+            other => panic!("expected SpawnAgent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_spawn_action_no_qa_context_for_non_qa_failure() {
+        let config = mk_config();
+
+        let mut task = mk_task("T-PLAIN-RETRY");
+        task.retry_count = 1;
+        task.max_retries = 3;
+        task.preferred_model = Some(ModelKind::Claude);
+        task.last_failure_reason = Some("cargo test failed: assertion error".to_string());
+
+        let action = build_spawn_action(&task, &config).expect("should produce action");
+        match action {
+            DaemonAction::SpawnAgent { prompt, .. } => {
+                // Should include retry context but NOT a separate QA Failures section.
+                assert!(
+                    prompt.contains("assertion error"),
+                    "prompt should contain the failure reason in retry context"
+                );
+                // The QA Failures section header should NOT appear as a standalone section.
+                // (It may appear in retry context, but not as a dedicated section.)
+                assert!(
+                    !prompt.contains("## QA Failures"),
+                    "prompt should not have a standalone QA failure section for non-QA failures"
+                );
+            }
+            other => panic!("expected SpawnAgent, got {:?}", other),
+        }
     }
 }
