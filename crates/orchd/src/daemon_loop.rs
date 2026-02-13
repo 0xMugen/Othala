@@ -554,7 +554,14 @@ pub fn execute_actions(
                     },
                 };
                 let _ = service.record_event(&event);
-                eprintln!("[daemon] {} failed: {}", task_id.0, reason);
+
+                // Transition the task to Stopped so it's no longer active.
+                if let Ok(Some(mut task)) = service.task(task_id) {
+                    task.state = TaskState::Stopped;
+                    let _ = service.store.upsert_task(&task);
+                }
+
+                eprintln!("[daemon] {} failed → stopped: {}", task_id.0, reason);
             }
             DaemonAction::ExecutePipeline { action } => {
                 // Pipeline execution is handled by specific pipeline executors.

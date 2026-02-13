@@ -18,6 +18,7 @@ fn state_color(state: TaskState) -> Color {
         TaskState::Ready | TaskState::Merged => Color::Cyan,
         TaskState::Submitting | TaskState::AwaitingMerge => Color::Blue,
         TaskState::Restacking => Color::Yellow,
+        TaskState::Stopped => Color::Red,
     }
 }
 
@@ -301,6 +302,7 @@ pub(crate) fn status_sidebar_lines(
 
     let chatting = match task.state {
         TaskState::Chatting => ChecklistState::Active,
+        TaskState::Stopped => ChecklistState::Blocked,
         _ => ChecklistState::Done,
     };
 
@@ -336,6 +338,8 @@ pub(crate) fn status_sidebar_lines(
 
     let (plan_label, plan_value, plan_color) = if task.state == TaskState::Merged {
         ("plan complete: ", "yes", Color::Green)
+    } else if task.state == TaskState::Stopped {
+        ("phase: ", "stopped", Color::Red)
     } else {
         let phase = match task.state {
             TaskState::Chatting => match task.display_state.as_str() {
@@ -348,7 +352,7 @@ pub(crate) fn status_sidebar_lines(
             TaskState::Submitting => "pushing",
             TaskState::Restacking => "restacking",
             TaskState::AwaitingMerge => "awaiting merge",
-            TaskState::Merged => unreachable!(),
+            TaskState::Merged | TaskState::Stopped => unreachable!(),
         };
         ("phase: ", phase, Color::Yellow)
     };

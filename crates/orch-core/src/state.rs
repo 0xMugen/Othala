@@ -20,6 +20,8 @@ pub enum TaskState {
     AwaitingMerge,
     /// PR merged, done
     Merged,
+    /// Agent exhausted all retries or was manually stopped
+    Stopped,
 }
 
 impl std::fmt::Display for TaskState {
@@ -31,6 +33,7 @@ impl std::fmt::Display for TaskState {
             TaskState::Restacking => "RESTACKING",
             TaskState::AwaitingMerge => "AWAITING_MERGE",
             TaskState::Merged => "MERGED",
+            TaskState::Stopped => "STOPPED",
         };
         f.write_str(tag)
     }
@@ -39,7 +42,7 @@ impl std::fmt::Display for TaskState {
 impl TaskState {
     /// Returns true if the task is in a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskState::Merged)
+        matches!(self, TaskState::Merged | TaskState::Stopped)
     }
 
     /// Returns true if the task is actively working.
@@ -114,6 +117,28 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let decoded: VerifyStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn stopped_state_is_terminal_and_not_active() {
+        assert!(TaskState::Stopped.is_terminal());
+        assert!(!TaskState::Stopped.is_active());
+        assert!(!TaskState::Stopped.can_submit());
+        assert!(!TaskState::Stopped.can_restack());
+    }
+
+    #[test]
+    fn stopped_state_serializes_correctly() {
+        let state = TaskState::Stopped;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"STOPPED\"");
+        let decoded: TaskState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, TaskState::Stopped);
+    }
+
+    #[test]
+    fn stopped_state_display() {
+        assert_eq!(format!("{}", TaskState::Stopped), "STOPPED");
     }
 
     #[test]

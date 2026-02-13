@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,6 +121,8 @@ pub struct QAState {
     pub qa_complete: bool,
     /// Accumulated output from the agent — used to parse QA results on completion.
     pub output_buffer: Vec<String>,
+    /// When the agent signaled qa_complete. Used to enforce a grace period before killing.
+    pub signal_at: Option<Instant>,
 }
 
 impl QAState {
@@ -135,6 +138,7 @@ impl QAState {
             result_rx: None,
             qa_complete: false,
             output_buffer: Vec::new(),
+            signal_at: None,
         }
     }
 }
@@ -484,6 +488,7 @@ pub fn spawn_qa_agent(
     let mut child = Command::new(&cmd.executable)
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env_remove("CLAUDECODE")
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -530,6 +535,9 @@ pub fn drain_qa_output(state: &mut QAState) -> Vec<String> {
             if let Some(signal) = detect_common_signal(&line) {
                 if signal.kind == AgentSignalKind::QAComplete {
                     state.qa_complete = true;
+                    if state.signal_at.is_none() {
+                        state.signal_at = Some(Instant::now());
+                    }
                 }
             }
             lines.push(line);
@@ -559,9 +567,21 @@ pub fn poll_qa_agent(state: &mut QAState) -> Option<QAResult> {
             if let Some(signal) = detect_common_signal(&line) {
                 if signal.kind == AgentSignalKind::QAComplete {
                     state.qa_complete = true;
+                    if state.signal_at.is_none() {
+                        state.signal_at = Some(Instant::now());
+                    }
                 }
             }
             state.output_buffer.push(line);
+        }
+    }
+
+    // Kill process if it signaled completion but hasn't exited.
+    if let Some(t) = state.signal_at {
+        if t.elapsed() > Duration::from_secs(5) {
+            if let Some(child) = state.child_handle.as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -587,6 +607,9 @@ pub fn poll_qa_agent(state: &mut QAState) -> Option<QAResult> {
             if let Some(signal) = detect_common_signal(&line) {
                 if signal.kind == AgentSignalKind::QAComplete {
                     state.qa_complete = true;
+                    if state.signal_at.is_none() {
+                        state.signal_at = Some(Instant::now());
+                    }
                 }
             }
             state.output_buffer.push(line);

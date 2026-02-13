@@ -68,6 +68,8 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (AwaitingMerge, Restacking) => true,
         // Any state can go back to Chatting (retry/fix)
         (_, Chatting) => true,
+        // Chatting can transition to Stopped (exhausted retries / manual stop)
+        (Chatting, Stopped) => true,
         _ => false,
     }
 }
@@ -83,6 +85,7 @@ pub fn task_state_tag(state: TaskState) -> &'static str {
         TaskState::Restacking => "RESTACKING",
         TaskState::AwaitingMerge => "AWAITING_MERGE",
         TaskState::Merged => "MERGED",
+        TaskState::Stopped => "STOPPED",
     }
 }
 

@@ -2370,4 +2370,209 @@ mod tests {
             Some(&vec!["hello world".to_string()])
         );
     }
+
+    #[test]
+    fn chat_input_backspace_resets_history_index() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "old msg".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Start new input, navigate to history, then backspace
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old msg"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old ms"));
+
+        // Down should do nothing now (history_index was reset to None)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old ms"));
+    }
+
+    #[test]
+    fn chat_input_send_history_entry_directly() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "reusable command".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.drain_actions(); // clear first send
+
+        // Re-enter chat, navigate to history, and send it
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("reusable command"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::SendChatMessage);
+        assert_eq!(drained[0].prompt.as_deref(), Some("reusable command"));
+
+        // History should now have the same message twice
+        assert_eq!(
+            app.chat_history.get(&TaskId("T1".to_string())),
+            Some(&vec![
+                "reusable command".to_string(),
+                "reusable command".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_input_full_history_navigation_round_trip() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build three messages of history
+        for msg in &["first", "second", "third"] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+            for ch in msg.chars() {
+                app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+
+        // Enter chat input mode with a draft
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "draft".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        // Navigate all the way up through history
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("third"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("second"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("first"));
+
+        // At oldest, Up stays put
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("first"));
+
+        // Navigate all the way back down
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("second"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("third"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("draft"));
+
+        // At draft, Down stays put
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("draft"));
+    }
+
+    #[test]
+    fn chat_input_message_is_trimmed_on_send() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "  hello  ".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].prompt.as_deref(), Some("hello"));
+
+        // Stored in history trimmed
+        assert_eq!(
+            app.chat_history.get(&TaskId("T1".to_string())),
+            Some(&vec!["hello".to_string()])
+        );
+    }
+
+    #[test]
+    fn chat_input_ctrl_c_quits_from_chat_mode() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "typing".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        // Ctrl+C should quit even from chat input mode
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        // No action should be queued
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn chat_input_paste_resets_history_index() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "old".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Enter chat input, navigate to history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old"));
+
+        // Paste appends to the buffer (but does not reset history_index itself,
+        // only char input and backspace do). The buffer content changes though.
+        app.handle_paste(" pasted");
+        assert_eq!(app.input_prompt(), Some("old pasted"));
+    }
+
+    #[test]
+    fn chat_input_delete_confirm_y_key_confirms() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input_mode,
+            super::InputMode::DeleteTaskConfirm { .. }
+        ));
+
+        // 'y' key should also confirm deletion (not just Enter)
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::DeleteTask);
+    }
+
+    #[test]
+    fn chat_input_non_press_key_events_are_ignored() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "test".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        // Release event should be ignored (key.kind != Press)
+        let mut release_event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        release_event.kind = crossterm::event::KeyEventKind::Release;
+        app.handle_key_event(release_event);
+
+        assert_eq!(app.input_prompt(), Some("test")); // 'x' was NOT appended
+    }
 }
