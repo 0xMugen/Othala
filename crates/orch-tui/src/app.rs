@@ -1,7 +1,7 @@
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use orch_core::types::{ModelKind, Task, TaskId};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::action::{action_label, map_key_to_command, UiAction, UiCommand};
 use crate::event::TuiEvent;
@@ -33,6 +33,10 @@ pub enum InputMode {
     ChatInput {
         buffer: String,
         task_id: TaskId,
+        /// The in-progress text the user was typing before navigating history.
+        draft: String,
+        /// `None` means showing the draft; `Some(i)` means showing `history[len - 1 - i]`.
+        history_index: Option<usize>,
     },
 }
 
@@ -42,6 +46,8 @@ pub struct TuiApp {
     pub action_queue: VecDeque<QueuedAction>,
     pub input_mode: InputMode,
     pub should_quit: bool,
+    /// Per-task history of submitted chat messages (most recent last).
+    pub chat_history: HashMap<TaskId, Vec<String>>,
 }
 
 impl Default for TuiApp {
@@ -51,6 +57,7 @@ impl Default for TuiApp {
             action_queue: VecDeque::new(),
             input_mode: InputMode::Normal,
             should_quit: false,
+            chat_history: HashMap::new(),
         }
     }
 }
@@ -266,8 +273,123 @@ impl TuiApp {
         self.input_mode = InputMode::ChatInput {
             buffer: String::new(),
             task_id,
+            draft: String::new(),
+            history_index: None,
         };
-        self.state.status_line = "chat input: type message, Enter=send Esc=cancel".to_string();
+        self.state.status_line =
+            "chat input: type message, Enter=send Up/Down=history Esc=cancel".to_string();
+    }
+
+    fn handle_chat_input_key(&mut self, key: KeyEvent) {
+        let task_id = match &self.input_mode {
+            InputMode::ChatInput { task_id, .. } => task_id.clone(),
+            _ => return,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.state.status_line = "chat input canceled".to_string();
+            }
+            KeyCode::Enter => {
+                let message = match &self.input_mode {
+                    InputMode::ChatInput { buffer, .. } => buffer.trim().to_string(),
+                    _ => return,
+                };
+                if message.is_empty() {
+                    self.state.status_line = "chat message cannot be empty".to_string();
+                    return;
+                }
+                self.chat_history
+                    .entry(task_id.clone())
+                    .or_default()
+                    .push(message.clone());
+                self.action_queue.push_back(QueuedAction {
+                    action: UiAction::SendChatMessage,
+                    task_id: Some(task_id.clone()),
+                    prompt: Some(message),
+                    model: None,
+                });
+                self.input_mode = InputMode::Normal;
+                self.state.status_line =
+                    format!("queued action=send_chat_message task={}", task_id.0);
+            }
+            KeyCode::Up => {
+                let history_len = self
+                    .chat_history
+                    .get(&task_id)
+                    .map_or(0, |h| h.len());
+                if history_len == 0 {
+                    return;
+                }
+                if let InputMode::ChatInput {
+                    buffer,
+                    draft,
+                    history_index,
+                    ..
+                } = &mut self.input_mode
+                {
+                    let new_idx = match *history_index {
+                        None => {
+                            *draft = buffer.clone();
+                            0
+                        }
+                        Some(i) if i + 1 < history_len => i + 1,
+                        Some(_) => return,
+                    };
+                    *history_index = Some(new_idx);
+                    *buffer = self.chat_history[&task_id][history_len - 1 - new_idx].clone();
+                }
+            }
+            KeyCode::Down => {
+                if let InputMode::ChatInput {
+                    buffer,
+                    draft,
+                    history_index,
+                    ..
+                } = &mut self.input_mode
+                {
+                    match *history_index {
+                        None => {}
+                        Some(0) => {
+                            *history_index = None;
+                            *buffer = draft.clone();
+                        }
+                        Some(i) => {
+                            let new_idx = i - 1;
+                            *history_index = Some(new_idx);
+                            let history = &self.chat_history[&task_id];
+                            *buffer = history[history.len() - 1 - new_idx].clone();
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let InputMode::ChatInput {
+                    buffer,
+                    history_index,
+                    ..
+                } = &mut self.input_mode
+                {
+                    buffer.pop();
+                    *history_index = None;
+                }
+            }
+            KeyCode::Char(ch) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let InputMode::ChatInput {
+                        buffer,
+                        history_index,
+                        ..
+                    } = &mut self.input_mode
+                    {
+                        buffer.push(ch);
+                        *history_index = None;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn begin_delete_task_confirmation(&mut self) {
@@ -311,7 +433,7 @@ impl TuiApp {
 
     pub fn chat_input_display(&self) -> Option<(&str, &TaskId)> {
         match &self.input_mode {
-            InputMode::ChatInput { buffer, task_id } => Some((buffer.as_str(), task_id)),
+            InputMode::ChatInput { buffer, task_id, .. } => Some((buffer.as_str(), task_id)),
             _ => None,
         }
     }
@@ -324,6 +446,11 @@ impl TuiApp {
     }
 
     fn handle_input_mode_key(&mut self, key: KeyEvent) -> bool {
+        // Handle ChatInput before the match to avoid double &mut self borrow.
+        if matches!(self.input_mode, InputMode::ChatInput { .. }) {
+            self.handle_chat_input_key(key);
+            return true;
+        }
         match &mut self.input_mode {
             InputMode::Normal => return false,
             InputMode::NewChatPrompt { buffer } => match key.code {
@@ -390,38 +517,7 @@ impl TuiApp {
                 }
                 _ => {}
             },
-            InputMode::ChatInput { buffer, task_id } => match key.code {
-                KeyCode::Esc => {
-                    self.input_mode = InputMode::Normal;
-                    self.state.status_line = "chat input canceled".to_string();
-                }
-                KeyCode::Enter => {
-                    let message = buffer.trim().to_string();
-                    if message.is_empty() {
-                        self.state.status_line = "chat message cannot be empty".to_string();
-                        return true;
-                    }
-                    let tid = task_id.clone();
-                    self.action_queue.push_back(QueuedAction {
-                        action: UiAction::SendChatMessage,
-                        task_id: Some(tid.clone()),
-                        prompt: Some(message),
-                        model: None,
-                    });
-                    self.input_mode = InputMode::Normal;
-                    self.state.status_line =
-                        format!("queued action=send_chat_message task={}", tid.0);
-                }
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
-                KeyCode::Char(ch) => {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                        buffer.push(ch);
-                    }
-                }
-                _ => {}
-            },
+            InputMode::ChatInput { .. } => unreachable!(),
             InputMode::DeleteTaskConfirm { task_id, .. } => match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
@@ -1204,7 +1300,7 @@ mod tests {
         ));
         assert_eq!(
             app.state.status_line,
-            "chat input: type message, Enter=send Esc=cancel"
+            "chat input: type message, Enter=send Up/Down=history Esc=cancel"
         );
 
         // Type a message
@@ -1574,5 +1670,704 @@ mod tests {
 
         // Ensure no actions were queued (arrows don't dispatch actions)
         assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn left_right_arrow_keys_toggle_category_and_update_focused_pane_idx() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["agent output".to_string()],
+        });
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "qa-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["qa output".to_string()],
+        });
+
+        // Focus the agent pane
+        app.state.focused_pane_idx = Some(0);
+        assert_eq!(app.state.selected_pane_idx, 0);
+
+        // Right arrow toggles to QA and updates focused_pane_idx
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::QA
+        );
+        assert_eq!(app.state.selected_pane_idx, 1);
+        assert_eq!(app.state.focused_pane_idx, Some(1));
+        assert_eq!(app.state.scroll_back, 0);
+
+        // Left arrow toggles back and updates focused_pane_idx
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::Agent
+        );
+        assert_eq!(app.state.selected_pane_idx, 0);
+        assert_eq!(app.state.focused_pane_idx, Some(0));
+    }
+
+    #[test]
+    fn scroll_resets_when_toggling_category_in_focused_pane() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..50).map(|i| format!("line {i}")).collect(),
+        });
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "qa-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["qa output".to_string()],
+        });
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.state.focused_pane_idx = Some(0);
+
+        // Scroll up to accumulate scroll_back
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.state.scroll_back > 0);
+
+        // Toggle category — scroll_back should reset
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn scroll_up_down_in_focused_task() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..30).map(|i| format!("line {i}")).collect(),
+        });
+        app.state.focused_task = true;
+
+        // Scroll up several times
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 3);
+
+        // Scroll down
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 2);
+
+        // Page up
+        app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(app.state.scroll_back >= 20);
+
+        // End resets to bottom
+        app.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 0);
+
+        // Home scrolls to top
+        app.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert!(app.state.scroll_back > 0);
+    }
+
+    #[test]
+    fn vim_keys_scroll_in_focused_task() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..10).map(|i| format!("line {i}")).collect(),
+        });
+        app.state.focused_task = true;
+
+        // 'k' scrolls up
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 1);
+
+        // 'j' scrolls down
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn arrow_keys_navigate_tasks_and_panes_in_normal_view() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
+                verify_summary: "not_run".to_string(),
+                last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
+                verify_summary: "not_run".to_string(),
+                last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
+            },
+        ];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["T1 output".to_string()],
+        });
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T2".to_string(),
+            task_id: TaskId("T2".to_string()),
+            model: ModelKind::Codex,
+            lines: vec!["T2 output".to_string()],
+        });
+
+        assert_eq!(app.state.selected_task_idx, 0);
+
+        // Down selects next task
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.selected_task_idx, 1);
+
+        // Down wraps back to first
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.selected_task_idx, 0);
+
+        // Up wraps to last
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state.selected_task_idx, 1);
+
+        // Right/Left toggles pane category
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::QA
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.selected_pane_category,
+            crate::model::PaneCategory::Agent
+        );
+    }
+
+    #[test]
+    fn task_selection_snaps_pane_when_no_panes_exist() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            TaskOverviewRow {
+                task_id: TaskId("T1".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T1".to_string(),
+                branch: "task/T1".to_string(),
+                stack_position: None,
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
+                verify_summary: "not_run".to_string(),
+                last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
+            },
+            TaskOverviewRow {
+                task_id: TaskId("T2".to_string()),
+                repo_id: RepoId("example".to_string()),
+                title: "Task T2".to_string(),
+                branch: "task/T2".to_string(),
+                stack_position: None,
+                state: TaskState::Chatting,
+                display_state: "Chatting".to_string(),
+                verify_summary: "not_run".to_string(),
+                last_activity: Utc::now(),
+                qa_status: None,
+                qa_tests: Vec::new(),
+                qa_targets: Vec::new(),
+            },
+        ];
+        // No panes at all
+
+        // Moving through tasks should not panic
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.selected_task_idx, 1);
+        assert_eq!(app.state.selected_pane_idx, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state.selected_task_idx, 0);
+    }
+
+    #[test]
+    fn toggle_focused_task_clears_scroll_back() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..20).map(|i| format!("line {i}")).collect(),
+        });
+
+        // Open task detail
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.state.focused_task);
+
+        // Scroll up
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.state.scroll_back > 0);
+
+        // Close task detail — scroll_back should reset
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.state.focused_task);
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn toggle_focused_pane_clears_scroll_back() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..20).map(|i| format!("line {i}")).collect(),
+        });
+
+        // Focus pane via Tab
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, Some(0));
+
+        // Scroll up
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.state.scroll_back > 0);
+
+        // Unfocus pane via Tab — scroll_back should reset
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn esc_from_focused_pane_clears_scroll_back() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: (0..20).map(|i| format!("line {i}")).collect(),
+        });
+
+        app.state.focused_pane_idx = Some(0);
+        app.state.scroll_back = 5;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.scroll_back, 0);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn entering_focused_task_clears_focused_pane_and_scroll() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["output".to_string()],
+        });
+
+        // Focus a pane and set scroll
+        app.state.focused_pane_idx = Some(0);
+        app.state.scroll_back = 3;
+
+        // Enter task detail — should clear focused pane and scroll
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.state.focused_task);
+        assert_eq!(app.state.focused_pane_idx, None);
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn entering_focused_pane_clears_focused_task() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["output".to_string()],
+        });
+
+        // Enter task detail first
+        app.state.focused_task = true;
+
+        // Tab to focus pane — should clear focused task
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!app.state.focused_task);
+        assert_eq!(app.state.focused_pane_idx, Some(0));
+    }
+
+    #[test]
+    fn scroll_down_never_goes_negative() {
+        let mut app = TuiApp::default();
+        app.apply_event(TuiEvent::AgentPaneOutput {
+            instance_id: "agent-T1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            model: ModelKind::Claude,
+            lines: vec!["line".to_string()],
+        });
+        app.state.focused_pane_idx = Some(0);
+
+        // Already at bottom (scroll_back = 0), scroll down should remain 0
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 0);
+
+        // Page down at bottom should remain 0
+        app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.state.scroll_back, 0);
+    }
+
+    #[test]
+    fn normal_view_keys_pass_through_when_focused() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![TaskOverviewRow {
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: "Task T1".to_string(),
+            branch: "task/T1".to_string(),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }];
+        app.state.focused_task = true;
+
+        // Action keys should still work in focused views (they fall through)
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, UiAction::StartAgent);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_any_view() {
+        // From normal view
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+
+        // From focused task view
+        let mut app = TuiApp::default();
+        app.state.focused_task = true;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+
+        // From focused pane view
+        let mut app = TuiApp::default();
+        app.state.focused_pane_idx = Some(0);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+
+        // From input mode
+        let mut app = TuiApp::default();
+        app.input_mode = super::InputMode::NewChatPrompt {
+            buffer: "test".to_string(),
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    fn make_task_row(id: &str) -> TaskOverviewRow {
+        TaskOverviewRow {
+            task_id: TaskId(id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {id}"),
+            branch: format!("task/{id}"),
+            stack_position: None,
+            state: TaskState::Chatting,
+            display_state: "Chatting".to_string(),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chat_history_up_arrow_recalls_previous_message() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Send two messages to build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "first message".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "second message".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Enter chat input mode again
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some(""));
+
+        // Up arrow shows most recent message
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("second message"));
+
+        // Up arrow again shows older message
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("first message"));
+
+        // Up arrow at oldest entry stays put
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("first message"));
+    }
+
+    #[test]
+    fn chat_history_down_arrow_returns_to_draft() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "msg one".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "msg two".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Start typing a draft, then navigate history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "my draft".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        // Up to history
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("msg two"));
+
+        // Down back to draft
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("my draft"));
+
+        // Down at draft does nothing
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("my draft"));
+    }
+
+    #[test]
+    fn chat_history_up_with_no_history_does_nothing() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "hello".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        // No history yet, Up arrow should leave buffer unchanged
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("hello"));
+    }
+
+    #[test]
+    fn chat_history_typing_resets_history_index() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        // Build history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "old msg".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Start new input, navigate to history, then type
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old msg"));
+
+        // Typing a character resets history navigation
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old msg!"));
+
+        // Down should do nothing now (history_index is None)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("old msg!"));
+    }
+
+    #[test]
+    fn chat_history_is_per_task() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1"), make_task_row("T2")];
+
+        // Send a message for T1
+        app.state.selected_task_idx = 0;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "T1 msg".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Switch to T2 and send a message
+        app.state.selected_task_idx = 1;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "T2 msg".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Check T2 history
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("T2 msg"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Check T1 history
+        app.state.selected_task_idx = 0;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_prompt(), Some("T1 msg"));
+    }
+
+    #[test]
+    fn chat_history_submitted_message_is_stored() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for ch in "hello world".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.chat_history.get(&TaskId("T1".to_string())),
+            Some(&vec!["hello world".to_string()])
+        );
     }
 }

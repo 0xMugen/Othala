@@ -19,6 +19,7 @@ pub enum AllowedAutoCommand {
     Submit,
     SubmitStack,
     RepoInit,
+    Track,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +182,21 @@ fn validate_contract(allowed: AllowedAutoCommand, args: &[OsString]) -> Result<(
                 }
                 && arg_eq(args, 3, "--no-interactive")
         }
+        AllowedAutoCommand::Track => {
+            // gt track <branch> --parent <parent> --no-interactive
+            args.len() == 5
+                && arg_eq(args, 0, "track")
+                && {
+                    let branch = arg_at(args, 1);
+                    !branch.trim().is_empty() && !branch.starts_with('-')
+                }
+                && arg_eq(args, 2, "--parent")
+                && {
+                    let parent = arg_at(args, 3);
+                    !parent.trim().is_empty() && !parent.starts_with('-')
+                }
+                && arg_eq(args, 4, "--no-interactive")
+        }
     };
 
     if ok {
@@ -281,6 +297,11 @@ mod tests {
             &os(&["sync", "--no-restack", "--force", "--no-interactive"])
         )
         .is_ok());
+        assert!(validate_contract(
+            AllowedAutoCommand::Track,
+            &os(&["track", "task/T1", "--parent", "main", "--no-interactive"])
+        )
+        .is_ok());
     }
 
     #[test]
@@ -345,6 +366,21 @@ mod tests {
             &os(&["init", "--trunk", "", "--no-interactive"]),
         )
         .expect_err("empty trunk should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        // Track rejects empty branch/parent
+        let err = validate_contract(
+            AllowedAutoCommand::Track,
+            &os(&["track", "", "--parent", "main", "--no-interactive"]),
+        )
+        .expect_err("empty track branch should fail");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+
+        let err = validate_contract(
+            AllowedAutoCommand::Track,
+            &os(&["track", "task/T1", "--parent", "", "--no-interactive"]),
+        )
+        .expect_err("empty track parent should fail");
         assert!(matches!(err, GraphiteError::ContractViolation { .. }));
     }
 

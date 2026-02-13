@@ -202,6 +202,10 @@ pub fn daemon_tick(
     let qa_keys: Vec<String> = daemon_state.qa_agents.keys().cloned().collect();
     for key in qa_keys {
         if let Some(qa_state) = daemon_state.qa_agents.get_mut(&key) {
+            // Only poll if there is an actual child process to check.
+            if qa_state.child_handle.is_none() {
+                continue;
+            }
             if let Some(result) = poll_qa_agent(qa_state) {
                 let task_id = TaskId::new(&key);
                 let all_passed = result.summary.failed == 0;

@@ -58,6 +58,38 @@ impl WorktreeManager {
         repo.root.join(&self.relative_root).join(&task_id.0)
     }
 
+    /// Create a worktree **and** a new branch in one step.
+    ///
+    /// Runs `git worktree add -b <branch> <path>`.  This never touches the main
+    /// worktree's HEAD, so VSCode/other editors won't see a branch switch.
+    pub fn create_with_new_branch(
+        &self,
+        repo: &RepoHandle,
+        spec: &WorktreeSpec,
+    ) -> Result<WorktreeInfo, GitError> {
+        let root = repo.root.join(&self.relative_root);
+        fs::create_dir_all(&root).map_err(|source| GitError::Io {
+            command: format!("create_dir_all {}", root.display()),
+            source,
+        })?;
+
+        let path = self.task_worktree_path(repo, &spec.task_id);
+        let args = vec![
+            OsString::from("worktree"),
+            OsString::from("add"),
+            OsString::from("-b"),
+            OsString::from(spec.branch.as_str()),
+            path.as_os_str().to_os_string(),
+        ];
+        self.git.run(&repo.root, args)?;
+
+        Ok(WorktreeInfo {
+            task_id: spec.task_id.clone(),
+            branch: spec.branch.clone(),
+            path,
+        })
+    }
+
     pub fn create_for_existing_branch(
         &self,
         repo: &RepoHandle,

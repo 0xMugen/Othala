@@ -1028,7 +1028,10 @@ fn run() -> Result<(), MainError> {
 
             let qa_state = qa_agents.get_mut(&qa_key).unwrap();
             let qa_type = qa_state.qa_type;
-            if let Some(qa_result) = qa_agent::poll_qa_agent(qa_state) {
+            let poll_result = qa_agent::poll_qa_agent(qa_state);
+            let qa_failed = qa_state.status == qa_agent::QAStatus::Failed;
+
+            if let Some(qa_result) = poll_result {
                 // QA agent completed — save result and update UI.
                 let _ = qa_agent::save_qa_result(&repo_root, &qa_result);
 
@@ -1212,6 +1215,21 @@ fn run() -> Result<(), MainError> {
                     }
                 }
 
+                qa_agents.remove(&qa_key);
+            } else if qa_failed {
+                // QA agent process died without producing results.
+                // Remove the dead entry so it doesn't block future QA spawns.
+                let qa_instance = qa_key.clone();
+                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                    instance_id: qa_instance,
+                    status: AgentPaneStatus::Failed,
+                });
+                app.apply_event(TuiEvent::StatusLine {
+                    message: format!(
+                        "QA {} failed for {} (process terminated without output)",
+                        qa_type, task_id.0
+                    ),
+                });
                 qa_agents.remove(&qa_key);
             }
         }

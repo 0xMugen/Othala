@@ -211,6 +211,31 @@ impl GraphiteClient {
         Ok(())
     }
 
+    /// Track an existing branch with Graphite, setting its parent in the stack.
+    ///
+    /// This runs `gt track <branch> --parent <parent> --no-interactive` from the
+    /// client's `repo_root` directory. Useful when a branch was created with plain
+    /// `git branch` (e.g. inside a worktree) and needs to be registered with
+    /// Graphite after the fact.
+    pub fn track_branch(&self, branch: &str, parent: &str) -> Result<(), GraphiteError> {
+        if branch.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "branch name for gt track must not be empty".to_string(),
+            });
+        }
+        if parent.trim().is_empty() {
+            return Err(GraphiteError::ContractViolation {
+                message: "parent branch for gt track must not be empty".to_string(),
+            });
+        }
+        self.cli.run_allowed(
+            self.repo_root.as_path(),
+            AllowedAutoCommand::Track,
+            ["track", branch, "--parent", parent, "--no-interactive"],
+        )?;
+        Ok(())
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
@@ -384,6 +409,51 @@ mod tests {
                 assert!(command.contains("move"));
                 assert!(command.contains("--onto"));
                 assert!(command.contains("task/T1"));
+                assert!(command.contains("--no-interactive"));
+            }
+            other => panic!("expected io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn track_branch_rejects_blank_branch() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .track_branch("  ", "main")
+            .expect_err("blank branch must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn track_branch_rejects_blank_parent() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .track_branch("task/T1", "  ")
+            .expect_err("blank parent must fail contract check");
+        assert!(matches!(err, GraphiteError::ContractViolation { .. }));
+    }
+
+    #[test]
+    fn track_branch_passes_expected_flags() {
+        let client = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let err = client
+            .track_branch("task/T1", "main")
+            .expect_err("missing binary should surface io error");
+        match err {
+            GraphiteError::Io { command, .. } => {
+                assert!(command.contains("track"));
+                assert!(command.contains("task/T1"));
+                assert!(command.contains("--parent"));
+                assert!(command.contains("main"));
                 assert!(command.contains("--no-interactive"));
             }
             other => panic!("expected io error, got {other:?}"),
