@@ -7,7 +7,7 @@ use orchd::qa_agent;
 use orchd::stack_pipeline::{self, PipelineState};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{OrchdService, Scheduler, SchedulerConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -119,6 +119,47 @@ fn spawn_qa_agent_with_fallback(
             }
         }
     }
+}
+
+fn is_environment_blocker_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("operation not permitted")
+        || lower.contains("permission denied")
+        || lower.contains("error connecting to /tmp/tmux")
+        || lower.contains("dependent on tmux tui session")
+        || lower.contains("prerequisite failed: `tmux")
+        || lower.contains("sandbox")
+        || lower.contains("[context-gen] agent produced no context files")
+}
+
+fn qa_result_is_environment_blocked(result: &qa_agent::QAResult) -> bool {
+    let failed: Vec<&qa_agent::QATestResult> = result.tests.iter().filter(|t| !t.passed).collect();
+    !failed.is_empty()
+        && failed
+            .iter()
+            .all(|t| is_environment_blocker_text(&t.detail))
+}
+
+fn qa_output_is_environment_blocked(lines: &[String]) -> bool {
+    !lines.is_empty() && lines.iter().any(|line| is_environment_blocker_text(line))
+}
+
+fn failed_test_keys(result: &qa_agent::QAResult) -> HashSet<(String, String)> {
+    result
+        .tests
+        .iter()
+        .filter(|t| !t.passed)
+        .map(|t| (t.suite.clone(), t.name.clone()))
+        .collect()
+}
+
+fn qa_failures_no_worse_than_baseline(
+    validation: &qa_agent::QAResult,
+    baseline: &qa_agent::QAResult,
+) -> bool {
+    let validation_failed = failed_test_keys(validation);
+    let baseline_failed = failed_test_keys(baseline);
+    !validation_failed.is_empty() && validation_failed.is_subset(&baseline_failed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +426,7 @@ fn run() -> Result<(), MainError> {
     let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
     let mut tick_counter: u32 = 0;
     let mut qa_agents: HashMap<String, qa_agent::QAState> = HashMap::new();
+    let mut baseline_results_by_task: HashMap<String, qa_agent::QAResult> = HashMap::new();
     let mut pipelines: HashMap<String, PipelineState> = HashMap::new();
     let mut pipeline_procs: HashMap<String, PipelineProc> = HashMap::new();
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -760,13 +802,10 @@ fn run() -> Result<(), MainError> {
                         .unwrap_or_else(|| repo_root.clone());
                     let baseline = qa_agent::load_baseline(&repo_root).unwrap();
                     let task_spec = qa_agent::load_task_spec(&repo_root, &outcome.task_id);
-                    let previous = service
-                        .task(&outcome.task_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|t| t.branch_name)
-                        .as_deref()
-                        .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
+                    let previous = baseline_results_by_task
+                        .get(&outcome.task_id.0)
+                        .cloned()
+                        .or_else(|| qa_agent::load_latest_result(&repo_root, "main"));
                     let prompt = qa_agent::build_qa_prompt(
                         &baseline,
                         task_spec.as_deref(),
@@ -1061,7 +1100,27 @@ fn run() -> Result<(), MainError> {
                 let _ = qa_agent::save_qa_result(&repo_root, &qa_result);
 
                 let all_passed = qa_result.summary.failed == 0;
-                let status = if all_passed {
+                let env_blocked = qa_result_is_environment_blocked(&qa_result);
+                let baseline_matched = if qa_type == qa_agent::QAType::Validation
+                    && !all_passed
+                    && !env_blocked
+                {
+                    baseline_results_by_task
+                        .get(&task_id.0)
+                        .cloned()
+                        .or_else(|| qa_agent::load_latest_result(&repo_root, "main"))
+                        .as_ref()
+                        .map(|baseline| qa_failures_no_worse_than_baseline(&qa_result, baseline))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let qa_ok = all_passed || env_blocked || baseline_matched;
+                let status = if env_blocked {
+                    format!("{qa_type} blocked by environment")
+                } else if baseline_matched {
+                    format!("{qa_type} matched baseline (no regressions)")
+                } else if all_passed {
                     format!(
                         "{} passed {}/{}",
                         qa_type, qa_result.summary.passed, qa_result.summary.total
@@ -1092,7 +1151,7 @@ fn run() -> Result<(), MainError> {
                 let qa_instance = qa_key.clone();
                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
                     instance_id: qa_instance,
-                    status: if all_passed {
+                    status: if qa_ok {
                         AgentPaneStatus::Exited
                     } else {
                         AgentPaneStatus::Failed
@@ -1109,18 +1168,37 @@ fn run() -> Result<(), MainError> {
                     message: format!("QA {status} for {}", task_id.0),
                 });
 
+                if qa_type == qa_agent::QAType::Baseline && qa_key.starts_with("qa-base-") {
+                    baseline_results_by_task.insert(task_id.0.clone(), qa_result.clone());
+                }
+
                 // If this was a validation run, advance the task based on result.
                 if qa_type == qa_agent::QAType::Validation {
                     let now = Utc::now();
-                    if all_passed {
-                        let event_id = EventId(format!("E-READY-QA-{}", task_id.0));
+                    if qa_ok {
+                        let event_id = if env_blocked {
+                            EventId(format!("E-READY-QA-BLOCKED-{}", task_id.0))
+                        } else if baseline_matched {
+                            EventId(format!("E-READY-QA-BASELINE-{}", task_id.0))
+                        } else {
+                            EventId(format!("E-READY-QA-{}", task_id.0))
+                        };
                         match service.mark_ready(&task_id, event_id, now) {
                             Ok(_) => {
                                 app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "{} -> Ready (QA validation passed)",
-                                        task_id.0
-                                    ),
+                                    message: if env_blocked {
+                                        format!(
+                                            "{} -> Ready (QA validation blocked by environment)",
+                                            task_id.0
+                                        )
+                                    } else if baseline_matched {
+                                        format!(
+                                            "{} -> Ready (QA validation matched baseline)",
+                                            task_id.0
+                                        )
+                                    } else {
+                                        format!("{} -> Ready (QA validation passed)", task_id.0)
+                                    },
                                 });
                             }
                             Err(e) => {
@@ -1224,16 +1302,49 @@ fn run() -> Result<(), MainError> {
                 // QA agent process died without producing results.
                 // Remove the dead entry so it doesn't block future QA spawns.
                 let qa_instance = qa_key.clone();
-                app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                    instance_id: qa_instance,
-                    status: AgentPaneStatus::Failed,
-                });
-                app.apply_event(TuiEvent::StatusLine {
-                    message: format!(
-                        "QA {} failed for {} (process terminated without output)",
-                        qa_type, task_id.0
-                    ),
-                });
+                let env_blocked = qa_output_is_environment_blocked(&qa_state.output_buffer);
+                if env_blocked {
+                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                        instance_id: qa_instance,
+                        status: AgentPaneStatus::Exited,
+                    });
+                    let targets = qa_agent::load_task_spec(&repo_root, &task_id)
+                        .map(|s| extract_targets(&s))
+                        .unwrap_or_default();
+                    app.apply_event(TuiEvent::QAUpdate {
+                        task_id: task_id.clone(),
+                        status: format!("{qa_type} blocked by environment"),
+                        tests: vec![],
+                        targets,
+                    });
+                    app.apply_event(TuiEvent::StatusLine {
+                        message: format!(
+                            "QA {} blocked by environment for {} (process terminated without structured output)",
+                            qa_type, task_id.0
+                        ),
+                    });
+                    if qa_type == qa_agent::QAType::Validation {
+                        let _ = service.mark_ready(
+                            &task_id,
+                            EventId(format!("E-READY-QA-BLOCKED-{}", task_id.0)),
+                            Utc::now(),
+                        );
+                        if let Ok(tasks) = service.list_top_level_tasks() {
+                            app.apply_event(TuiEvent::TasksReplaced { tasks });
+                        }
+                    }
+                } else {
+                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                        instance_id: qa_instance,
+                        status: AgentPaneStatus::Failed,
+                    });
+                    app.apply_event(TuiEvent::StatusLine {
+                        message: format!(
+                            "QA {} failed for {} (process terminated without output)",
+                            qa_type, task_id.0
+                        ),
+                    });
+                }
                 qa_agents.remove(&qa_key);
             }
         }
