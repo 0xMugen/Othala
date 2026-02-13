@@ -8,10 +8,9 @@ use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
 use orchd::supervisor::AgentSupervisor;
-use orchd::{provision_chat_workspace, OrchdService, Scheduler, SchedulerConfig};
+use orchd::{provision_chat_workspace_on_base, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
 
 #[derive(Parser)]
 #[command(name = "othala")]
@@ -105,16 +104,17 @@ fn run_context_gen_with_status(
 
     std::thread::spawn(move || {
         let ptx = progress_tx;
-        let result = orchd::context_gen::ensure_context_exists_blocking(
-            &repo,
-            &tmpl,
-            model,
-            move |line| { let _ = ptx.send(line.to_string()); },
-        );
+        let result =
+            orchd::context_gen::ensure_context_exists_blocking(&repo, &tmpl, model, move |line| {
+                let _ = ptx.send(line.to_string());
+            });
         let _ = result_tx.send(result);
     });
 
-    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let spinner_frames = [
+        '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}',
+        '\u{2827}', '\u{2807}', '\u{280f}',
+    ];
     let mut frame = 0usize;
     let mut last_status = String::from("starting agent...");
 
@@ -171,6 +171,20 @@ fn print_task_list(tasks: &[Task]) {
     }
 }
 
+fn find_stack_parent(tasks: &[Task], repo_id: &RepoId) -> Option<(TaskId, String)> {
+    tasks
+        .iter()
+        .filter(|task| &task.repo_id == repo_id)
+        .filter(|task| !matches!(task.state, TaskState::Merged | TaskState::Stopped))
+        .filter_map(|task| {
+            task.branch_name
+                .as_ref()
+                .map(|branch| (task.id.clone(), branch.clone(), task.updated_at))
+        })
+        .max_by(|a, b| a.2.cmp(&b.2))
+        .map(|(task_id, branch, _)| (task_id, branch))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -202,15 +216,27 @@ fn main() -> anyhow::Result<()> {
                 let task_id = format!("chat-{}", Utc::now().timestamp_millis());
                 let task_id = TaskId::new(&task_id);
                 let start_path = std::env::current_dir()?;
-                let workspace = provision_chat_workspace(&start_path, &task_id)?;
+                let repo_id = RepoId(repo.clone());
+                let parent = find_stack_parent(&service.list_tasks()?, &repo_id);
+                let workspace = provision_chat_workspace_on_base(
+                    &start_path,
+                    &task_id,
+                    parent.as_ref().map(|(_, branch)| branch.as_str()),
+                )?;
 
                 let mut task = Task::new(
                     task_id.clone(),
-                    RepoId(repo.clone()),
+                    repo_id.clone(),
                     title.clone(),
                     workspace.worktree_path.clone(),
                 );
                 task.branch_name = Some(workspace.branch_name.clone());
+                if let Some((parent_task_id, _)) = parent.as_ref() {
+                    task.parent_task_id = Some(parent_task_id.clone());
+                    if !task.depends_on.contains(parent_task_id) {
+                        task.depends_on.push(parent_task_id.clone());
+                    }
+                }
 
                 let model_kind = match model.to_lowercase().as_str() {
                     "claude" => ModelKind::Claude,
@@ -229,13 +255,25 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 service.create_task(&task, &event)?;
-                println!(
-                    "Created chat: {} - {} [{} @ {}]",
-                    task_id.0,
-                    title,
-                    workspace.branch_name,
-                    workspace.worktree_path.display()
-                );
+                if let Some((parent_task_id, parent_branch)) = parent {
+                    println!(
+                        "Created chat: {} - {} [{} @ {}] (stacked on {} / {})",
+                        task_id.0,
+                        title,
+                        workspace.branch_name,
+                        workspace.worktree_path.display(),
+                        parent_task_id.0,
+                        parent_branch
+                    );
+                } else {
+                    println!(
+                        "Created chat: {} - {} [{} @ {}]",
+                        task_id.0,
+                        title,
+                        workspace.branch_name,
+                        workspace.worktree_path.display()
+                    );
+                }
             }
             ChatAction::List => {
                 print_task_list(&service.list_tasks()?);
@@ -285,11 +323,9 @@ fn main() -> anyhow::Result<()> {
             let template_dir = PathBuf::from("templates/prompts");
 
             // Ensure context files exist before entering the loop.
-            if let Err(e) = run_context_gen_with_status(
-                &repo_root,
-                &template_dir,
-                ModelKind::Claude,
-            ) {
+            if let Err(e) =
+                run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude)
+            {
                 eprintln!("[daemon] Context generation failed (non-fatal): {e}");
             }
             eprintln!();

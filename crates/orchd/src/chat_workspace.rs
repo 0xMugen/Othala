@@ -11,6 +11,17 @@ pub struct ChatWorkspace {
 }
 
 pub fn provision_chat_workspace(start_path: &Path, task_id: &TaskId) -> Result<ChatWorkspace> {
+    provision_chat_workspace_on_base(start_path, task_id, None)
+}
+
+/// Provision a chat workspace and optionally force a specific base branch.
+///
+/// When `base_branch_override` is `None`, the current branch is used.
+pub fn provision_chat_workspace_on_base(
+    start_path: &Path,
+    task_id: &TaskId,
+    base_branch_override: Option<&str>,
+) -> Result<ChatWorkspace> {
     let git = GitCli::default();
     let repo = discover_repo(start_path, &git).with_context(|| {
         format!(
@@ -19,12 +30,21 @@ pub fn provision_chat_workspace(start_path: &Path, task_id: &TaskId) -> Result<C
         )
     })?;
 
-    let base_branch =
-        current_branch(&repo, &git).context("failed to read current branch")?;
+    let base_branch = match base_branch_override {
+        Some(branch) => branch.to_string(),
+        None => current_branch(&repo, &git).context("failed to read current branch")?,
+    };
     let branch_name = branch_name_for_task(task_id);
     let commit_message = format!("start {}", task_id.0);
 
-    provision_inner(&git, &repo, &base_branch, &branch_name, &commit_message, task_id)
+    provision_inner(
+        &git,
+        &repo,
+        &base_branch,
+        &branch_name,
+        &commit_message,
+        task_id,
+    )
 }
 
 fn provision_inner(
@@ -45,7 +65,7 @@ fn provision_inner(
         branch: branch_name.to_string(),
     };
 
-    let info = match manager.create_with_new_branch(repo, &spec) {
+    let info = match manager.create_with_new_branch_from(repo, &spec, base_branch) {
         Ok(info) => info,
         Err(err) => {
             return Err(anyhow!(err)).context("failed to create task worktree");
@@ -57,9 +77,14 @@ fn provision_inner(
     if let Err(e) = git.run(
         &info.path,
         [
-            "-c", "user.name=Othala",
-            "-c", "user.email=othala@localhost",
-            "commit", "--allow-empty", "-m", commit_message,
+            "-c",
+            "user.name=Othala",
+            "-c",
+            "user.email=othala@localhost",
+            "commit",
+            "--allow-empty",
+            "-m",
+            commit_message,
         ],
     ) {
         // Clean up on failure.
@@ -100,10 +125,7 @@ pub fn ensure_worktree_exists(repo_root: &Path, task: &orch_core::types::Task) -
     let repo = discover_repo(repo_root, &git)?;
     let manager = WorktreeManager::default();
     let default_branch = format!("task/{}", task.id.0);
-    let branch = task
-        .branch_name
-        .as_deref()
-        .unwrap_or(&default_branch);
+    let branch = task.branch_name.as_deref().unwrap_or(&default_branch);
     let spec = WorktreeSpec {
         task_id: task.id.clone(),
         branch: branch.to_string(),

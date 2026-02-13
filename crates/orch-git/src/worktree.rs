@@ -67,6 +67,24 @@ impl WorktreeManager {
         repo: &RepoHandle,
         spec: &WorktreeSpec,
     ) -> Result<WorktreeInfo, GitError> {
+        self.create_with_new_branch_from(repo, spec, "HEAD")
+    }
+
+    /// Create a worktree and branch from a specific start point.
+    ///
+    /// Runs `git worktree add -b <branch> <path> <start_point>`.
+    pub fn create_with_new_branch_from(
+        &self,
+        repo: &RepoHandle,
+        spec: &WorktreeSpec,
+        start_point: &str,
+    ) -> Result<WorktreeInfo, GitError> {
+        if start_point.trim().is_empty() {
+            return Err(GitError::Parse {
+                context: "worktree start point must not be empty".to_string(),
+            });
+        }
+
         let root = repo.root.join(&self.relative_root);
         fs::create_dir_all(&root).map_err(|source| GitError::Io {
             command: format!("create_dir_all {}", root.display()),
@@ -80,6 +98,7 @@ impl WorktreeManager {
             OsString::from("-b"),
             OsString::from(spec.branch.as_str()),
             path.as_os_str().to_os_string(),
+            OsString::from(start_point),
         ];
         self.git.run(&repo.root, args)?;
 

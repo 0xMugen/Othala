@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
+use orch_graphite::GraphiteClient;
 
 use crate::context_gen::{
     build_context_gen_prompt, context_is_current, poll_context_gen, should_regenerate,
@@ -16,17 +17,18 @@ use crate::context_graph::{load_context_graph, ContextLoadConfig};
 use crate::prompt_builder::{build_rich_prompt, PromptConfig, PromptRole, RetryContext};
 use crate::qa_agent::{
     build_qa_failure_context, build_qa_prompt, load_baseline, load_latest_result,
-    load_task_spec as load_qa_task_spec, poll_qa_agent, save_qa_result, spawn_qa_agent,
-    QAResult, QAState, QAStatus, QAType,
+    load_task_spec as load_qa_task_spec, poll_qa_agent, save_qa_result, spawn_qa_agent, QAResult,
+    QAState, QAStatus, QAType,
 };
 use crate::retry::evaluate_retry;
-use crate::stack_pipeline::{PipelineAction, PipelineState, next_action};
+use crate::stack_pipeline::{next_action, PipelineAction, PipelineState};
 use crate::supervisor::{AgentOutcome, AgentSupervisor};
 use crate::test_spec::load_test_spec;
 use crate::OrchdService;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Configuration for the daemon loop.
 #[derive(Debug, Clone)]
@@ -98,20 +100,11 @@ pub enum DaemonAction {
     /// Trigger background context regeneration.
     TriggerContextRegen,
     /// Spawn a QA agent (baseline or validation).
-    SpawnQA {
-        task_id: TaskId,
-        qa_type: QAType,
-    },
+    SpawnQA { task_id: TaskId, qa_type: QAType },
     /// QA run completed successfully — all tests passed.
-    QACompleted {
-        task_id: TaskId,
-        result: QAResult,
-    },
+    QACompleted { task_id: TaskId, result: QAResult },
     /// QA run found failures.
-    QAFailed {
-        task_id: TaskId,
-        result: QAResult,
-    },
+    QAFailed { task_id: TaskId, result: QAResult },
     /// Log a message.
     Log { message: String },
 }
@@ -148,10 +141,7 @@ pub fn daemon_tick(
     if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
         for task in &chatting {
             let default_branch = format!("task/{}", task.id.0);
-            let branch = task
-                .branch_name
-                .as_deref()
-                .unwrap_or(&default_branch);
+            let branch = task.branch_name.as_deref().unwrap_or(&default_branch);
 
             // Skip if QA agent already running for this task.
             if daemon_state.qa_agents.contains_key(&task.id.0) {
@@ -187,8 +177,7 @@ pub fn daemon_tick(
     }
 
     for outcome in &poll_result.completed {
-        let outcome_actions =
-            handle_agent_completion(service, outcome, config, now);
+        let outcome_actions = handle_agent_completion(service, outcome, config, now);
         actions.extend(outcome_actions);
     }
 
@@ -291,19 +280,14 @@ pub fn daemon_tick(
     }
 
     // Clean up terminal pipelines.
-    daemon_state
-        .pipelines
-        .retain(|_, p| !p.is_terminal());
+    daemon_state.pipelines.retain(|_, p| !p.is_terminal());
 
     // --- Phase 4: Context generation ---
 
     // Poll any running context gen process.
     if let Some(paths) = poll_context_gen(&config.repo_root, &mut daemon_state.context_gen) {
         actions.push(DaemonAction::Log {
-            message: format!(
-                "[context-gen] Updated {} context files",
-                paths.len()
-            ),
+            message: format!("[context-gen] Updated {} context files", paths.len()),
         });
     }
 
@@ -344,12 +328,14 @@ fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction
         .map(|spec| spec.raw);
 
     let retry = if task.retry_count > 0 {
-        task.last_failure_reason.as_ref().map(|reason| RetryContext {
-            attempt: task.retry_count + 1,
-            max_retries: task.max_retries,
-            previous_failure: reason.clone(),
-            previous_model: *task.failed_models.last().unwrap_or(&model),
-        })
+        task.last_failure_reason
+            .as_ref()
+            .map(|reason| RetryContext {
+                attempt: task.retry_count + 1,
+                max_retries: task.max_retries,
+                previous_failure: reason.clone(),
+                previous_model: *task.failed_models.last().unwrap_or(&model),
+            })
     } else {
         None
     };
@@ -455,6 +441,112 @@ fn find_parent_branch(service: &OrchdService, task: &Task) -> Option<String> {
     parent.branch_name
 }
 
+fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("failed to spawn verify command `{command}`: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "verify command `{command}` failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    ))
+}
+
+fn apply_retry_transition(
+    service: &OrchdService,
+    task_id: &TaskId,
+    next_model: ModelKind,
+    reason: &str,
+    at: DateTime<Utc>,
+) -> Result<bool, String> {
+    let Some(mut task) = service.task(task_id).map_err(|e| e.to_string())? else {
+        return Err(format!("task not found for retry: {}", task_id.0));
+    };
+
+    if task.retry_count >= task.max_retries {
+        let failed_event = Event {
+            id: EventId(format!(
+                "E-FAILED-{}-{}",
+                task_id.0,
+                at.timestamp_nanos_opt().unwrap_or_default()
+            )),
+            task_id: Some(task_id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at,
+            kind: EventKind::TaskFailed {
+                reason: format!(
+                    "{} (max retries reached: {}/{})",
+                    reason, task.retry_count, task.max_retries
+                ),
+                is_final: true,
+            },
+        };
+        let _ = service.record_event(&failed_event);
+
+        task.state = TaskState::Stopped;
+        task.last_failure_reason = Some(reason.to_string());
+        task.updated_at = at;
+        service
+            .store
+            .upsert_task(&task)
+            .map_err(|e| format!("failed to persist stopped task {}: {e}", task_id.0))?;
+        return Ok(false);
+    }
+
+    task.retry_count += 1;
+    if let Some(prev_model) = task.preferred_model {
+        if prev_model != next_model && !task.failed_models.contains(&prev_model) {
+            task.failed_models.push(prev_model);
+        }
+    }
+    task.preferred_model = Some(next_model);
+    task.last_failure_reason = Some(reason.to_string());
+    service
+        .store
+        .upsert_task(&task)
+        .map_err(|e| format!("failed to update task for retry {}: {e}", task_id.0))?;
+
+    if task.state != TaskState::Chatting {
+        let _ = service.transition_task_state(
+            task_id,
+            TaskState::Chatting,
+            EventId(format!(
+                "E-RETRY-STATE-{}-{}",
+                task_id.0,
+                at.timestamp_nanos_opt().unwrap_or_default()
+            )),
+            at,
+        );
+    }
+
+    let retry_event = Event {
+        id: EventId(format!(
+            "E-RETRY-{}-{}",
+            task_id.0,
+            at.timestamp_nanos_opt().unwrap_or_default()
+        )),
+        task_id: Some(task_id.clone()),
+        repo_id: Some(task.repo_id),
+        at,
+        kind: EventKind::RetryScheduled {
+            attempt: task.retry_count,
+            model: next_model.as_str().to_string(),
+            reason: reason.to_string(),
+        },
+    };
+    let _ = service.record_event(&retry_event);
+    Ok(true)
+}
+
 /// Execute the actions produced by a daemon tick.
 ///
 /// This is the side-effectful counterpart to `daemon_tick()`. The daemon
@@ -506,53 +598,39 @@ pub fn execute_actions(
                     },
                 };
                 if let Err(e) = service.record_event(&event) {
-                    eprintln!("[daemon] Failed to record needs_human for {}: {}", task_id.0, e);
+                    eprintln!(
+                        "[daemon] Failed to record needs_human for {}: {}",
+                        task_id.0, e
+                    );
                 }
             }
             DaemonAction::ScheduleRetry {
                 task_id,
                 next_model,
                 reason,
-            } => {
-                // Update the task for retry: bump retry_count, add failed model,
-                // transition back to Chatting.
-                if let Ok(Some(mut task)) = service.task(task_id) {
-                    task.retry_count += 1;
-                    if let Some(prev_model) = task.preferred_model {
-                        if !task.failed_models.contains(&prev_model) {
-                            task.failed_models.push(prev_model);
-                        }
-                    }
-                    task.preferred_model = Some(*next_model);
-                    task.last_failure_reason = Some(reason.clone());
-
-                    // Persist updated task and transition to Chatting.
-                    if let Err(e) = service.store.upsert_task(&task) {
-                        eprintln!("[daemon] Failed to update task for retry {}: {}", task_id.0, e);
-                        return;
-                    }
-
-                    let event = Event {
-                        id: EventId(format!("E-RETRY-{}-{}", task_id.0, task.retry_count)),
-                        task_id: Some(task_id.clone()),
-                        repo_id: Some(task.repo_id.clone()),
-                        at: now,
-                        kind: EventKind::RetryScheduled {
-                            attempt: task.retry_count,
-                            model: next_model.as_str().to_string(),
-                            reason: reason.clone(),
-                        },
-                    };
-                    let _ = service.record_event(&event);
+            } => match apply_retry_transition(service, task_id, *next_model, reason, now) {
+                Ok(true) => {
+                    daemon_state.pipelines.remove(&task_id.0);
+                    eprintln!("[daemon] {} scheduled retry with {}", task_id.0, next_model);
+                }
+                Ok(false) => {
+                    daemon_state.pipelines.remove(&task_id.0);
                     eprintln!(
-                        "[daemon] {} retry #{} with {}",
-                        task_id.0, task.retry_count, next_model.as_str()
+                        "[daemon] {} reached max retries; task moved to STOPPED",
+                        task_id.0
                     );
                 }
-            }
+                Err(e) => {
+                    eprintln!("[daemon] Failed to schedule retry for {}: {}", task_id.0, e);
+                }
+            },
             DaemonAction::TaskFailed { task_id, reason } => {
                 let event = Event {
-                    id: EventId(format!("E-FAILED-{}", task_id.0)),
+                    id: EventId(format!(
+                        "E-FAILED-{}-{}",
+                        task_id.0,
+                        now.timestamp_nanos_opt().unwrap_or_default()
+                    )),
                     task_id: Some(task_id.clone()),
                     repo_id: None,
                     at: now,
@@ -566,43 +644,259 @@ pub fn execute_actions(
                 // Transition the task to Stopped so it's no longer active.
                 if let Ok(Some(mut task)) = service.task(task_id) {
                     task.state = TaskState::Stopped;
+                    task.updated_at = now;
                     let _ = service.store.upsert_task(&task);
                 }
 
                 eprintln!("[daemon] {} failed → stopped: {}", task_id.0, reason);
             }
-            DaemonAction::ExecutePipeline { action } => {
-                // Pipeline execution is handled by specific pipeline executors.
-                // For now, log the action.
-                match action {
-                    PipelineAction::Complete { task_id } => {
-                        eprintln!("[daemon] Pipeline complete for {}", task_id.0);
-                    }
-                    PipelineAction::Failed {
-                        task_id,
-                        stage,
-                        error,
-                    } => {
-                        eprintln!(
-                            "[daemon] Pipeline failed for {} at {}: {}",
-                            task_id.0, stage, error
-                        );
-                    }
-                    _ => {
-                        eprintln!("[daemon] Pipeline action: {:?}", action);
+            DaemonAction::ExecutePipeline { action } => match action {
+                PipelineAction::RunVerify {
+                    task_id,
+                    worktree_path,
+                } => {
+                    let verify_cmd = config
+                        .verify_command
+                        .as_deref()
+                        .unwrap_or("cargo check && cargo test --workspace");
+
+                    let _ = service.record_event(&Event {
+                        id: EventId(format!(
+                            "E-VERIFY-START-{}-{}",
+                            task_id.0,
+                            now.timestamp_nanos_opt().unwrap_or_default()
+                        )),
+                        task_id: Some(task_id.clone()),
+                        repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                        at: now,
+                        kind: EventKind::VerifyStarted,
+                    });
+
+                    match run_verify_command(worktree_path, verify_cmd) {
+                        Ok(()) => {
+                            let _ = service.record_event(&Event {
+                                id: EventId(format!(
+                                    "E-VERIFY-DONE-{}-{}",
+                                    task_id.0,
+                                    now.timestamp_nanos_opt().unwrap_or_default()
+                                )),
+                                task_id: Some(task_id.clone()),
+                                repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                                at: now,
+                                kind: EventKind::VerifyCompleted { success: true },
+                            });
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.advance();
+                            }
+                        }
+                        Err(error) => {
+                            let _ = service.record_event(&Event {
+                                id: EventId(format!(
+                                    "E-VERIFY-DONE-{}-{}",
+                                    task_id.0,
+                                    now.timestamp_nanos_opt().unwrap_or_default()
+                                )),
+                                task_id: Some(task_id.clone()),
+                                repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                                at: now,
+                                kind: EventKind::VerifyCompleted { success: false },
+                            });
+
+                            let retry_model = service
+                                .task(task_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.preferred_model)
+                                .or_else(|| config.enabled_models.first().copied())
+                                .unwrap_or(ModelKind::Claude);
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.fail(error.clone());
+                            }
+                            match apply_retry_transition(service, task_id, retry_model, &error, now)
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!(
+                                        "[daemon] Verify failed for {}; retries exhausted",
+                                        task_id.0
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[daemon] Verify failure retry handling failed for {}: {}",
+                                        task_id.0, e
+                                    );
+                                }
+                            }
+                            daemon_state.pipelines.remove(&task_id.0);
+                        }
                     }
                 }
-            }
+                PipelineAction::StackOnParent {
+                    task_id,
+                    worktree_path,
+                    parent_branch,
+                } => {
+                    let event_seed = now.timestamp_nanos_opt().unwrap_or_default();
+                    let _ = service.start_restack(
+                        task_id,
+                        EventId(format!("E-RESTACK-START-{}-{event_seed}", task_id.0)),
+                        now,
+                    );
+
+                    let graphite = GraphiteClient::new(worktree_path.clone());
+                    match graphite.move_current_branch_onto(parent_branch) {
+                        Ok(()) => {
+                            let _ = service.complete_restack(
+                                task_id,
+                                EventId(format!("E-RESTACK-DONE-{}-{event_seed}", task_id.0)),
+                                now,
+                            );
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.advance();
+                            }
+                        }
+                        Err(error) => {
+                            let _ = service.record_event(&Event {
+                                id: EventId(format!(
+                                    "E-RESTACK-CONFLICT-{}-{}",
+                                    task_id.0, event_seed
+                                )),
+                                task_id: Some(task_id.clone()),
+                                repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                                at: now,
+                                kind: EventKind::RestackConflict,
+                            });
+                            let err_msg = format!("restack onto `{parent_branch}` failed: {error}");
+                            let retry_model = service
+                                .task(task_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.preferred_model)
+                                .or_else(|| config.enabled_models.first().copied())
+                                .unwrap_or(ModelKind::Claude);
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.fail(err_msg.clone());
+                            }
+                            match apply_retry_transition(
+                                service,
+                                task_id,
+                                retry_model,
+                                &err_msg,
+                                now,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!(
+                                        "[daemon] Restack failed for {}; retries exhausted",
+                                        task_id.0
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[daemon] Restack failure retry handling failed for {}: {}",
+                                        task_id.0, e
+                                    );
+                                }
+                            }
+                            daemon_state.pipelines.remove(&task_id.0);
+                        }
+                    }
+                }
+                PipelineAction::Submit {
+                    task_id,
+                    worktree_path,
+                    mode,
+                } => {
+                    let seed = now.timestamp_nanos_opt().unwrap_or_default();
+                    if let Err(e) = service.start_submit(
+                        task_id,
+                        *mode,
+                        EventId(format!("E-SUBMIT-START-{}-{seed}", task_id.0)),
+                        now,
+                    ) {
+                        eprintln!("[daemon] Failed to mark {} submitting: {}", task_id.0, e);
+                        continue;
+                    }
+
+                    let graphite = GraphiteClient::new(worktree_path.clone());
+                    match graphite.submit(*mode) {
+                        Ok(()) => {
+                            if let Err(e) = service.complete_submit(
+                                task_id,
+                                format!("graphite://submit/{}", task_id.0),
+                                0,
+                                EventId(format!("E-SUBMIT-DONE-{}-{seed}", task_id.0)),
+                                now,
+                            ) {
+                                eprintln!(
+                                    "[daemon] Submit succeeded but state update failed for {}: {}",
+                                    task_id.0, e
+                                );
+                            } else if let Some(pipeline) =
+                                daemon_state.pipelines.get_mut(&task_id.0)
+                            {
+                                pipeline.advance();
+                            }
+                        }
+                        Err(error) => {
+                            let err_msg = format!("graphite submit failed: {error}");
+                            let retry_model = service
+                                .task(task_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.preferred_model)
+                                .or_else(|| config.enabled_models.first().copied())
+                                .unwrap_or(ModelKind::Claude);
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.fail(err_msg.clone());
+                            }
+                            match apply_retry_transition(
+                                service,
+                                task_id,
+                                retry_model,
+                                &err_msg,
+                                now,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!(
+                                        "[daemon] Submit failed for {}; retries exhausted",
+                                        task_id.0
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[daemon] Submit failure retry handling failed for {}: {}",
+                                        task_id.0, e
+                                    );
+                                }
+                            }
+                            daemon_state.pipelines.remove(&task_id.0);
+                        }
+                    }
+                }
+                PipelineAction::Complete { task_id } => {
+                    eprintln!("[daemon] Pipeline complete for {}", task_id.0);
+                }
+                PipelineAction::Failed {
+                    task_id,
+                    stage,
+                    error,
+                } => {
+                    eprintln!(
+                        "[daemon] Pipeline failed for {} at {}: {}",
+                        task_id.0, stage, error
+                    );
+                }
+            },
             DaemonAction::TriggerContextRegen => {
                 if should_regenerate(
                     &daemon_state.context_gen,
                     &config.context_gen_config,
                     Utc::now(),
                 ) {
-                    let prompt = build_context_gen_prompt(
-                        &config.repo_root,
-                        &config.template_dir,
-                    );
+                    let prompt = build_context_gen_prompt(&config.repo_root, &config.template_dir);
                     if let Err(e) = spawn_context_gen(
                         &config.repo_root,
                         &prompt,
@@ -650,21 +944,14 @@ pub fn execute_actions(
                         .unwrap_or(ModelKind::Claude);
 
                     let mut qa_state = QAState::new(*qa_type);
-                    if let Err(e) =
-                        spawn_qa_agent(&cwd, &prompt, model, &mut qa_state)
-                    {
+                    if let Err(e) = spawn_qa_agent(&cwd, &prompt, model, &mut qa_state) {
                         eprintln!(
                             "[daemon] Failed to spawn QA {} for {}: {}",
                             qa_type, task_id.0, e
                         );
                     } else {
-                        eprintln!(
-                            "[daemon] QA {} started for {}",
-                            qa_type, task_id.0
-                        );
-                        daemon_state
-                            .qa_agents
-                            .insert(task_id.0.clone(), qa_state);
+                        eprintln!("[daemon] QA {} started for {}", qa_type, task_id.0);
+                        daemon_state.qa_agents.insert(task_id.0.clone(), qa_state);
 
                         // Record event.
                         let event = Event {
@@ -761,8 +1048,8 @@ pub fn run_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::SqliteStore;
     use crate::event_log::JsonlEventLog;
+    use crate::persistence::SqliteStore;
     use crate::scheduler::{Scheduler, SchedulerConfig};
     use orch_core::events::{Event, EventKind};
     use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
@@ -971,7 +1258,15 @@ mod tests {
 
         let qa_spawns: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, DaemonAction::SpawnQA { qa_type: QAType::Baseline, .. }))
+            .filter(|a| {
+                matches!(
+                    a,
+                    DaemonAction::SpawnQA {
+                        qa_type: QAType::Baseline,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(qa_spawns.len(), 1, "should spawn exactly one baseline QA");
 
@@ -1040,7 +1335,11 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, DaemonAction::SpawnQA { .. }))
             .collect();
-        assert_eq!(qa_spawns.len(), 0, "should NOT spawn QA when one already running");
+        assert_eq!(
+            qa_spawns.len(),
+            0,
+            "should NOT spawn QA when one already running"
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -1067,9 +1366,13 @@ mod tests {
         let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
 
         // Should spawn QA Validation, NOT MarkReady.
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, DaemonAction::SpawnQA { qa_type: QAType::Validation, .. })));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            DaemonAction::SpawnQA {
+                qa_type: QAType::Validation,
+                ..
+            }
+        )));
         assert!(!actions
             .iter()
             .any(|a| matches!(a, DaemonAction::MarkReady { .. })));
@@ -1201,9 +1504,7 @@ mod tests {
 
         let mut failed = QAState::new(QAType::Validation);
         failed.status = QAStatus::Failed;
-        daemon_state
-            .qa_agents
-            .insert("T-fail".to_string(), failed);
+        daemon_state.qa_agents.insert("T-fail".to_string(), failed);
 
         let mut running = QAState::new(QAType::Baseline);
         running.status = QAStatus::RunningBaseline;
