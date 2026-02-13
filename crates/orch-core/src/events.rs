@@ -112,4 +112,85 @@ mod tests {
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, event);
     }
+
+    #[test]
+    fn all_event_kinds_serialize_and_deserialize() {
+        let kinds: Vec<EventKind> = vec![
+            EventKind::TaskCreated,
+            EventKind::TaskStateChanged {
+                from: "CHATTING".to_string(),
+                to: "READY".to_string(),
+            },
+            EventKind::ParentHeadUpdated {
+                parent_task_id: TaskId::new("T-parent"),
+            },
+            EventKind::RestackStarted,
+            EventKind::RestackCompleted,
+            EventKind::RestackConflict,
+            EventKind::VerifyStarted,
+            EventKind::VerifyCompleted { success: false },
+            EventKind::ReadyReached,
+            EventKind::SubmitStarted {
+                mode: SubmitMode::Single,
+            },
+            EventKind::SubmitCompleted,
+            EventKind::NeedsHuman {
+                reason: "merge conflict".to_string(),
+            },
+            EventKind::Error {
+                code: "E001".to_string(),
+                message: "something broke".to_string(),
+            },
+            EventKind::RetryScheduled {
+                attempt: 2,
+                model: "claude".to_string(),
+                reason: "timeout".to_string(),
+            },
+            EventKind::TaskFailed {
+                reason: "max retries".to_string(),
+                is_final: true,
+            },
+            EventKind::TestSpecValidated {
+                passed: true,
+                details: "3/3 criteria passed".to_string(),
+            },
+            EventKind::OrchestratorDecomposed {
+                sub_task_ids: vec!["T-sub-1".to_string(), "T-sub-2".to_string()],
+            },
+            EventKind::QAStarted {
+                qa_type: "baseline".to_string(),
+            },
+            EventKind::QACompleted {
+                passed: 10,
+                failed: 2,
+                total: 12,
+            },
+            EventKind::QAFailed {
+                failures: vec!["test_a failed".to_string(), "test_b failed".to_string()],
+            },
+        ];
+
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).expect("serialize event kind");
+            let decoded: EventKind =
+                serde_json::from_str(&json).expect("deserialize event kind");
+            assert_eq!(decoded, kind, "roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn event_with_none_task_id_roundtrips() {
+        let event = Event {
+            id: EventId("E-global".to_string()),
+            task_id: None,
+            repo_id: None,
+            at: Utc::now(),
+            kind: EventKind::TaskCreated,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.task_id, None);
+        assert_eq!(decoded.repo_id, None);
+    }
 }

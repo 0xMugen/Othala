@@ -428,6 +428,16 @@ fn run() -> Result<(), MainError> {
                 UiAction::DeleteTask => {
                     if let Some(task_id) = &queued.task_id {
                         supervisor.stop(task_id);
+                        // Kill any running QA agents for this task.
+                        for prefix in &["qa-", "qa-post-"] {
+                            let qa_key = format!("{}{}", prefix, task_id.0);
+                            if let Some(mut qa_state) = qa_agents.remove(&qa_key) {
+                                if let Some(mut child) = qa_state.child_handle.take() {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                            }
+                        }
                         // Clean up the worktree before deleting the task.
                         if let Ok(Some(_task)) = service.task(task_id) {
                             let git = orch_git::GitCli::default();

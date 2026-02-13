@@ -148,4 +148,105 @@ mod tests {
         assert!(!TaskState::Submitting.can_submit());
         assert!(!TaskState::Merged.can_submit());
     }
+
+    #[test]
+    fn can_restack_in_correct_states() {
+        assert!(!TaskState::Chatting.can_restack());
+        assert!(TaskState::Ready.can_restack());
+        assert!(TaskState::Submitting.can_restack());
+        assert!(!TaskState::Restacking.can_restack());
+        assert!(TaskState::AwaitingMerge.can_restack());
+        assert!(!TaskState::Merged.can_restack());
+        assert!(!TaskState::Stopped.can_restack());
+    }
+
+    #[test]
+    fn is_active_only_when_chatting() {
+        assert!(TaskState::Chatting.is_active());
+        assert!(!TaskState::Ready.is_active());
+        assert!(!TaskState::Submitting.is_active());
+        assert!(!TaskState::Restacking.is_active());
+        assert!(!TaskState::AwaitingMerge.is_active());
+        assert!(!TaskState::Merged.is_active());
+        assert!(!TaskState::Stopped.is_active());
+    }
+
+    #[test]
+    fn is_terminal_only_for_merged_and_stopped() {
+        assert!(!TaskState::Chatting.is_terminal());
+        assert!(!TaskState::Ready.is_terminal());
+        assert!(!TaskState::Submitting.is_terminal());
+        assert!(!TaskState::Restacking.is_terminal());
+        assert!(!TaskState::AwaitingMerge.is_terminal());
+        assert!(TaskState::Merged.is_terminal());
+        assert!(TaskState::Stopped.is_terminal());
+    }
+
+    #[test]
+    fn verify_status_is_passed_and_is_failed() {
+        assert!(!VerifyStatus::NotRun.is_passed());
+        assert!(!VerifyStatus::NotRun.is_failed());
+
+        assert!(!VerifyStatus::Running.is_passed());
+        assert!(!VerifyStatus::Running.is_failed());
+
+        assert!(VerifyStatus::Passed.is_passed());
+        assert!(!VerifyStatus::Passed.is_failed());
+
+        let failed = VerifyStatus::Failed {
+            message: "error".to_string(),
+        };
+        assert!(!failed.is_passed());
+        assert!(failed.is_failed());
+    }
+
+    #[test]
+    fn verify_status_default_is_not_run() {
+        let status = VerifyStatus::default();
+        assert_eq!(status, VerifyStatus::NotRun);
+    }
+
+    #[test]
+    fn task_state_display_all_variants() {
+        assert_eq!(format!("{}", TaskState::Chatting), "CHATTING");
+        assert_eq!(format!("{}", TaskState::Ready), "READY");
+        assert_eq!(format!("{}", TaskState::Submitting), "SUBMITTING");
+        assert_eq!(format!("{}", TaskState::Restacking), "RESTACKING");
+        assert_eq!(format!("{}", TaskState::AwaitingMerge), "AWAITING_MERGE");
+        assert_eq!(format!("{}", TaskState::Merged), "MERGED");
+        assert_eq!(format!("{}", TaskState::Stopped), "STOPPED");
+    }
+
+    #[test]
+    fn task_state_deserializes_from_screaming_snake_case() {
+        let state: TaskState = serde_json::from_str("\"RESTACKING\"").unwrap();
+        assert_eq!(state, TaskState::Restacking);
+
+        let state: TaskState = serde_json::from_str("\"SUBMITTING\"").unwrap();
+        assert_eq!(state, TaskState::Submitting);
+    }
+
+    #[test]
+    fn verify_status_not_run_serialization() {
+        let status = VerifyStatus::NotRun;
+        let json = serde_json::to_string(&status).unwrap();
+        let decoded: VerifyStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, VerifyStatus::NotRun);
+    }
+
+    #[test]
+    fn verify_status_running_serialization() {
+        let status = VerifyStatus::Running;
+        let json = serde_json::to_string(&status).unwrap();
+        let decoded: VerifyStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, VerifyStatus::Running);
+    }
+
+    #[test]
+    fn verify_status_passed_serialization() {
+        let status = VerifyStatus::Passed;
+        let json = serde_json::to_string(&status).unwrap();
+        let decoded: VerifyStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, VerifyStatus::Passed);
+    }
 }
