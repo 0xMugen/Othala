@@ -343,13 +343,18 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let task_id_str = selected_task
         .map(|t| t.task_id.0.clone())
         .unwrap_or_else(|| "-".to_string());
+    let waiting_on_baseline = selected_task
+        .and_then(|task| task.qa_status.as_deref())
+        .map(|status| {
+            app.state.selected_pane_category == PaneCategory::Agent
+                && status.eq_ignore_ascii_case("baseline running")
+        })
+        .unwrap_or(false);
 
     // Find the pane for the currently selected category.
     let task_pane_idx = selected_task.and_then(|task| {
-        app.state.pane_index_for_task_category(
-            &task.task_id,
-            app.state.selected_pane_category,
-        )
+        app.state
+            .pane_index_for_task_category(&task.task_id, app.state.selected_pane_category)
     });
     let task_pane = task_pane_idx.and_then(|idx| app.state.panes.get(idx));
 
@@ -412,9 +417,12 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         extend_rendered_chat(&mut lines, &window, chat_area.width);
         (format!("{category_label} {}", pane.instance_id), lines)
     } else {
-        let no_pane_msg = match app.state.selected_pane_category {
-            PaneCategory::Agent => "no agent running for this task",
-            PaneCategory::QA => "no QA agent running for this task",
+        let no_pane_msg = match (app.state.selected_pane_category, waiting_on_baseline) {
+            (PaneCategory::Agent, true) => {
+                "waiting for baseline QA to finish before launching agent"
+            }
+            (PaneCategory::Agent, false) => "no agent running for this task",
+            (PaneCategory::QA, _) => "no QA agent running for this task",
         };
         (
             format!("{category_label} (task={task_id_str})"),
@@ -432,7 +440,20 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .wrap(Wrap { trim: false });
     frame.render_widget(pty_widget, chat_area);
 
-    render_activity_line(frame, activity_area, task_pane);
+    if waiting_on_baseline && task_pane.is_none() {
+        let line = Line::from(vec![
+            Span::styled(" \u{25CF} ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "waiting on baseline QA",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), activity_area);
+    } else {
+        render_activity_line(frame, activity_area, task_pane);
+    }
     render_chat_input_box(frame, input_area, app);
 }
 
