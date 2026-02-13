@@ -26,14 +26,14 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         return None;
     }
 
-    let kind = if lower.contains("[needs_human]") || lower.contains("[need_human]") {
-        Some(AgentSignalKind::NeedHuman)
-    } else if lower.contains("[patch_ready]") {
-        Some(AgentSignalKind::PatchReady)
-    } else if lower.contains("[qa_complete]") {
-        Some(AgentSignalKind::QAComplete)
-    } else if lower.contains("[conflict_resolved]") {
-        Some(AgentSignalKind::ConflictResolved)
+    let kind = if let Some(tag) = parse_bracket_signal_tag(&lower) {
+        match tag {
+            "needs_human" | "need_human" => Some(AgentSignalKind::NeedHuman),
+            "patch_ready" => Some(AgentSignalKind::PatchReady),
+            "qa_complete" => Some(AgentSignalKind::QAComplete),
+            "conflict_resolved" => Some(AgentSignalKind::ConflictResolved),
+            _ => None,
+        }
     } else if lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("too many requests")
@@ -51,6 +51,33 @@ pub fn detect_common_signal(line: &str) -> Option<AgentSignal> {
         message: line.trim().to_string(),
         source_line: line.to_string(),
     })
+}
+
+/// Parses a control tag only when it appears as an explicit signal, not as a
+/// substring in code/output. Accepted shapes:
+/// - `[patch_ready]`
+/// - `status: [patch_ready] ...`
+fn parse_bracket_signal_tag(lower_line: &str) -> Option<&str> {
+    let trimmed = lower_line.trim();
+
+    let candidate = if trimmed.starts_with('[') {
+        trimmed
+    } else if let Some((_, after_colon)) = trimmed.split_once(':') {
+        after_colon.trim_start()
+    } else {
+        return None;
+    };
+
+    if !candidate.starts_with('[') {
+        return None;
+    }
+
+    let end = candidate.find(']')?;
+    let tag = &candidate[1..end];
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag)
 }
 
 #[cfg(test)]
@@ -180,5 +207,11 @@ mod tests {
         let signal =
             detect_common_signal("ok: [conflict_resolved]").expect("conflict resolved signal");
         assert_eq!(signal.kind, AgentSignalKind::ConflictResolved);
+    }
+
+    #[test]
+    fn does_not_match_embedded_bracket_markers_inside_code() {
+        assert!(detect_common_signal("assert!(prompt.contains(\"[patch_ready]\"));").is_none());
+        assert!(detect_common_signal("let marker = \"[needs_human]\"; // test fixture").is_none());
     }
 }

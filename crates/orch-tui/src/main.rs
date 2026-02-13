@@ -89,6 +89,38 @@ fn spawn_pipeline_cmd(cmd: &str, args: &[String], cwd: &Path) -> PipelineProc {
     PipelineProc { output_rx: rx }
 }
 
+fn preferred_qa_model(_task_model: ModelKind) -> ModelKind {
+    _task_model
+}
+
+fn spawn_qa_agent_with_fallback(
+    cwd: &Path,
+    prompt: &str,
+    task_model: ModelKind,
+    state: &mut qa_agent::QAState,
+) -> anyhow::Result<ModelKind> {
+    let primary = preferred_qa_model(task_model);
+    match qa_agent::spawn_qa_agent(cwd, prompt, primary, state) {
+        Ok(()) => Ok(primary),
+        Err(primary_err) => {
+            if primary != ModelKind::Claude {
+                match qa_agent::spawn_qa_agent(cwd, prompt, ModelKind::Claude, state) {
+                    Ok(()) => Ok(ModelKind::Claude),
+                    Err(fallback_err) => Err(anyhow::anyhow!(
+                        "qa spawn with {} failed: {}; fallback {} failed: {}",
+                        primary.as_str(),
+                        primary_err,
+                        ModelKind::Claude.as_str(),
+                        fallback_err
+                    )),
+                }
+            } else {
+                Err(primary_err)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     tick_ms: u64,
@@ -121,10 +153,8 @@ fn print_banner() {
 }
 
 fn run_qa_spec_gen_with_status(repo_root: &Path, template_dir: &Path, model: ModelKind) {
-    use orchd::qa_spec_gen::{
-        check_qa_spec_startup, QASpecStartupStatus,
-    };
     use orchd::context_gen::parse_progress_line;
+    use orchd::qa_spec_gen::{check_qa_spec_startup, QASpecStartupStatus};
 
     match check_qa_spec_startup(repo_root) {
         QASpecStartupStatus::UpToDate => {
@@ -148,18 +178,17 @@ fn run_qa_spec_gen_with_status(repo_root: &Path, template_dir: &Path, model: Mod
 
     std::thread::spawn(move || {
         let ptx = progress_tx;
-        let result = orchd::qa_spec_gen::ensure_qa_spec_exists_blocking(
-            &repo,
-            &tmpl,
-            model,
-            move |line| {
+        let result =
+            orchd::qa_spec_gen::ensure_qa_spec_exists_blocking(&repo, &tmpl, model, move |line| {
                 let _ = ptx.send(line.to_string());
-            },
-        );
+            });
         let _ = result_tx.send(result);
     });
 
-    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let spinner_frames = [
+        '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}',
+        '\u{2827}', '\u{2807}', '\u{280f}',
+    ];
     let mut frame = 0usize;
     let mut last_status = String::from("analysing repository...");
 
@@ -224,16 +253,17 @@ fn run_context_gen_with_status(repo_root: &Path, template_dir: &Path, model: Mod
 
     std::thread::spawn(move || {
         let ptx = progress_tx;
-        let result = orchd::context_gen::ensure_context_exists_blocking(
-            &repo,
-            &tmpl,
-            model,
-            move |line| { let _ = ptx.send(line.to_string()); },
-        );
+        let result =
+            orchd::context_gen::ensure_context_exists_blocking(&repo, &tmpl, model, move |line| {
+                let _ = ptx.send(line.to_string());
+            });
         let _ = result_tx.send(result);
     });
 
-    let spinner_frames = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+    let spinner_frames = [
+        '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}',
+        '\u{2827}', '\u{2807}', '\u{280f}',
+    ];
     let mut frame = 0usize;
     let mut last_status = String::from("starting agent...");
 
@@ -403,14 +433,9 @@ fn run() -> Result<(), MainError> {
                         };
                         match service.create_task(&task, &event) {
                             Ok(()) => {
-                                let detail = branch_name
-                                    .as_deref()
-                                    .unwrap_or("(no branch)");
+                                let detail = branch_name.as_deref().unwrap_or("(no branch)");
                                 app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "created chat {} on {}",
-                                        task_id.0, detail
-                                    ),
+                                    message: format!("created chat {} on {}", task_id.0, detail),
                                 });
                                 // Immediately refresh task list so it appears.
                                 if let Ok(tasks) = service.list_top_level_tasks() {
@@ -614,8 +639,7 @@ fn run() -> Result<(), MainError> {
                 UiAction::SubmitTask => {
                     if let Some(task_id) = &queued.task_id {
                         if let Ok(Some(task)) = service.task(task_id) {
-                            if task.state == TaskState::Ready
-                                && !pipelines.contains_key(&task_id.0)
+                            if task.state == TaskState::Ready && !pipelines.contains_key(&task_id.0)
                             {
                                 let parent_branch = task
                                     .parent_task_id
@@ -632,8 +656,7 @@ fn run() -> Result<(), MainError> {
                                     parent_branch,
                                 );
                                 pipelines.insert(task_id.0.clone(), pipeline);
-                                let event_id =
-                                    EventId(format!("E-SUBMITTING-{}", task_id.0));
+                                let event_id = EventId(format!("E-SUBMITTING-{}", task_id.0));
                                 let _ = service.transition_task_state(
                                     task_id,
                                     TaskState::Submitting,
@@ -641,25 +664,19 @@ fn run() -> Result<(), MainError> {
                                     Utc::now(),
                                 );
                                 let pipe_instance = format!("pipeline-{}", task_id.0);
-                                let model =
-                                    task.preferred_model.unwrap_or(ModelKind::Claude);
+                                let model = task.preferred_model.unwrap_or(ModelKind::Claude);
                                 app.apply_event(TuiEvent::AgentPaneOutput {
                                     instance_id: pipe_instance.clone(),
                                     task_id: task_id.clone(),
                                     model,
-                                    lines: vec![
-                                        "[Submit pipeline starting...]".to_string(),
-                                    ],
+                                    lines: vec!["[Submit pipeline starting...]".to_string()],
                                 });
                                 app.apply_event(TuiEvent::AgentPaneStatusChanged {
                                     instance_id: pipe_instance,
                                     status: AgentPaneStatus::Starting,
                                 });
                                 app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "{} -> Submitting (manual)",
-                                        task_id.0
-                                    ),
+                                    message: format!("{} -> Submitting (manual)", task_id.0),
                                 });
                                 if let Ok(tasks) = service.list_top_level_tasks() {
                                     app.apply_event(TuiEvent::TasksReplaced { tasks });
@@ -677,10 +694,7 @@ fn run() -> Result<(), MainError> {
                 }
                 _ => {
                     app.apply_event(TuiEvent::StatusLine {
-                        message: format!(
-                            "action not yet implemented: {:?}",
-                            queued.action
-                        ),
+                        message: format!("action not yet implemented: {:?}", queued.action),
                     });
                 }
             }
@@ -720,8 +734,7 @@ fn run() -> Result<(), MainError> {
                         .map(|t| t.worktree_path.clone())
                         .unwrap_or_else(|| repo_root.clone());
                     let baseline = qa_agent::load_baseline(&repo_root).unwrap();
-                    let task_spec =
-                        qa_agent::load_task_spec(&repo_root, &outcome.task_id);
+                    let task_spec = qa_agent::load_task_spec(&repo_root, &outcome.task_id);
                     let previous = service
                         .task(&outcome.task_id)
                         .ok()
@@ -736,15 +749,14 @@ fn run() -> Result<(), MainError> {
                         &qa_cwd,
                         &template_dir,
                     );
-                    let mut qa_state =
-                        qa_agent::QAState::new(qa_agent::QAType::Validation);
-                    match qa_agent::spawn_qa_agent(
+                    let mut qa_state = qa_agent::QAState::new(qa_agent::QAType::Validation);
+                    match spawn_qa_agent_with_fallback(
                         &qa_cwd,
                         &prompt,
                         outcome.model,
                         &mut qa_state,
                     ) {
-                        Ok(()) => {
+                        Ok(qa_model) => {
                             qa_agents.insert(qa_key, qa_state);
                             let targets = task_spec
                                 .as_deref()
@@ -755,7 +767,7 @@ fn run() -> Result<(), MainError> {
                             app.apply_event(TuiEvent::AgentPaneOutput {
                                 instance_id: qa_instance.clone(),
                                 task_id: outcome.task_id.clone(),
-                                model: outcome.model,
+                                model: qa_model,
                                 lines: vec!["[QA validation starting...]".to_string()],
                             });
                             app.apply_event(TuiEvent::AgentPaneStatusChanged {
@@ -770,8 +782,9 @@ fn run() -> Result<(), MainError> {
                             });
                             app.apply_event(TuiEvent::StatusLine {
                                 message: format!(
-                                    "QA validation started for {} (patch_ready)",
-                                    outcome.task_id.0
+                                    "QA validation started for {} (patch_ready, model {})",
+                                    outcome.task_id.0,
+                                    qa_model.as_str()
                                 ),
                             });
                         }
@@ -783,8 +796,7 @@ fn run() -> Result<(), MainError> {
                                     outcome.task_id.0
                                 ),
                             });
-                            let event_id =
-                                EventId(format!("E-READY-{}", outcome.task_id.0));
+                            let event_id = EventId(format!("E-READY-{}", outcome.task_id.0));
                             let _ = service.mark_ready(&outcome.task_id, event_id, now);
                         }
                     }
@@ -799,10 +811,7 @@ fn run() -> Result<(), MainError> {
                                 "exit 0"
                             };
                             app.apply_event(TuiEvent::StatusLine {
-                                message: format!(
-                                    "{} -> Ready ({reason})",
-                                    outcome.task_id.0
-                                ),
+                                message: format!("{} -> Ready ({reason})", outcome.task_id.0),
                             });
                         }
                         Err(e) => {
@@ -835,6 +844,12 @@ fn run() -> Result<(), MainError> {
                     instance_id,
                     status: AgentPaneStatus::Failed,
                 });
+                app.apply_event(TuiEvent::StatusLine {
+                    message: format!(
+                        "{} agent exited without completion signal (exit {:?})",
+                        outcome.task_id.0, outcome.exit_code
+                    ),
+                });
             }
         }
 
@@ -864,10 +879,7 @@ fn run() -> Result<(), MainError> {
                     // Validate/recover worktree before spawning.
                     if let Err(e) = orchd::ensure_worktree_exists(&repo_root, task) {
                         app.apply_event(TuiEvent::StatusLine {
-                            message: format!(
-                                "worktree recovery failed for {}: {e}",
-                                task.id.0
-                            ),
+                            message: format!("worktree recovery failed for {}: {e}", task.id.0),
                         });
                         continue;
                     }
@@ -905,12 +917,11 @@ fn run() -> Result<(), MainError> {
                             let qa_key = format!("qa-{}", task.id.0);
                             if !qa_agents.contains_key(&qa_key) {
                                 if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
-                                    let task_spec =
-                                        qa_agent::load_task_spec(&repo_root, &task.id);
-                                    let previous =
-                                        task.branch_name.as_deref().and_then(|b| {
-                                            qa_agent::load_latest_result(&repo_root, b)
-                                        });
+                                    let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
+                                    let previous = task
+                                        .branch_name
+                                        .as_deref()
+                                        .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
                                     let prompt = qa_agent::build_qa_prompt(
                                         &baseline,
                                         task_spec.as_deref(),
@@ -920,20 +931,20 @@ fn run() -> Result<(), MainError> {
                                     );
                                     let mut qa_state =
                                         qa_agent::QAState::new(qa_agent::QAType::Baseline);
-                                    match qa_agent::spawn_qa_agent(
+                                    match spawn_qa_agent_with_fallback(
                                         &repo_root,
                                         &prompt,
                                         model,
                                         &mut qa_state,
                                     ) {
-                                        Ok(()) => {
+                                        Ok(qa_model) => {
                                             qa_agents.insert(qa_key, qa_state);
                                             // Create a TUI pane for QA agent output.
                                             let qa_instance = format!("qa-{}", task.id.0);
                                             app.apply_event(TuiEvent::AgentPaneOutput {
                                                 instance_id: qa_instance.clone(),
                                                 task_id: task.id.clone(),
-                                                model,
+                                                model: qa_model,
                                                 lines: vec!["[QA baseline starting...]".to_string()],
                                             });
                                             app.apply_event(TuiEvent::AgentPaneStatusChanged {
@@ -951,8 +962,9 @@ fn run() -> Result<(), MainError> {
                                             });
                                             app.apply_event(TuiEvent::StatusLine {
                                                 message: format!(
-                                                    "QA baseline started for {}",
-                                                    task.id.0
+                                                    "QA baseline started for {} (model {})",
+                                                    task.id.0,
+                                                    qa_model.as_str()
                                                 ),
                                             });
                                         }
@@ -970,10 +982,7 @@ fn run() -> Result<(), MainError> {
                         }
                         Err(e) => {
                             app.apply_event(TuiEvent::StatusLine {
-                                message: format!(
-                                    "auto-spawn failed for {}: {}",
-                                    task.id.0, e
-                                ),
+                                message: format!("auto-spawn failed for {}: {}", task.id.0, e),
                             });
                         }
                     }
@@ -1002,39 +1011,52 @@ fn run() -> Result<(), MainError> {
                             &repo_root,
                             &template_dir,
                         );
-                        let mut qa_state =
-                            qa_agent::QAState::new(qa_agent::QAType::Baseline);
-                        if let Ok(()) = qa_agent::spawn_qa_agent(
-                            &repo_root, &prompt, model, &mut qa_state,
+                        let mut qa_state = qa_agent::QAState::new(qa_agent::QAType::Baseline);
+                        match spawn_qa_agent_with_fallback(
+                            &repo_root,
+                            &prompt,
+                            model,
+                            &mut qa_state,
                         ) {
-                            qa_agents.insert(qa_key, qa_state);
-                            // Create a TUI pane for QA agent output.
-                            let qa_instance = format!("qa-{}", task.id.0);
-                            app.apply_event(TuiEvent::AgentPaneOutput {
-                                instance_id: qa_instance.clone(),
-                                task_id: task.id.clone(),
-                                model,
-                                lines: vec!["[QA baseline starting...]".to_string()],
-                            });
-                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                                instance_id: qa_instance,
-                                status: AgentPaneStatus::Starting,
-                            });
-                            app.apply_event(TuiEvent::QAUpdate {
-                                task_id: task.id.clone(),
-                                status: "baseline running".to_string(),
-                                tests: vec![],
-                                targets: task_spec
-                                    .as_deref()
-                                    .map(|s| extract_targets(s))
-                                    .unwrap_or_default(),
-                            });
-                            app.apply_event(TuiEvent::StatusLine {
-                                message: format!(
-                                    "QA baseline started for {} (catch-up)",
-                                    task.id.0
-                                ),
-                            });
+                            Ok(qa_model) => {
+                                qa_agents.insert(qa_key, qa_state);
+                                // Create a TUI pane for QA agent output.
+                                let qa_instance = format!("qa-{}", task.id.0);
+                                app.apply_event(TuiEvent::AgentPaneOutput {
+                                    instance_id: qa_instance.clone(),
+                                    task_id: task.id.clone(),
+                                    model: qa_model,
+                                    lines: vec!["[QA baseline starting...]".to_string()],
+                                });
+                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                    instance_id: qa_instance,
+                                    status: AgentPaneStatus::Starting,
+                                });
+                                app.apply_event(TuiEvent::QAUpdate {
+                                    task_id: task.id.clone(),
+                                    status: "baseline running".to_string(),
+                                    tests: vec![],
+                                    targets: task_spec
+                                        .as_deref()
+                                        .map(|s| extract_targets(s))
+                                        .unwrap_or_default(),
+                                });
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "QA baseline started for {} (catch-up, model {})",
+                                        task.id.0,
+                                        qa_model.as_str()
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "QA baseline catch-up spawn failed for {}: {e}",
+                                        task.id.0
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -1090,16 +1112,12 @@ fn run() -> Result<(), MainError> {
                 let status = if all_passed {
                     format!(
                         "{} passed {}/{}",
-                        qa_type,
-                        qa_result.summary.passed,
-                        qa_result.summary.total
+                        qa_type, qa_result.summary.passed, qa_result.summary.total
                     )
                 } else {
                     format!(
                         "{} failed {}/{}",
-                        qa_type,
-                        qa_result.summary.passed,
-                        qa_result.summary.total
+                        qa_type, qa_result.summary.passed, qa_result.summary.total
                     )
                 };
 
@@ -1143,8 +1161,7 @@ fn run() -> Result<(), MainError> {
                 if qa_type == qa_agent::QAType::Validation {
                     let now = Utc::now();
                     if all_passed {
-                        let event_id =
-                            EventId(format!("E-READY-QA-{}", task_id.0));
+                        let event_id = EventId(format!("E-READY-QA-{}", task_id.0));
                         match service.mark_ready(&task_id, event_id, now) {
                             Ok(_) => {
                                 app.apply_event(TuiEvent::StatusLine {
@@ -1172,15 +1189,10 @@ fn run() -> Result<(), MainError> {
                         if let Ok(Some(task)) = service.task(&task_id) {
                             if task.retry_count < task.max_retries {
                                 // Build QA failure context and spawn fix agent.
-                                let qa_ctx =
-                                    qa_agent::build_qa_failure_context(&qa_result);
-                                let retry_prompt =
-                                    format!("{}\n\n{}", task.title, qa_ctx);
-                                let model = task
-                                    .preferred_model
-                                    .unwrap_or(ModelKind::Claude);
-                                let instance_id =
-                                    format!("agent-{}", task_id.0);
+                                let qa_ctx = qa_agent::build_qa_failure_context(&qa_result);
+                                let retry_prompt = format!("{}\n\n{}", task.title, qa_ctx);
+                                let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                                let instance_id = format!("agent-{}", task_id.0);
 
                                 // Stop any existing session first.
                                 supervisor.stop(&task_id);
@@ -1198,52 +1210,41 @@ fn run() -> Result<(), MainError> {
                                             &task_id,
                                             &format!(
                                                 "QA validation failed {}/{}",
-                                                qa_result.summary.passed,
-                                                qa_result.summary.total
+                                                qa_result.summary.passed, qa_result.summary.total
                                             ),
                                         );
 
-                                        app.apply_event(
-                                            TuiEvent::AgentPaneOutput {
-                                                instance_id: instance_id
-                                                    .clone(),
-                                                task_id: task_id.clone(),
-                                                model,
-                                                lines: vec![format!(
-                                                    "[QA fix retry {}/{} — {} tests failed]",
-                                                    task.retry_count + 1,
-                                                    task.max_retries,
-                                                    qa_result.summary.failed
-                                                )],
-                                            },
-                                        );
-                                        app.apply_event(
-                                            TuiEvent::AgentPaneStatusChanged {
-                                                instance_id,
-                                                status:
-                                                    AgentPaneStatus::Starting,
-                                            },
-                                        );
-                                        app.apply_event(
-                                            TuiEvent::StatusLine {
-                                                message: format!(
-                                                    "{} QA failed — fix agent spawned (retry {}/{})",
-                                                    task_id.0,
-                                                    task.retry_count + 1,
-                                                    task.max_retries
-                                                ),
-                                            },
-                                        );
+                                        app.apply_event(TuiEvent::AgentPaneOutput {
+                                            instance_id: instance_id.clone(),
+                                            task_id: task_id.clone(),
+                                            model,
+                                            lines: vec![format!(
+                                                "[QA fix retry {}/{} — {} tests failed]",
+                                                task.retry_count + 1,
+                                                task.max_retries,
+                                                qa_result.summary.failed
+                                            )],
+                                        });
+                                        app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                            instance_id,
+                                            status: AgentPaneStatus::Starting,
+                                        });
+                                        app.apply_event(TuiEvent::StatusLine {
+                                            message: format!(
+                                                "{} QA failed — fix agent spawned (retry {}/{})",
+                                                task_id.0,
+                                                task.retry_count + 1,
+                                                task.max_retries
+                                            ),
+                                        });
                                     }
                                     Err(e) => {
-                                        app.apply_event(
-                                            TuiEvent::StatusLine {
-                                                message: format!(
-                                                    "{} QA failed, fix agent spawn failed: {e}",
-                                                    task_id.0
-                                                ),
-                                            },
-                                        );
+                                        app.apply_event(TuiEvent::StatusLine {
+                                            message: format!(
+                                                "{} QA failed, fix agent spawn failed: {e}",
+                                                task_id.0
+                                            ),
+                                        });
                                     }
                                 }
                             } else {
@@ -1387,12 +1388,8 @@ fn run() -> Result<(), MainError> {
                             // commit, so `|| true` lets us continue to
                             // submit regardless.
                             let submit_cmd = match mode {
-                                SubmitMode::Single => {
-                                    "gt submit --no-edit --no-interactive"
-                                }
-                                SubmitMode::Stack => {
-                                    "gt submit --stack --no-edit --no-interactive"
-                                }
+                                SubmitMode::Single => "gt submit --no-edit --no-interactive",
+                                SubmitMode::Stack => "gt submit --stack --no-edit --no-interactive",
                             };
                             let script = format!(
                                 "gt modify --all --commit \
@@ -1409,8 +1406,7 @@ fn run() -> Result<(), MainError> {
                             ))
                         }
                         stack_pipeline::PipelineAction::Complete { task_id } => {
-                            let event_id =
-                                EventId(format!("E-AWAIT-{}", task_id.0));
+                            let event_id = EventId(format!("E-AWAIT-{}", task_id.0));
                             let _ = service.transition_task_state(
                                 task_id,
                                 TaskState::AwaitingMerge,
@@ -1423,10 +1419,7 @@ fn run() -> Result<(), MainError> {
                                 status: AgentPaneStatus::Exited,
                             });
                             app.apply_event(TuiEvent::StatusLine {
-                                message: format!(
-                                    "{} -> AwaitingMerge (submitted)",
-                                    task_id.0
-                                ),
+                                message: format!("{} -> AwaitingMerge (submitted)", task_id.0),
                             });
                             if let Ok(tasks) = service.list_top_level_tasks() {
                                 app.apply_event(TuiEvent::TasksReplaced { tasks });
@@ -1493,9 +1486,7 @@ fn run() -> Result<(), MainError> {
 
                 // Detect "nothing to submit" from gt — it exits 0 but
                 // the branch has no changes, so treat it as a failure.
-                let nothing_to_submit = lines_buf
-                    .iter()
-                    .any(|l| l.contains("Nothing to submit"));
+                let nothing_to_submit = lines_buf.iter().any(|l| l.contains("Nothing to submit"));
 
                 if !lines_buf.is_empty() {
                     let pipe_instance = format!("pipeline-{key}");
@@ -1527,14 +1518,9 @@ fn run() -> Result<(), MainError> {
                             // If pipeline reached Done, transition to AwaitingMerge
                             // immediately (the Drive section skips terminal pipelines
                             // so the Complete action would never fire otherwise).
-                            if pipeline.stage
-                                == stack_pipeline::PipelineStage::Done
-                            {
+                            if pipeline.stage == stack_pipeline::PipelineStage::Done {
                                 let task_id = TaskId(key.clone());
-                                let event_id = EventId(format!(
-                                    "E-AWAIT-{}",
-                                    task_id.0
-                                ));
+                                let event_id = EventId(format!("E-AWAIT-{}", task_id.0));
                                 let _ = service.transition_task_state(
                                     &task_id,
                                     TaskState::AwaitingMerge,
@@ -1542,30 +1528,21 @@ fn run() -> Result<(), MainError> {
                                     Utc::now(),
                                 );
                                 let pipe_instance = format!("pipeline-{key}");
-                                app.apply_event(
-                                    TuiEvent::AgentPaneStatusChanged {
-                                        instance_id: pipe_instance,
-                                        status: AgentPaneStatus::Exited,
-                                    },
-                                );
+                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                    instance_id: pipe_instance,
+                                    status: AgentPaneStatus::Exited,
+                                });
                                 app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "{} -> AwaitingMerge (submitted)",
-                                        task_id.0
-                                    ),
+                                    message: format!("{} -> AwaitingMerge (submitted)", task_id.0),
                                 });
                                 if let Ok(tasks) = service.list_top_level_tasks() {
-                                    app.apply_event(TuiEvent::TasksReplaced {
-                                        tasks,
-                                    });
+                                    app.apply_event(TuiEvent::TasksReplaced { tasks });
                                 }
 
                                 // Spawn post-submit QA validation pass.
                                 let qa_key = format!("qa-post-{}", task_id.0);
                                 if !qa_agents.contains_key(&qa_key) {
-                                    if let Some(baseline) =
-                                        qa_agent::load_baseline(&repo_root)
-                                    {
+                                    if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
                                         // Validation runs from the task's worktree.
                                         let qa_cwd = service
                                             .task(&task_id)
@@ -1573,9 +1550,8 @@ fn run() -> Result<(), MainError> {
                                             .flatten()
                                             .map(|t| t.worktree_path.clone())
                                             .unwrap_or_else(|| repo_root.clone());
-                                        let task_spec = qa_agent::load_task_spec(
-                                            &repo_root, &task_id,
-                                        );
+                                        let task_spec =
+                                            qa_agent::load_task_spec(&repo_root, &task_id);
                                         let previous = service
                                             .task(&task_id)
                                             .ok()
@@ -1583,9 +1559,7 @@ fn run() -> Result<(), MainError> {
                                             .and_then(|t| t.branch_name)
                                             .as_deref()
                                             .and_then(|b| {
-                                                qa_agent::load_latest_result(
-                                                    &repo_root, b,
-                                                )
+                                                qa_agent::load_latest_result(&repo_root, b)
                                             });
                                         let prompt = qa_agent::build_qa_prompt(
                                             &baseline,
@@ -1600,73 +1574,58 @@ fn run() -> Result<(), MainError> {
                                             .flatten()
                                             .and_then(|t| t.preferred_model)
                                             .unwrap_or(ModelKind::Claude);
-                                        let mut qa_state = qa_agent::QAState::new(
-                                            qa_agent::QAType::Validation,
-                                        );
-                                        match qa_agent::spawn_qa_agent(
+                                        let mut qa_state =
+                                            qa_agent::QAState::new(qa_agent::QAType::Validation);
+                                        match spawn_qa_agent_with_fallback(
                                             &qa_cwd,
                                             &prompt,
                                             model,
                                             &mut qa_state,
                                         ) {
-                                            Ok(()) => {
-                                                qa_agents
-                                                    .insert(qa_key, qa_state);
-                                                let qa_instance = format!(
-                                                    "qa-post-{}",
-                                                    task_id.0
-                                                );
+                                            Ok(qa_model) => {
+                                                qa_agents.insert(qa_key, qa_state);
+                                                let qa_instance = format!("qa-post-{}", task_id.0);
                                                 let targets = task_spec
                                                     .as_deref()
                                                     .map(|s| extract_targets(s))
                                                     .unwrap_or_default();
-                                                app.apply_event(
-                                                    TuiEvent::AgentPaneOutput {
-                                                        instance_id:
-                                                            qa_instance.clone(),
-                                                        task_id: task_id.clone(),
-                                                        model,
-                                                        lines: vec![
-                                                            "[Post-submit QA validation starting...]"
-                                                                .to_string(),
-                                                        ],
-                                                    },
-                                                );
-                                                app.apply_event(
-                                                    TuiEvent::AgentPaneStatusChanged {
-                                                        instance_id: qa_instance,
-                                                        status:
-                                                            AgentPaneStatus::Starting,
-                                                    },
-                                                );
-                                                app.apply_event(
-                                                    TuiEvent::QAUpdate {
-                                                        task_id: task_id.clone(),
-                                                        status:
-                                                            "post-submit validation running"
-                                                                .to_string(),
-                                                        tests: vec![],
-                                                        targets,
-                                                    },
-                                                );
+                                                app.apply_event(TuiEvent::AgentPaneOutput {
+                                                    instance_id: qa_instance.clone(),
+                                                    task_id: task_id.clone(),
+                                                    model: qa_model,
+                                                    lines: vec![
+                                                        "[Post-submit QA validation starting...]"
+                                                            .to_string(),
+                                                    ],
+                                                });
+                                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                                    instance_id: qa_instance,
+                                                    status: AgentPaneStatus::Starting,
+                                                });
+                                                app.apply_event(TuiEvent::QAUpdate {
+                                                    task_id: task_id.clone(),
+                                                    status: "post-submit validation running"
+                                                        .to_string(),
+                                                    tests: vec![],
+                                                    targets,
+                                                });
                                                 app.apply_event(
                                                     TuiEvent::StatusLine {
                                                         message: format!(
-                                                            "Post-submit QA validation started for {}",
-                                                            task_id.0
+                                                            "Post-submit QA validation started for {} (model {})",
+                                                            task_id.0,
+                                                            qa_model.as_str()
                                                         ),
                                                     },
                                                 );
                                             }
                                             Err(e) => {
-                                                app.apply_event(
-                                                    TuiEvent::StatusLine {
-                                                        message: format!(
-                                                            "Post-submit QA spawn failed for {}: {e}",
-                                                            task_id.0
-                                                        ),
-                                                    },
-                                                );
+                                                app.apply_event(TuiEvent::StatusLine {
+                                                    message: format!(
+                                                        "Post-submit QA spawn failed for {}: {e}",
+                                                        task_id.0
+                                                    ),
+                                                });
                                             }
                                         }
                                     }
@@ -1685,9 +1644,7 @@ fn run() -> Result<(), MainError> {
                                 status: AgentPaneStatus::Failed,
                             });
                             app.apply_event(TuiEvent::StatusLine {
-                                message: format!(
-                                    "{key} pipeline: {stage} failed — {reason}"
-                                ),
+                                message: format!("{key} pipeline: {stage} failed — {reason}"),
                             });
                         }
                     }
@@ -1702,7 +1659,9 @@ fn run() -> Result<(), MainError> {
         tick_counter = tick_counter.wrapping_add(1);
         if tick_counter.is_multiple_of(8) {
             if let Ok(tasks) = service.list_top_level_tasks() {
-                app.apply_event(TuiEvent::TasksReplaced { tasks: tasks.clone() });
+                app.apply_event(TuiEvent::TasksReplaced {
+                    tasks: tasks.clone(),
+                });
                 // Load QA data from disk for each task.
                 let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 for task in &tasks {
@@ -1735,7 +1694,12 @@ fn run() -> Result<(), MainError> {
 fn extract_targets(spec: &str) -> Vec<String> {
     spec.lines()
         .filter(|line| line.trim().starts_with("- "))
-        .map(|line| line.trim().strip_prefix("- ").unwrap_or(line.trim()).to_string())
+        .map(|line| {
+            line.trim()
+                .strip_prefix("- ")
+                .unwrap_or(line.trim())
+                .to_string()
+        })
         .collect()
 }
 
@@ -1749,10 +1713,7 @@ fn load_qa_display(repo_root: &Path, task_id: &TaskId, branch: &str) -> Option<T
     let result = qa_agent::load_latest_result(repo_root, branch)?;
 
     let status = if result.summary.failed > 0 {
-        format!(
-            "failed {}/{}",
-            result.summary.passed, result.summary.total
-        )
+        format!("failed {}/{}", result.summary.passed, result.summary.total)
     } else {
         format!("passed {}/{}", result.summary.passed, result.summary.total)
     };
@@ -1773,7 +1734,12 @@ fn load_qa_display(repo_root: &Path, task_id: &TaskId, branch: &str) -> Option<T
         .map(|spec| {
             spec.lines()
                 .filter(|line| line.trim().starts_with("- "))
-                .map(|line| line.trim().strip_prefix("- ").unwrap_or(line.trim()).to_string())
+                .map(|line| {
+                    line.trim()
+                        .strip_prefix("- ")
+                        .unwrap_or(line.trim())
+                        .to_string()
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -2013,7 +1979,10 @@ mod tests {
     fn chat_log_path_uses_task_id() {
         let dir = PathBuf::from("/tmp/chat");
         let task_id = TaskId("chat-123".to_string());
-        assert_eq!(chat_log_path(&dir, &task_id), PathBuf::from("/tmp/chat/chat-123.log"));
+        assert_eq!(
+            chat_log_path(&dir, &task_id),
+            PathBuf::from("/tmp/chat/chat-123.log")
+        );
     }
 
     #[test]
