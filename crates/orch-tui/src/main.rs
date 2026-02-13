@@ -876,6 +876,76 @@ fn run() -> Result<(), MainError> {
                         )
                 });
                 if !supervisor.has_session(&task.id) && !pane_stopped {
+                    // Run baseline QA before launching the implementation agent.
+                    // This preserves "before task" QA without running two agent
+                    // processes for the same task concurrently.
+                    let default_branch = format!("task/{}", task.id.0);
+                    let branch = task.branch_name.as_deref().unwrap_or(&default_branch);
+                    let qa_key = format!("qa-{}", task.id.0);
+                    if qa_agent::load_baseline(&repo_root).is_some()
+                        && qa_agent::load_latest_result(&repo_root, branch).is_none()
+                    {
+                        if !qa_agents.contains_key(&qa_key) {
+                            let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                            let baseline = qa_agent::load_baseline(&repo_root).unwrap();
+                            let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
+                            let prompt = qa_agent::build_qa_prompt(
+                                &baseline,
+                                task_spec.as_deref(),
+                                None,
+                                &task.worktree_path,
+                                &template_dir,
+                            );
+                            let mut qa_state = qa_agent::QAState::new(qa_agent::QAType::Baseline);
+                            match spawn_qa_agent_with_fallback(
+                                &task.worktree_path,
+                                &prompt,
+                                model,
+                                &mut qa_state,
+                            ) {
+                                Ok(qa_model) => {
+                                    qa_agents.insert(qa_key, qa_state);
+                                    let qa_instance = format!("qa-{}", task.id.0);
+                                    app.apply_event(TuiEvent::AgentPaneOutput {
+                                        instance_id: qa_instance.clone(),
+                                        task_id: task.id.clone(),
+                                        model: qa_model,
+                                        lines: vec!["[QA baseline starting...]".to_string()],
+                                    });
+                                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                        instance_id: qa_instance,
+                                        status: AgentPaneStatus::Starting,
+                                    });
+                                    app.apply_event(TuiEvent::QAUpdate {
+                                        task_id: task.id.clone(),
+                                        status: "baseline running".to_string(),
+                                        tests: vec![],
+                                        targets: task_spec
+                                            .as_deref()
+                                            .map(|s| extract_targets(s))
+                                            .unwrap_or_default(),
+                                    });
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "QA baseline started for {} (model {}), waiting to launch agent",
+                                            task.id.0,
+                                            qa_model.as_str()
+                                        ),
+                                    });
+                                }
+                                Err(e) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "QA baseline spawn failed for {}: {e}",
+                                            task.id.0
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     // Validate/recover worktree before spawning.
                     if let Err(e) = orchd::ensure_worktree_exists(&repo_root, task) {
                         app.apply_event(TuiEvent::StatusLine {
@@ -911,152 +981,11 @@ fn run() -> Result<(), MainError> {
                                     model, task.id.0
                                 ),
                             });
-
-                            // Spawn QA baseline in parallel if baseline.md exists
-                            // and no QA agent is already running for this task.
-                            let qa_key = format!("qa-{}", task.id.0);
-                            if !qa_agents.contains_key(&qa_key) {
-                                if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
-                                    let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
-                                    let previous = task
-                                        .branch_name
-                                        .as_deref()
-                                        .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
-                                    let prompt = qa_agent::build_qa_prompt(
-                                        &baseline,
-                                        task_spec.as_deref(),
-                                        previous.as_ref(),
-                                        &repo_root,
-                                        &template_dir,
-                                    );
-                                    let mut qa_state =
-                                        qa_agent::QAState::new(qa_agent::QAType::Baseline);
-                                    match spawn_qa_agent_with_fallback(
-                                        &repo_root,
-                                        &prompt,
-                                        model,
-                                        &mut qa_state,
-                                    ) {
-                                        Ok(qa_model) => {
-                                            qa_agents.insert(qa_key, qa_state);
-                                            // Create a TUI pane for QA agent output.
-                                            let qa_instance = format!("qa-{}", task.id.0);
-                                            app.apply_event(TuiEvent::AgentPaneOutput {
-                                                instance_id: qa_instance.clone(),
-                                                task_id: task.id.clone(),
-                                                model: qa_model,
-                                                lines: vec!["[QA baseline starting...]".to_string()],
-                                            });
-                                            app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                                                instance_id: qa_instance,
-                                                status: AgentPaneStatus::Starting,
-                                            });
-                                            app.apply_event(TuiEvent::QAUpdate {
-                                                task_id: task.id.clone(),
-                                                status: "baseline running".to_string(),
-                                                tests: vec![],
-                                                targets: task_spec
-                                                    .as_deref()
-                                                    .map(|s| extract_targets(s))
-                                                    .unwrap_or_default(),
-                                            });
-                                            app.apply_event(TuiEvent::StatusLine {
-                                                message: format!(
-                                                    "QA baseline started for {} (model {})",
-                                                    task.id.0,
-                                                    qa_model.as_str()
-                                                ),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            app.apply_event(TuiEvent::StatusLine {
-                                                message: format!(
-                                                    "QA spawn failed for {}: {e}",
-                                                    task.id.0
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
                         }
                         Err(e) => {
                             app.apply_event(TuiEvent::StatusLine {
                                 message: format!("auto-spawn failed for {}: {}", task.id.0, e),
                             });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Spawn QA baseline for any chatting task that has an agent
-        // running but no QA agent yet (catches tasks started before
-        // baseline.md existed or before this code was deployed).
-        if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
-            for task in &chatting {
-                let qa_key = format!("qa-{}", task.id.0);
-                if !qa_agents.contains_key(&qa_key) && supervisor.has_session(&task.id) {
-                    if let Some(baseline) = qa_agent::load_baseline(&repo_root) {
-                        let model = task.preferred_model.unwrap_or(ModelKind::Claude);
-                        let task_spec = qa_agent::load_task_spec(&repo_root, &task.id);
-                        let previous = task
-                            .branch_name
-                            .as_deref()
-                            .and_then(|b| qa_agent::load_latest_result(&repo_root, b));
-                        let prompt = qa_agent::build_qa_prompt(
-                            &baseline,
-                            task_spec.as_deref(),
-                            previous.as_ref(),
-                            &repo_root,
-                            &template_dir,
-                        );
-                        let mut qa_state = qa_agent::QAState::new(qa_agent::QAType::Baseline);
-                        match spawn_qa_agent_with_fallback(
-                            &repo_root,
-                            &prompt,
-                            model,
-                            &mut qa_state,
-                        ) {
-                            Ok(qa_model) => {
-                                qa_agents.insert(qa_key, qa_state);
-                                // Create a TUI pane for QA agent output.
-                                let qa_instance = format!("qa-{}", task.id.0);
-                                app.apply_event(TuiEvent::AgentPaneOutput {
-                                    instance_id: qa_instance.clone(),
-                                    task_id: task.id.clone(),
-                                    model: qa_model,
-                                    lines: vec!["[QA baseline starting...]".to_string()],
-                                });
-                                app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                                    instance_id: qa_instance,
-                                    status: AgentPaneStatus::Starting,
-                                });
-                                app.apply_event(TuiEvent::QAUpdate {
-                                    task_id: task.id.clone(),
-                                    status: "baseline running".to_string(),
-                                    tests: vec![],
-                                    targets: task_spec
-                                        .as_deref()
-                                        .map(|s| extract_targets(s))
-                                        .unwrap_or_default(),
-                                });
-                                app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "QA baseline started for {} (catch-up, model {})",
-                                        task.id.0,
-                                        qa_model.as_str()
-                                    ),
-                                });
-                            }
-                            Err(e) => {
-                                app.apply_event(TuiEvent::StatusLine {
-                                    message: format!(
-                                        "QA baseline catch-up spawn failed for {}: {e}",
-                                        task.id.0
-                                    ),
-                                });
-                            }
                         }
                     }
                 }
