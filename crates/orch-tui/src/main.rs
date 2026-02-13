@@ -1295,74 +1295,73 @@ fn run() -> Result<(), MainError> {
                     } else {
                         // QA failed — spawn a fix agent and retry.
                         if let Ok(Some(task)) = service.task(&task_id) {
-                            if task.retry_count < task.max_retries {
-                                // Build QA failure context and spawn fix agent.
-                                let qa_ctx = qa_agent::build_qa_failure_context(&qa_result);
-                                let retry_prompt = format!("{}\n\n{}", task.title, qa_ctx);
-                                let model = task.preferred_model.unwrap_or(ModelKind::Claude);
-                                let instance_id = format!("agent-{}", task_id.0);
-
-                                // Stop any existing session first.
-                                supervisor.stop(&task_id);
-
-                                match supervisor.spawn_agent(
-                                    &task.id,
-                                    &task.repo_id,
-                                    &task.worktree_path,
-                                    &retry_prompt,
-                                    Some(model),
-                                ) {
-                                    Ok(()) => {
-                                        // Increment retry count.
-                                        let _ = service.increment_retry(
-                                            &task_id,
-                                            &format!(
-                                                "QA validation failed {}/{}",
-                                                qa_result.summary.passed, qa_result.summary.total
-                                            ),
-                                        );
-
-                                        app.apply_event(TuiEvent::AgentPaneOutput {
-                                            instance_id: instance_id.clone(),
-                                            task_id: task_id.clone(),
-                                            model,
-                                            lines: vec![format!(
-                                                "[QA fix retry {}/{} — {} tests failed]",
-                                                task.retry_count + 1,
-                                                task.max_retries,
-                                                qa_result.summary.failed
-                                            )],
-                                        });
-                                        app.apply_event(TuiEvent::AgentPaneStatusChanged {
-                                            instance_id,
-                                            status: AgentPaneStatus::Starting,
-                                        });
-                                        app.apply_event(TuiEvent::StatusLine {
-                                            message: format!(
-                                                "{} QA failed — fix agent spawned (retry {}/{})",
-                                                task_id.0,
-                                                task.retry_count + 1,
-                                                task.max_retries
-                                            ),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        app.apply_event(TuiEvent::StatusLine {
-                                            message: format!(
-                                                "{} QA failed, fix agent spawn failed: {e}",
-                                                task_id.0
-                                            ),
-                                        });
-                                    }
-                                }
-                            } else {
-                                // Max retries exhausted — give up.
+                            if task.retry_count >= task.max_retries {
                                 app.apply_event(TuiEvent::StatusLine {
                                     message: format!(
-                                        "{} QA validation failed — max retries ({}) exhausted",
+                                        "{} QA validation hit max retries ({}), continuing auto-retry",
                                         task_id.0, task.max_retries
                                     ),
                                 });
+                            }
+
+                            // Build QA failure context and spawn fix agent.
+                            let qa_ctx = qa_agent::build_qa_failure_context(&qa_result);
+                            let retry_prompt = format!("{}\n\n{}", task.title, qa_ctx);
+                            let model = task.preferred_model.unwrap_or(ModelKind::Claude);
+                            let instance_id = format!("agent-{}", task_id.0);
+
+                            // Stop any existing session first.
+                            supervisor.stop(&task_id);
+
+                            match supervisor.spawn_agent(
+                                &task.id,
+                                &task.repo_id,
+                                &task.worktree_path,
+                                &retry_prompt,
+                                Some(model),
+                            ) {
+                                Ok(()) => {
+                                    // Increment retry count.
+                                    let _ = service.increment_retry(
+                                        &task_id,
+                                        &format!(
+                                            "QA validation failed {}/{}",
+                                            qa_result.summary.passed, qa_result.summary.total
+                                        ),
+                                    );
+
+                                    app.apply_event(TuiEvent::AgentPaneOutput {
+                                        instance_id: instance_id.clone(),
+                                        task_id: task_id.clone(),
+                                        model,
+                                        lines: vec![format!(
+                                            "[QA fix retry {}/{} — {} tests failed]",
+                                            task.retry_count + 1,
+                                            task.max_retries,
+                                            qa_result.summary.failed
+                                        )],
+                                    });
+                                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                        instance_id,
+                                        status: AgentPaneStatus::Starting,
+                                    });
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "{} QA failed — fix agent spawned (retry {}/{})",
+                                            task_id.0,
+                                            task.retry_count + 1,
+                                            task.max_retries
+                                        ),
+                                    });
+                                }
+                                Err(e) => {
+                                    app.apply_event(TuiEvent::StatusLine {
+                                        message: format!(
+                                            "{} QA failed, fix agent spawn failed: {e}",
+                                            task_id.0
+                                        ),
+                                    });
+                                }
                             }
                         } else {
                             app.apply_event(TuiEvent::StatusLine {
