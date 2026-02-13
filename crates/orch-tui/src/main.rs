@@ -555,15 +555,32 @@ fn run() -> Result<(), MainError> {
                         if !supervisor.has_session(task_id) {
                             if let Ok(Some(task)) = service.task(task_id) {
                                 let model = task.preferred_model.unwrap_or(ModelKind::Claude);
-                                if let Err(e) = supervisor.spawn_interactive(
-                                    &task.id,
-                                    &task.repo_id,
-                                    &task.worktree_path,
-                                    message,
-                                    Some(model),
-                                ) {
+                                let spawn_mode = if model == ModelKind::Codex {
+                                    "one-shot"
+                                } else {
+                                    "interactive"
+                                };
+                                let spawn_result = if model == ModelKind::Codex {
+                                    supervisor.spawn_agent(
+                                        &task.id,
+                                        &task.repo_id,
+                                        &task.worktree_path,
+                                        message,
+                                        Some(model),
+                                    )
+                                } else {
+                                    supervisor.spawn_interactive(
+                                        &task.id,
+                                        &task.repo_id,
+                                        &task.worktree_path,
+                                        message,
+                                        Some(model),
+                                    )
+                                };
+
+                                if let Err(e) = spawn_result {
                                     app.apply_event(TuiEvent::StatusLine {
-                                        message: format!("interactive spawn failed: {e}"),
+                                        message: format!("{spawn_mode} spawn failed: {e}"),
                                     });
                                 } else {
                                     // Echo user message into the pane and log.
@@ -571,15 +588,19 @@ fn run() -> Result<(), MainError> {
                                     append_chat_log(&chat_log_dir, task_id, &[user_line.clone()]);
                                     let instance_id = format!("agent-{}", task_id.0);
                                     app.apply_event(TuiEvent::AgentPaneOutput {
-                                        instance_id,
+                                        instance_id: instance_id.clone(),
                                         task_id: task_id.clone(),
                                         model,
                                         lines: vec![user_line],
                                     });
+                                    app.apply_event(TuiEvent::AgentPaneStatusChanged {
+                                        instance_id,
+                                        status: AgentPaneStatus::Starting,
+                                    });
                                     app.apply_event(TuiEvent::StatusLine {
                                         message: format!(
-                                            "started interactive {:?} agent for {}",
-                                            model, task_id.0
+                                            "started {spawn_mode} {:?} agent for {}",
+                                            model, task_id.0,
                                         ),
                                     });
                                 }
@@ -605,9 +626,13 @@ fn run() -> Result<(), MainError> {
                                     });
                                 }
                                 Err(e) => {
-                                    app.apply_event(TuiEvent::StatusLine {
-                                        message: format!("send failed: {e}"),
-                                    });
+                                    let msg = e.to_string();
+                                    let status = if msg.contains("is not interactive") {
+                                        "send failed: current session is non-interactive; wait for it to finish, then send again".to_string()
+                                    } else {
+                                        format!("send failed: {msg}")
+                                    };
+                                    app.apply_event(TuiEvent::StatusLine { message: status });
                                 }
                             }
                         }
