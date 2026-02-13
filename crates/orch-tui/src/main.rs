@@ -524,8 +524,8 @@ fn run() -> Result<(), MainError> {
     let mut qa_agents: HashMap<String, qa_agent::QAState> = HashMap::new();
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let template_dir = PathBuf::from("templates/prompts");
-    let mut global_baseline_result: Option<qa_agent::QAResult> =
-        qa_agent::load_latest_result(&repo_root, "main");
+    let cached_main_baseline = qa_agent::load_latest_result(&repo_root, "main");
+    let mut global_baseline_result: Option<qa_agent::QAResult> = None;
     let mut queued_validation_tasks: HashSet<TaskId> = HashSet::new();
     let mut next_baseline_retry_at = Instant::now();
     let mut pipelines: HashMap<String, PipelineState> = HashMap::new();
@@ -999,10 +999,21 @@ fn run() -> Result<(), MainError> {
                     });
                 }
                 Err(e) => {
-                    next_baseline_retry_at = Instant::now() + Duration::from_secs(10);
-                    app.apply_event(TuiEvent::StatusLine {
-                        message: format!("global baseline QA spawn failed: {e}; retrying in 10s"),
-                    });
+                    if let Some(cached) = cached_main_baseline.clone() {
+                        global_baseline_result = Some(cached);
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!(
+                                "global baseline QA spawn failed: {e}; using cached main baseline"
+                            ),
+                        });
+                    } else {
+                        next_baseline_retry_at = Instant::now() + Duration::from_secs(10);
+                        app.apply_event(TuiEvent::StatusLine {
+                            message: format!(
+                                "global baseline QA spawn failed: {e}; retrying in 10s"
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1179,7 +1190,7 @@ fn run() -> Result<(), MainError> {
                 {
                     global_baseline_result
                         .clone()
-                        .or_else(|| qa_agent::load_latest_result(&repo_root, "main"))
+                        .or_else(|| cached_main_baseline.clone())
                         .as_ref()
                         .map(|baseline| qa_failures_no_worse_than_baseline(&qa_result, baseline))
                         .unwrap_or(false)
@@ -1369,17 +1380,29 @@ fn run() -> Result<(), MainError> {
                 // QA agent process died without producing results.
                 // Remove the dead entry so it doesn't block future QA spawns.
                 if is_global_baseline {
-                    if qa_output_is_environment_blocked(&qa_state.output_buffer) {
+                    if let Some(cached) = cached_main_baseline.clone() {
+                        global_baseline_result = Some(cached);
                         app.apply_event(TuiEvent::StatusLine {
-                            message: "global baseline QA blocked by environment without structured output; retrying in 10s".to_string(),
+                            message:
+                                "global baseline QA failed without structured output; using cached main baseline"
+                                    .to_string(),
                         });
                     } else {
-                        app.apply_event(TuiEvent::StatusLine {
-                            message: "global baseline QA failed without output; retrying in 10s"
-                                .to_string(),
-                        });
+                        if qa_output_is_environment_blocked(&qa_state.output_buffer) {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message:
+                                    "global baseline QA blocked by environment without structured output; retrying in 10s"
+                                        .to_string(),
+                            });
+                        } else {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message:
+                                    "global baseline QA failed without output; retrying in 10s"
+                                        .to_string(),
+                            });
+                        }
+                        next_baseline_retry_at = Instant::now() + Duration::from_secs(10);
                     }
-                    next_baseline_retry_at = Instant::now() + Duration::from_secs(10);
                     qa_agents.remove(&qa_key);
                     continue;
                 }
