@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::context_graph::{load_context_graph, render_context_for_prompt, ContextLoadConfig};
+use crate::context_graph::{load_context_graph, render_context_with_sources, ContextLoadConfig};
 
 /// A running agent session.
 pub struct AgentSession {
@@ -349,10 +349,10 @@ impl AgentSupervisor {
 pub fn build_prompt(task_id: &TaskId, title: &str, repo_root: &Path) -> String {
     let mut sections = Vec::new();
 
-    // Load and inject codebase context from .othala/context/.
     if let Some(graph) = load_context_graph(repo_root, &ContextLoadConfig::default()) {
         if !graph.nodes.is_empty() {
-            sections.push(render_context_for_prompt(&graph));
+            const SOURCE_BUDGET: usize = 64_000;
+            sections.push(render_context_with_sources(&graph, repo_root, SOURCE_BUDGET));
         }
     }
 
