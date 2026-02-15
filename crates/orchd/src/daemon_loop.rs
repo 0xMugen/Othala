@@ -45,6 +45,8 @@ pub struct DaemonConfig {
     pub verify_command: Option<String>,
     /// Context generation configuration.
     pub context_gen_config: ContextGenConfig,
+    /// Skip QA baseline runs (prevents QA agent from mutating state).
+    pub skip_qa_baseline: bool,
 }
 
 /// Mutable state carried across daemon ticks.
@@ -138,6 +140,7 @@ pub fn daemon_tick(
     // For tasks about to be spawned, check if a baseline QA result exists for
     // the task's branch. If no baseline exists and we have a QA spec, spawn a
     // baseline QA agent first.
+    if !config.skip_qa_baseline {
     if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
         for task in &chatting {
             let default_branch = format!("task/{}", task.id.0);
@@ -164,6 +167,7 @@ pub fn daemon_tick(
             });
         }
     }
+    } // end skip_qa_baseline guard
 
     // --- Phase 2: Poll supervisor for completed agents ---
     let poll_result = supervisor.poll();
@@ -1099,6 +1103,7 @@ mod tests {
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
+            skip_qa_baseline: false,
         }
     }
 
@@ -1246,6 +1251,7 @@ mod tests {
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
+            skip_qa_baseline: false,
         };
         (config, tmp)
     }
