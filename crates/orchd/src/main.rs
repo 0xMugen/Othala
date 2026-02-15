@@ -73,6 +73,9 @@ enum Commands {
         /// Skip all QA runs (baseline + validation)
         #[arg(long)]
         skip_qa: bool,
+        /// Run a single daemon tick then exit
+        #[arg(long)]
+        once: bool,
     },
     /// Interactive first-time setup wizard
     Wizard {
@@ -670,6 +673,7 @@ fn main() -> anyhow::Result<()> {
             skip_context_gen,
             verify_command,
             skip_qa,
+            once,
         } => {
             print_banner();
 
@@ -711,6 +715,13 @@ fn main() -> anyhow::Result<()> {
                 skip_qa,
                 skip_context_regen: skip_context_gen,
             };
+
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let flag = shutdown.clone();
+                signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone())?;
+                signal_hook::flag::register(signal_hook::consts::SIGTERM, flag)?;
+            }
 
             let start = Instant::now();
             let mut idle_grace_ticks: u32 = 0;
@@ -770,6 +781,18 @@ fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     idle_grace_ticks = 0;
+                }
+
+                if once {
+                    eprintln!("[daemon] --once mode, exiting after single tick");
+                    supervisor.stop_all();
+                    break;
+                }
+
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[daemon] Received signal, shutting down gracefully");
+                    supervisor.stop_all();
+                    break;
                 }
 
                 std::thread::sleep(std::time::Duration::from_secs(2));
