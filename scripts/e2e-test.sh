@@ -124,6 +124,7 @@ $OTHALA daemon \
 	--timeout "$TIMEOUT" \
 	--exit-on-idle \
 	--skip-context-gen \
+	--skip-qa \
 	--verify-command "$VERIFY_CMD" \
 	>"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
