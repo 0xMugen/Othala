@@ -1,6 +1,8 @@
 //! Retry logic — decides whether to retry a failed task and which model to use.
 
+use chrono::{DateTime, Duration, Utc};
 use orch_core::types::{ModelKind, Task};
+use std::collections::HashMap;
 
 use crate::supervisor::AgentOutcome;
 
@@ -13,6 +15,162 @@ pub struct RetryDecision {
     pub next_model: Option<ModelKind>,
     /// Human-readable explanation.
     pub reason: String,
+}
+
+const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+const DEFAULT_COOLDOWN_SECS: i64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthState {
+    Healthy,
+    Degraded,
+    Cooldown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelHealthTracker {
+    state: HashMap<ModelKind, ModelHealth>,
+    failure_threshold: u32,
+    cooldown_duration: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct ModelHealth {
+    consecutive_failures: u32,
+    last_failure: Option<DateTime<Utc>>,
+    cooldown_until: Option<DateTime<Utc>>,
+}
+
+impl ModelHealth {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_failure: None,
+            cooldown_until: None,
+        }
+    }
+}
+
+impl Default for ModelHealthTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelHealthTracker {
+    pub fn new() -> Self {
+        Self {
+            state: HashMap::new(),
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            cooldown_duration: Duration::seconds(DEFAULT_COOLDOWN_SECS),
+        }
+    }
+
+    pub fn with_config(failure_threshold: u32, cooldown_secs: i64) -> Self {
+        Self {
+            state: HashMap::new(),
+            failure_threshold: failure_threshold.max(1),
+            cooldown_duration: Duration::seconds(cooldown_secs.max(1)),
+        }
+    }
+
+    pub fn record_success(&mut self, model: ModelKind) {
+        let health = self.state.entry(model).or_insert_with(ModelHealth::new);
+        health.consecutive_failures = 0;
+        health.cooldown_until = None;
+    }
+
+    pub fn record_failure(&mut self, model: ModelKind) {
+        self.record_failure_at(model, Utc::now());
+    }
+
+    pub fn record_failure_at(&mut self, model: ModelKind, now: DateTime<Utc>) {
+        let health = self.state.entry(model).or_insert_with(ModelHealth::new);
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_failure = Some(now);
+        if health.consecutive_failures >= self.failure_threshold {
+            health.cooldown_until = Some(now + self.cooldown_duration);
+        }
+    }
+
+    pub fn is_available(&self, model: ModelKind, now: DateTime<Utc>) -> bool {
+        self.state
+            .get(&model)
+            .and_then(|h| h.cooldown_until)
+            .map_or(true, |until| now >= until)
+    }
+
+    pub fn health_state(&self, model: ModelKind, now: DateTime<Utc>) -> HealthState {
+        let Some(health) = self.state.get(&model) else {
+            return HealthState::Healthy;
+        };
+
+        if health.cooldown_until.is_some_and(|until| now < until) {
+            return HealthState::Cooldown;
+        }
+        if health.consecutive_failures > 0 {
+            HealthState::Degraded
+        } else {
+            HealthState::Healthy
+        }
+    }
+
+    fn last_failure(&self, model: ModelKind) -> Option<DateTime<Utc>> {
+        self.state.get(&model).and_then(|h| h.last_failure)
+    }
+}
+
+pub fn pick_next_model_with_health(
+    task: &Task,
+    just_failed: ModelKind,
+    enabled_models: &[ModelKind],
+    tracker: &ModelHealthTracker,
+    now: DateTime<Utc>,
+) -> Option<ModelKind> {
+    let mut ordered_candidates = Vec::new();
+
+    if let Some(preferred) = task.preferred_model {
+        if preferred != just_failed
+            && !task.failed_models.contains(&preferred)
+            && enabled_models.contains(&preferred)
+        {
+            ordered_candidates.push(preferred);
+        }
+    }
+
+    for model in enabled_models {
+        if *model == just_failed || task.failed_models.contains(model) {
+            continue;
+        }
+        if !ordered_candidates.contains(model) {
+            ordered_candidates.push(*model);
+        }
+    }
+
+    if ordered_candidates.is_empty() {
+        return None;
+    }
+
+    let mut healthy = Vec::new();
+    let mut degraded = Vec::new();
+    let mut cooldown = Vec::new();
+
+    for model in ordered_candidates {
+        match tracker.health_state(model, now) {
+            HealthState::Healthy => healthy.push(model),
+            HealthState::Degraded => degraded.push(model),
+            HealthState::Cooldown => cooldown.push(model),
+        }
+    }
+
+    if let Some(model) = healthy.first() {
+        return Some(*model);
+    }
+    if let Some(model) = degraded.first() {
+        return Some(*model);
+    }
+
+    cooldown.into_iter().min_by_key(|model| tracker.last_failure(*model))
 }
 
 /// Evaluate whether a task should be retried after a failed agent run.
@@ -135,6 +293,7 @@ mod tests {
             patch_ready: success,
             needs_human: false,
             success,
+            duration_secs: 1,
         }
     }
 
@@ -264,5 +423,87 @@ mod tests {
 
         assert!(!decision.should_retry);
         assert!(decision.reason.contains("no available models"));
+    }
+
+    #[test]
+    fn cooldown_activates_after_threshold_failures() {
+        let mut tracker = ModelHealthTracker::with_config(3, 60);
+        let now = Utc::now();
+
+        tracker.record_failure_at(ModelKind::Claude, now);
+        tracker.record_failure_at(ModelKind::Claude, now + Duration::seconds(1));
+        assert!(tracker.is_available(ModelKind::Claude, now + Duration::seconds(2)));
+        assert_eq!(
+            tracker.health_state(ModelKind::Claude, now + Duration::seconds(2)),
+            HealthState::Degraded
+        );
+
+        tracker.record_failure_at(ModelKind::Claude, now + Duration::seconds(3));
+        assert!(!tracker.is_available(ModelKind::Claude, now + Duration::seconds(4)));
+        assert_eq!(
+            tracker.health_state(ModelKind::Claude, now + Duration::seconds(4)),
+            HealthState::Cooldown
+        );
+    }
+
+    #[test]
+    fn cooldown_expires_and_model_becomes_available() {
+        let mut tracker = ModelHealthTracker::with_config(3, 60);
+        let now = Utc::now();
+
+        tracker.record_failure_at(ModelKind::Codex, now);
+        tracker.record_failure_at(ModelKind::Codex, now + Duration::seconds(1));
+        tracker.record_failure_at(ModelKind::Codex, now + Duration::seconds(2));
+
+        assert!(!tracker.is_available(ModelKind::Codex, now + Duration::seconds(30)));
+        assert!(tracker.is_available(ModelKind::Codex, now + Duration::seconds(63)));
+        assert_eq!(
+            tracker.health_state(ModelKind::Codex, now + Duration::seconds(63)),
+            HealthState::Degraded
+        );
+    }
+
+    #[test]
+    fn healthy_models_are_preferred_over_degraded_ones() {
+        let mut task = mk_task();
+        task.preferred_model = Some(ModelKind::Claude);
+        let enabled = vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini];
+        let now = Utc::now();
+
+        let mut tracker = ModelHealthTracker::with_config(3, 60);
+        tracker.record_failure_at(ModelKind::Codex, now);
+
+        let next = pick_next_model_with_health(
+            &task,
+            ModelKind::Gemini,
+            &enabled,
+            &tracker,
+            now + Duration::seconds(1),
+        );
+
+        assert_eq!(next, Some(ModelKind::Claude));
+    }
+
+    #[test]
+    fn all_models_in_cooldown_picks_least_recently_failed() {
+        let mut task = mk_task();
+        task.preferred_model = Some(ModelKind::Claude);
+        let enabled = vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini];
+        let now = Utc::now();
+
+        let mut tracker = ModelHealthTracker::with_config(1, 60);
+        tracker.record_failure_at(ModelKind::Claude, now + Duration::seconds(30));
+        tracker.record_failure_at(ModelKind::Codex, now + Duration::seconds(10));
+        tracker.record_failure_at(ModelKind::Gemini, now + Duration::seconds(20));
+
+        let next = pick_next_model_with_health(
+            &task,
+            ModelKind::Claude,
+            &enabled,
+            &tracker,
+            now + Duration::seconds(35),
+        );
+
+        assert_eq!(next, Some(ModelKind::Codex));
     }
 }

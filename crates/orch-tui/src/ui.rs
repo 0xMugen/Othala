@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::TuiApp;
+use crate::app::{InputMode, TuiApp};
 use crate::chat_parse;
 use crate::chat_render;
 use crate::model::{AgentPane, PaneCategory};
@@ -89,6 +89,10 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
 
     if let Some((task_id, branch)) = app.delete_confirm_display() {
         render_delete_confirm_modal(frame, &task_id.0, branch);
+    }
+
+    if matches!(&app.input_mode, InputMode::HelpOverlay) {
+        render_help_overlay(frame);
     }
 }
 
@@ -496,6 +500,72 @@ fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Opt
     let widget = Paragraph::new(lines)
         .block(focused_block("Are You Sure?"))
         .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>) {
+    let area = centered_rect(60, 80, frame.area());
+    let shortcuts = [
+        ("?", "Help"),
+        ("Esc", "Quit / Back"),
+        ("Ctrl+C", "Force quit"),
+        ("Up/Down", "Navigate tasks"),
+        ("Left/Right", "Navigate panes"),
+        ("Tab", "Toggle focus"),
+        ("Enter", "Toggle task detail"),
+        ("c", "Create task"),
+        ("a", "Approve task"),
+        ("g", "Submit to Graphite"),
+        ("s", "Start agent"),
+        ("x", "Stop agent"),
+        ("r", "Restart agent"),
+        ("d", "Delete task"),
+        ("q", "Quick verify"),
+        ("f", "Full verify"),
+        ("t", "Trigger restack"),
+        ("n", "Mark needs human"),
+        ("w", "Open web UI"),
+        ("p", "Pause task"),
+        ("u", "Resume task"),
+        ("i", "Chat input"),
+    ];
+
+    let mut lines = Vec::with_capacity(shortcuts.len() + 4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<12}", "Key"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Action",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "-".repeat(46),
+        Style::default().fg(DIM),
+    )));
+
+    for (key, description) in shortcuts {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{key:<12}"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(description, Style::default().fg(HEADER_FG)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press ? or Esc to close",
+        Style::default().fg(DIM),
+    )));
+
+    let widget = Paragraph::new(lines)
+        .block(focused_block("Keyboard Shortcuts"))
+        .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
 }

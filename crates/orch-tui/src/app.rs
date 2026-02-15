@@ -30,6 +30,7 @@ pub enum InputMode {
         task_id: TaskId,
         branch: Option<String>,
     },
+    HelpOverlay,
     ChatInput {
         buffer: String,
         task_id: TaskId,
@@ -243,6 +244,7 @@ impl TuiApp {
                     self.state.status_line = format!("task detail: {task_id}");
                 }
             }
+            UiCommand::ShowHelp => self.input_mode = InputMode::HelpOverlay,
             UiCommand::Quit => self.should_quit = true,
         }
     }
@@ -419,6 +421,7 @@ impl TuiApp {
             InputMode::ChatInput { buffer, .. } => Some(buffer.as_str()),
             InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
             InputMode::DeleteTaskConfirm { .. } => None,
+            InputMode::HelpOverlay => None,
         }
     }
 
@@ -453,6 +456,12 @@ impl TuiApp {
         }
         match &mut self.input_mode {
             InputMode::Normal => return false,
+            InputMode::HelpOverlay => match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.input_mode = InputMode::Normal;
+                }
+                _ => {}
+            },
             InputMode::NewChatPrompt { buffer } => match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
@@ -868,6 +877,36 @@ mod tests {
         assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
         assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
         assert_eq!(drained[0].prompt, None);
+    }
+
+    #[test]
+    fn question_mark_opens_help_overlay() {
+        let mut app = TuiApp::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::HelpOverlay));
+    }
+
+    #[test]
+    fn esc_closes_help_overlay() {
+        let mut app = TuiApp::default();
+        app.input_mode = super::InputMode::HelpOverlay;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn question_mark_closes_help_overlay() {
+        let mut app = TuiApp::default();
+        app.input_mode = super::InputMode::HelpOverlay;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
     }
 
     #[test]
