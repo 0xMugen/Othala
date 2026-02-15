@@ -97,7 +97,7 @@ impl ModelHealthTracker {
         self.state
             .get(&model)
             .and_then(|h| h.cooldown_until)
-            .map_or(true, |until| now >= until)
+            .is_none_or(|until| now >= until)
     }
 
     pub fn health_state(&self, model: ModelKind, now: DateTime<Utc>) -> HealthState {
