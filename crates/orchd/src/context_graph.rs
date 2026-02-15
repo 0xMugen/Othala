@@ -127,6 +127,69 @@ pub fn render_context_for_prompt(graph: &ContextGraph) -> String {
     out
 }
 
+/// Render context graph with inlined source file contents.
+///
+/// Like `render_context_for_prompt` but also reads files referenced via
+/// `@file:` and `[text](../../path)` source_refs, appending their content
+/// in fenced code blocks. Respects a character budget for inlined sources.
+pub fn render_context_with_sources(
+    graph: &ContextGraph,
+    repo_root: &Path,
+    source_budget: usize,
+) -> String {
+    let mut out = render_context_for_prompt(graph);
+
+    let mut all_refs: Vec<&PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+    for node in &graph.nodes {
+        for r in &node.source_refs {
+            if seen.insert(r) {
+                all_refs.push(r);
+            }
+        }
+    }
+
+    if all_refs.is_empty() {
+        return out;
+    }
+
+    out.push_str("# Referenced Source Files\n\n");
+    let mut used = 0usize;
+
+    for path in all_refs {
+        if used >= source_budget {
+            break;
+        }
+        let abs = repo_root.join(path);
+        let content = match std::fs::read_to_string(&abs) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let remaining = source_budget.saturating_sub(used);
+        let content = if content.len() > remaining {
+            format!("{}...(truncated)", &content[..remaining])
+        } else {
+            content
+        };
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        out.push_str(&format!("## {}\n\n```{}\n", path.display(), ext));
+        out.push_str(&content);
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n\n");
+        used += content.len();
+    }
+
+    out
+}
+
 /// Extract markdown links from content.
 ///
 /// Returns `(context_links, source_refs)`:
