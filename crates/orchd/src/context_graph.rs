@@ -36,7 +36,7 @@ pub struct ContextLoadConfig {
 impl Default for ContextLoadConfig {
     fn default() -> Self {
         Self {
-            max_depth: 6,
+            max_depth: 10,
             max_total_chars: 80_000,
         }
     }
@@ -47,10 +47,7 @@ impl Default for ContextLoadConfig {
 /// Performs BFS link-following up to `config.max_depth`, stopping when the
 /// character budget is exhausted. Returns `None` if the entry point doesn't
 /// exist.
-pub fn load_context_graph(
-    repo_root: &Path,
-    config: &ContextLoadConfig,
-) -> Option<ContextGraph> {
+pub fn load_context_graph(repo_root: &Path, config: &ContextLoadConfig) -> Option<ContextGraph> {
     let entry = repo_root.join(".othala/context/MAIN.md");
     if !entry.exists() {
         return None;
@@ -64,9 +61,23 @@ pub fn load_context_graph(
     // Normalise entry to a repo-relative path for the visited set.
     let entry_rel = PathBuf::from(".othala/context/MAIN.md");
     queue.push_back((entry_rel.clone(), 0));
-    visited.insert(entry_rel);
+    let entry_canonical = repo_root
+        .join(&entry_rel)
+        .canonicalize()
+        .unwrap_or_else(|_| normalise_path(&repo_root.join(&entry_rel)));
+    visited.insert(entry_canonical);
 
     while let Some((rel_path, depth)) = queue.pop_front() {
+        if depth > config.max_depth {
+            eprintln!(
+                "warning: context depth limit reached at {} (depth {}, max_depth {})",
+                rel_path.display(),
+                depth,
+                config.max_depth
+            );
+            continue;
+        }
+
         if total_chars >= config.max_total_chars {
             break;
         }
@@ -89,13 +100,34 @@ pub fn load_context_graph(
         total_chars += content.len();
 
         // Enqueue links for next depth level.
-        if depth < config.max_depth {
-            for link in &links {
-                if !visited.contains(link) {
-                    visited.insert(link.clone());
-                    queue.push_back((link.clone(), depth + 1));
-                }
+        for link in &links {
+            let next_depth = depth + 1;
+            if next_depth > config.max_depth {
+                eprintln!(
+                    "warning: context depth limit reached at {} -> {} (max_depth {})",
+                    rel_path.display(),
+                    link.display(),
+                    config.max_depth
+                );
+                continue;
             }
+
+            let link_abs = repo_root.join(link);
+            let link_canonical = link_abs
+                .canonicalize()
+                .unwrap_or_else(|_| normalise_path(&link_abs));
+
+            if visited.contains(&link_canonical) {
+                eprintln!(
+                    "warning: cycle detected in context graph: {} -> {}",
+                    rel_path.display(),
+                    link.display()
+                );
+                continue;
+            }
+
+            visited.insert(link_canonical);
+            queue.push_back((link.clone(), next_depth));
         }
 
         nodes.push(ContextNode {
@@ -173,10 +205,7 @@ pub fn render_context_with_sources(
             content
         };
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         out.push_str(&format!("## {}\n\n```{}\n", path.display(), ext));
         out.push_str(&content);
@@ -208,10 +237,7 @@ fn extract_links(content: &str, current_path: &Path) -> (Vec<PathBuf>, Vec<PathB
             let after = &rest[start + 2..];
             if let Some(end) = after.find(')') {
                 let target = after[..end].trim();
-                if !target.is_empty()
-                    && !target.starts_with("http")
-                    && !target.starts_with('#')
-                {
+                if !target.is_empty() && !target.starts_with("http") && !target.starts_with('#') {
                     let resolved = parent.join(target);
                     let normalised = normalise_path(&resolved);
 
@@ -342,8 +368,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("othala-ctx-test-{}", std::process::id()));
         setup_context_dir(&tmp);
 
-        let graph = load_context_graph(&tmp, &ContextLoadConfig::default())
-            .expect("should load graph");
+        let graph =
+            load_context_graph(&tmp, &ContextLoadConfig::default()).expect("should load graph");
 
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(
@@ -414,7 +440,10 @@ mod tests {
         let current = Path::new(".othala/context/MAIN.md");
         let (links, refs) = extract_links(content, current);
 
-        assert_eq!(links, vec![PathBuf::from(".othala/context/architecture.md")]);
+        assert_eq!(
+            links,
+            vec![PathBuf::from(".othala/context/architecture.md")]
+        );
         assert_eq!(refs, vec![PathBuf::from("src/lib.rs")]);
     }
 
@@ -424,7 +453,10 @@ mod tests {
         let current = Path::new(".othala/context/MAIN.md");
         let (links, refs) = extract_links(content, current);
 
-        assert_eq!(links, vec![PathBuf::from(".othala/context/architecture.md")]);
+        assert_eq!(
+            links,
+            vec![PathBuf::from(".othala/context/architecture.md")]
+        );
         assert!(refs.is_empty());
     }
 
@@ -450,7 +482,10 @@ mod tests {
         let current = Path::new(".othala/context/wiki/architecture.md");
         let (links, refs) = extract_links(content, current);
 
-        assert_eq!(links, vec![PathBuf::from(".othala/context/wiki/patterns.md")]);
+        assert_eq!(
+            links,
+            vec![PathBuf::from(".othala/context/wiki/patterns.md")]
+        );
         assert!(refs.is_empty());
     }
 
@@ -475,8 +510,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("othala-ctx-wiki-{}", std::process::id()));
         setup_wiki_context_dir(&tmp);
 
-        let graph = load_context_graph(&tmp, &ContextLoadConfig::default())
-            .expect("should load graph");
+        let graph =
+            load_context_graph(&tmp, &ContextLoadConfig::default()).expect("should load graph");
 
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(
@@ -523,5 +558,102 @@ mod tests {
             normalise_path(Path::new(".othala/context/../../src/lib.rs")),
             PathBuf::from("src/lib.rs")
         );
+    }
+
+    #[test]
+    fn test_default_depth_is_10() {
+        assert_eq!(ContextLoadConfig::default().max_depth, 10);
+    }
+
+    #[test]
+    fn test_depth_limit_respected() {
+        let tmp =
+            std::env::temp_dir().join(format!("othala-ctx-depth-limit-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+
+        fs::write(ctx.join("MAIN.md"), "See [B](B.md)\n").unwrap();
+        fs::write(ctx.join("B.md"), "See [C](C.md)\n").unwrap();
+        fs::write(ctx.join("C.md"), "See [D](D.md)\n").unwrap();
+        fs::write(ctx.join("D.md"), "See [E](E.md)\n").unwrap();
+        fs::write(ctx.join("E.md"), "End\n").unwrap();
+
+        let config = ContextLoadConfig {
+            max_depth: 2,
+            max_total_chars: 80_000,
+        };
+
+        let graph = load_context_graph(&tmp, &config).expect("should load graph");
+        let loaded: Vec<PathBuf> = graph.nodes.iter().map(|n| n.path.clone()).collect();
+
+        assert_eq!(
+            loaded,
+            vec![
+                PathBuf::from(".othala/context/MAIN.md"),
+                PathBuf::from(".othala/context/B.md"),
+                PathBuf::from(".othala/context/C.md")
+            ]
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let tmp = std::env::temp_dir().join(format!("othala-ctx-cycle-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+
+        fs::write(ctx.join("MAIN.md"), "See [A](A.md)\n").unwrap();
+        fs::write(ctx.join("A.md"), "See [B](B.md)\n").unwrap();
+        fs::write(ctx.join("B.md"), "See [A](A.md)\n").unwrap();
+
+        let graph =
+            load_context_graph(&tmp, &ContextLoadConfig::default()).expect("should load graph");
+
+        let loaded: Vec<PathBuf> = graph.nodes.iter().map(|n| n.path.clone()).collect();
+        assert_eq!(
+            loaded,
+            vec![
+                PathBuf::from(".othala/context/MAIN.md"),
+                PathBuf::from(".othala/context/A.md"),
+                PathBuf::from(".othala/context/B.md")
+            ]
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_cycle_with_source_refs() {
+        let tmp =
+            std::env::temp_dir().join(format!("othala-ctx-cycle-source-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+
+        fs::write(
+            ctx.join("MAIN.md"),
+            "See [A](A.md) and @file:A.md and @file:MAIN.md\n",
+        )
+        .unwrap();
+        fs::write(
+            ctx.join("A.md"),
+            "See [B](B.md) and @file:MAIN.md and @file:B.md\n",
+        )
+        .unwrap();
+        fs::write(ctx.join("B.md"), "See [A](A.md) and @file:MAIN.md\n").unwrap();
+
+        let graph =
+            load_context_graph(&tmp, &ContextLoadConfig::default()).expect("should load graph");
+
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(
+            graph.nodes[0].path,
+            PathBuf::from(".othala/context/MAIN.md")
+        );
+        assert_eq!(graph.nodes[1].path, PathBuf::from(".othala/context/A.md"));
+        assert_eq!(graph.nodes[2].path, PathBuf::from(".othala/context/B.md"));
+
+        fs::remove_dir_all(&tmp).ok();
     }
 }

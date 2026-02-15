@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::context_graph::{load_context_graph, render_context_with_sources, ContextLoadConfig};
 
+const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 1_800;
+
 /// A running agent session.
 pub struct AgentSession {
     pub child: Child,
@@ -24,6 +26,7 @@ pub struct AgentSession {
     pub task_id: TaskId,
     pub model: ModelKind,
     pub started_at: DateTime<Utc>,
+    pub timeout: Duration,
     pub patch_ready: bool,
     pub needs_human: bool,
     /// When the agent signaled completion (patch_ready or needs_human).
@@ -107,6 +110,7 @@ impl AgentSupervisor {
         repo_path: &PathBuf,
         prompt: &str,
         model: Option<ModelKind>,
+        timeout: Duration,
     ) -> anyhow::Result<()> {
         let model = model.unwrap_or(self.default_model);
         let adapter: Box<dyn AgentAdapter> = default_adapter_for(model)?;
@@ -117,7 +121,7 @@ impl AgentSupervisor {
             model,
             repo_path: repo_path.clone(),
             prompt: build_prompt(task_id, prompt, repo_path),
-            timeout_secs: 600,
+            timeout_secs: timeout.as_secs(),
             extra_args: vec![],
             env: vec![],
         };
@@ -144,6 +148,7 @@ impl AgentSupervisor {
             task_id: task_id.clone(),
             model,
             started_at: Utc::now(),
+            timeout,
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -175,7 +180,7 @@ impl AgentSupervisor {
             model,
             repo_path: repo_path.clone(),
             prompt: build_prompt(task_id, initial_prompt, repo_path),
-            timeout_secs: 600,
+            timeout_secs: DEFAULT_AGENT_TIMEOUT_SECS,
             extra_args: vec![],
             env: vec![],
         };
@@ -222,6 +227,7 @@ impl AgentSupervisor {
             task_id: task_id.clone(),
             model,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -280,6 +286,46 @@ impl AgentSupervisor {
                     model: session.model,
                     lines,
                 });
+            }
+
+            let timed_out = Utc::now()
+                .signed_duration_since(session.started_at)
+                .to_std()
+                .map(|elapsed| elapsed > session.timeout)
+                .unwrap_or(false);
+            if timed_out {
+                let elapsed_secs = Utc::now()
+                    .signed_duration_since(session.started_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                let timeout_message = format!(
+                    "agent timeout: exceeded {}s runtime limit after {}s",
+                    session.timeout.as_secs(),
+                    elapsed_secs
+                );
+                eprintln!(
+                    "[supervisor] Agent {} {}",
+                    session.task_id.0,
+                    timeout_message,
+                );
+                output.push(OutputChunk {
+                    task_id: session.task_id.clone(),
+                    model: session.model,
+                    lines: vec![timeout_message],
+                });
+                let _ = session.child.kill();
+                let exit_code = session.child.wait().ok().and_then(|status| status.code());
+                completed.push(AgentOutcome {
+                    task_id: session.task_id.clone(),
+                    model: session.model,
+                    exit_code,
+                    patch_ready: false,
+                    needs_human: false,
+                    success: false,
+                    duration_secs: elapsed_secs,
+                });
+                finished_keys.push(key.clone());
+                continue;
             }
 
             // Kill process if it signaled completion but hasn't exited.
@@ -363,7 +409,11 @@ pub fn build_prompt(task_id: &TaskId, title: &str, repo_root: &Path) -> String {
     if let Some(graph) = load_context_graph(repo_root, &ContextLoadConfig::default()) {
         if !graph.nodes.is_empty() {
             const SOURCE_BUDGET: usize = 64_000;
-            sections.push(render_context_with_sources(&graph, repo_root, SOURCE_BUDGET));
+            sections.push(render_context_with_sources(
+                &graph,
+                repo_root,
+                SOURCE_BUDGET,
+            ));
         }
     }
 
@@ -524,6 +574,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -566,6 +617,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Codex,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -603,6 +655,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -639,6 +692,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -675,6 +729,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -709,6 +764,7 @@ mod tests {
                 task_id: task_id.clone(),
                 model: ModelKind::Claude,
                 started_at: Utc::now(),
+                timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
                 patch_ready: false,
                 needs_human: false,
                 signal_at: None,
@@ -750,6 +806,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -786,6 +843,7 @@ mod tests {
             task_id: task_id.clone(),
             model: ModelKind::Claude,
             started_at: Utc::now(),
+            timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
             patch_ready: false,
             needs_human: false,
             signal_at: None,
@@ -835,6 +893,7 @@ mod tests {
                 task_id: fast_id.clone(),
                 model: ModelKind::Claude,
                 started_at: Utc::now(),
+                timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
                 patch_ready: false,
                 needs_human: false,
                 signal_at: None,
@@ -849,6 +908,7 @@ mod tests {
                 task_id: slow_id.clone(),
                 model: ModelKind::Codex,
                 started_at: Utc::now(),
+                timeout: Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECS),
                 patch_ready: false,
                 needs_human: false,
                 signal_at: None,
@@ -867,6 +927,116 @@ mod tests {
 
         // Cleanup.
         sup.stop_all();
+    }
+
+    #[test]
+    fn test_timeout_detection() {
+        let mut sup = AgentSupervisor::new(ModelKind::Claude);
+        let task_id = TaskId::new("T-timeout-detect");
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let (tx, rx) = mpsc::channel();
+        pipe_child_output(&mut child, tx);
+
+        sup.sessions.insert(
+            task_id.0.clone(),
+            AgentSession {
+                child,
+                output_rx: rx,
+                input_tx: None,
+                task_id: task_id.clone(),
+                model: ModelKind::Claude,
+                started_at: Utc::now() - chrono::Duration::seconds(10),
+                timeout: Duration::from_secs(1),
+                patch_ready: false,
+                needs_human: false,
+                signal_at: None,
+            },
+        );
+
+        let result = sup.poll();
+        assert_eq!(result.completed.len(), 1);
+        assert!(!sup.has_session(&task_id));
+    }
+
+    #[test]
+    fn test_no_timeout_when_within_limit() {
+        let mut sup = AgentSupervisor::new(ModelKind::Claude);
+        let task_id = TaskId::new("T-timeout-within-limit");
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let (tx, rx) = mpsc::channel();
+        pipe_child_output(&mut child, tx);
+
+        sup.sessions.insert(
+            task_id.0.clone(),
+            AgentSession {
+                child,
+                output_rx: rx,
+                input_tx: None,
+                task_id: task_id.clone(),
+                model: ModelKind::Claude,
+                started_at: Utc::now(),
+                timeout: Duration::from_secs(120),
+                patch_ready: false,
+                needs_human: false,
+                signal_at: None,
+            },
+        );
+
+        let result = sup.poll();
+        assert!(result.completed.is_empty());
+        assert!(sup.has_session(&task_id));
+
+        sup.stop(&task_id);
+    }
+
+    #[test]
+    fn test_timeout_produces_failure_outcome() {
+        let mut sup = AgentSupervisor::new(ModelKind::Claude);
+        let task_id = TaskId::new("T-timeout-outcome");
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let (tx, rx) = mpsc::channel();
+        pipe_child_output(&mut child, tx);
+
+        sup.sessions.insert(
+            task_id.0.clone(),
+            AgentSession {
+                child,
+                output_rx: rx,
+                input_tx: None,
+                task_id,
+                model: ModelKind::Codex,
+                started_at: Utc::now() - chrono::Duration::seconds(5),
+                timeout: Duration::from_secs(1),
+                patch_ready: true,
+                needs_human: true,
+                signal_at: None,
+            },
+        );
+
+        let result = sup.poll();
+        assert_eq!(result.completed.len(), 1);
+        let outcome = &result.completed[0];
+        assert!(!outcome.success);
+        assert!(!outcome.patch_ready);
+        assert!(!outcome.needs_human);
     }
 
     // -----------------------------------------------------------------------

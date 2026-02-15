@@ -149,4 +149,14 @@ mod tests {
         assert!(message.title.contains("Agent failed"));
         assert!(message.body.contains("15s"));
     }
+
+    #[test]
+    fn returns_some_for_error_events() {
+        let event = mk_event(EventKind::Error {
+            code: "internal".to_string(),
+            message: "unexpected failure".to_string(),
+        });
+
+        assert!(notification_for_event(&event).is_some());
+    }
 }

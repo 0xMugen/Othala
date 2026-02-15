@@ -1,23 +1,24 @@
 //! Othala daemon crate - MVP version.
 
+pub mod agent_log;
 pub mod chat_workspace;
 pub mod context_gen;
 pub mod context_graph;
 pub mod daemon_loop;
 pub mod dependency_graph;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
+pub mod event_log;
+pub mod persistence;
 pub mod prompt_builder;
 pub mod qa_agent;
 pub mod qa_spec_gen;
 pub mod retry;
-pub mod stack_pipeline;
-pub mod test_spec;
-pub mod event_log;
-pub mod persistence;
 pub mod scheduler;
 pub mod service;
+pub mod stack_pipeline;
 pub mod state_machine;
 pub mod supervisor;
+pub mod test_spec;
 pub mod types;
 
 pub use chat_workspace::*;

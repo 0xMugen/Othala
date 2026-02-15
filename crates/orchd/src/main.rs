@@ -9,14 +9,16 @@ use orch_agents::setup::{
 };
 use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, save_org_config, ConcurrencyConfig,
-    GraphiteOrgConfig, ModelsConfig, MovePolicy, OrgConfig, UiConfig,
+    GraphiteOrgConfig, ModelsConfig, MovePolicy, NotificationConfig, OrgConfig, UiConfig,
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
+use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{provision_chat_workspace_on_base, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -103,6 +105,17 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Show persisted agent output for a task
+    Tail {
+        /// Task/chat ID
+        id: String,
+        /// Number of lines to show
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow and print new lines
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Show agent run history for a task
     Runs {
@@ -319,9 +332,7 @@ fn parse_enable_models_csv(raw: &str) -> anyhow::Result<Vec<ModelKind>> {
             continue;
         }
         let Some(model) = parse_model_name(token) else {
-            anyhow::bail!(
-                "unknown model '{token}'. valid values: claude,codex,gemini"
-            );
+            anyhow::bail!("unknown model '{token}'. valid values: claude,codex,gemini");
         };
         out.push(model);
     }
@@ -352,6 +363,34 @@ fn default_org_config(enabled_models: Vec<ModelKind>) -> OrgConfig {
         ui: UiConfig {
             web_bind: "127.0.0.1:9842".to_string(),
         },
+        notifications: NotificationConfig::default(),
+    }
+}
+
+fn build_notification_dispatcher(config: &NotificationConfig) -> Option<NotificationDispatcher> {
+    if !config.enabled {
+        return None;
+    }
+
+    let mut sinks: Vec<Box<dyn NotificationSink>> = Vec::new();
+
+    if config.stdout {
+        sinks.push(Box::new(StdoutSink));
+    }
+
+    if let Some(url) = &config.webhook_url {
+        if !url.trim().is_empty() {
+            sinks.push(Box::new(WebhookSink {
+                url: url.clone(),
+                timeout_secs: 10,
+            }));
+        }
+    }
+
+    if sinks.is_empty() {
+        None
+    } else {
+        Some(NotificationDispatcher::new(sinks))
     }
 }
 
@@ -431,7 +470,9 @@ fn run_self_test(json: bool) -> bool {
         Command::new("git")
             .args(["rev-parse", "--is-inside-work-tree"])
             .output()
-            .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+            .map(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+            })
             .unwrap_or(false)
     } else {
         false
@@ -556,7 +597,11 @@ fn run_self_test(json: bool) -> bool {
             } else {
                 ("\u{2717}", "\x1b[31m")
             };
-            let suffix = if check.critical { "" } else { " (non-critical)" };
+            let suffix = if check.critical {
+                ""
+            } else {
+                " (non-critical)"
+            };
             println!(
                 "  {color}{symbol}\x1b[0m {}{}: {}",
                 check.name, suffix, check.detail
@@ -728,7 +773,7 @@ fn main() -> anyhow::Result<()> {
             let template_dir = PathBuf::from("templates/prompts");
 
             let config_path = PathBuf::from(".othala/config.toml");
-            let (enabled_models, default_model) = if config_path.exists() {
+            let (enabled_models, default_model, notification_dispatcher) = if config_path.exists() {
                 let org_config = load_org_config(&config_path)?;
                 use orch_core::validation::{Validate, ValidationLevel};
                 let issues = org_config.validate();
@@ -743,17 +788,28 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("config validation failed — run `othala wizard` to fix");
                 }
                 let default = org_config.models.default.unwrap_or(ModelKind::Claude);
-                (org_config.models.enabled, default)
+                let notification_dispatcher =
+                    build_notification_dispatcher(&org_config.notifications);
+                (
+                    org_config.models.enabled,
+                    default,
+                    notification_dispatcher,
+                )
             } else {
                 eprintln!("  \x1b[33mNo .othala/config.toml — using defaults (run `othala wizard` to configure)\x1b[0m");
                 (
                     vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
                     ModelKind::Claude,
+                    None,
                 )
             };
             eprintln!(
                 "  Enabled models: {}",
-                enabled_models.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")
+                enabled_models
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
 
             if !skip_context_gen {
@@ -777,6 +833,7 @@ fn main() -> anyhow::Result<()> {
             let context_gen_config = orchd::context_gen::ContextGenConfig::default();
             let mut supervisor = AgentSupervisor::new(default_model);
             let mut daemon_state = orchd::daemon_loop::DaemonState::new();
+            daemon_state.notification_dispatcher = notification_dispatcher;
 
             let verify_cmd = verify_command
                 .unwrap_or_else(|| "cargo check && cargo test --workspace".to_string());
@@ -790,6 +847,7 @@ fn main() -> anyhow::Result<()> {
                 context_gen_config,
                 skip_qa,
                 skip_context_regen: skip_context_gen,
+                agent_timeout_secs: 1_800,
             };
 
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -823,16 +881,35 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 if !tasks.is_empty() {
-                    let chatting = tasks.iter().filter(|t| t.state == TaskState::Chatting).count();
+                    let chatting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Chatting)
+                        .count();
                     let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
-                    let submitting = tasks.iter().filter(|t| t.state == TaskState::Submitting).count();
-                    let awaiting = tasks.iter().filter(|t| t.state == TaskState::AwaitingMerge).count();
-                    let merged = tasks.iter().filter(|t| t.state == TaskState::Merged).count();
-                    let stopped = tasks.iter().filter(|t| t.state == TaskState::Stopped).count();
+                    let submitting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Submitting)
+                        .count();
+                    let awaiting = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::AwaitingMerge)
+                        .count();
+                    let merged = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Merged)
+                        .count();
+                    let stopped = tasks
+                        .iter()
+                        .filter(|t| t.state == TaskState::Stopped)
+                        .count();
                     let mut status = format!(
                         "[{}] {} chatting, {} ready, {} submitting, {} awaiting, {} merged",
                         chrono::Local::now().format("%H:%M:%S"),
-                        chatting, ready, submitting, awaiting, merged
+                        chatting,
+                        ready,
+                        submitting,
+                        awaiting,
+                        merged
                     );
                     if stopped > 0 {
                         status.push_str(&format!(", {} stopped", stopped));
@@ -875,8 +952,8 @@ fn main() -> anyhow::Result<()> {
             }
 
             let final_tasks = service.list_tasks()?;
-            let json = serde_json::to_string_pretty(&final_tasks)
-                .unwrap_or_else(|_| "[]".to_string());
+            let json =
+                serde_json::to_string_pretty(&final_tasks).unwrap_or_else(|_| "[]".to_string());
             println!("{json}");
         }
         Commands::SelfTest { json } => {
@@ -1025,21 +1102,62 @@ fn main() -> anyhow::Result<()> {
             } else {
                 for event in &display_events {
                     let ts = event.at.format("%Y-%m-%d %H:%M:%S");
-                    let task_label = event
-                        .task_id
-                        .as_ref()
-                        .map(|t| t.0.as_str())
-                        .unwrap_or("-");
+                    let task_label = event.task_id.as_ref().map(|t| t.0.as_str()).unwrap_or("-");
                     let kind_str = format_event_kind(&event.kind);
                     println!("{ts}  {task_label:<24} {kind_str}");
+                }
+            }
+        }
+        Commands::Tail { id, lines, follow } => {
+            let repo_root = std::env::current_dir()?;
+            let task_id = TaskId::new(&id);
+
+            let mut displayed_lines = 0usize;
+
+            match orchd::agent_log::tail_agent_log(&repo_root, &task_id, lines) {
+                Ok(tail) => {
+                    displayed_lines = tail.len();
+                    for line in &tail {
+                        println!("{line}");
+                    }
+                }
+                Err(err) => {
+                    if !follow || err.kind() != ErrorKind::NotFound {
+                        return Err(err.into());
+                    }
+                }
+            }
+
+            if follow {
+                loop {
+                    match orchd::agent_log::read_agent_log(&repo_root, &task_id) {
+                        Ok(content) => {
+                            let all_lines: Vec<&str> = content.lines().collect();
+                            if all_lines.len() < displayed_lines {
+                                displayed_lines = 0;
+                            }
+                            if all_lines.len() > displayed_lines {
+                                for line in &all_lines[displayed_lines..] {
+                                    println!("{line}");
+                                }
+                                displayed_lines = all_lines.len();
+                            }
+                        }
+                        Err(err) => {
+                            if err.kind() != ErrorKind::NotFound {
+                                return Err(err.into());
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
         }
         Commands::Runs { id, json } => {
             let runs = service.task_runs(&TaskId::new(&id))?;
             if json {
-                let out = serde_json::to_string_pretty(&runs)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let out = serde_json::to_string_pretty(&runs).unwrap_or_else(|_| "[]".to_string());
                 println!("{out}");
             } else if runs.is_empty() {
                 println!("No runs found for task: {id}");
@@ -1163,7 +1281,9 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter(|t| {
                             t.parent_task_id.is_some()
-                                && !tasks.iter().any(|p| Some(&p.id) == t.parent_task_id.as_ref())
+                                && !tasks
+                                    .iter()
+                                    .any(|p| Some(&p.id) == t.parent_task_id.as_ref())
                         })
                         .collect();
                     for orphan in &orphans {
@@ -1185,7 +1305,9 @@ fn main() -> anyhow::Result<()> {
                 .collect();
 
             if prunable.is_empty() {
-                println!("No tasks to prune (older than {older_than_days} days in terminal state).");
+                println!(
+                    "No tasks to prune (older than {older_than_days} days in terminal state)."
+                );
             } else {
                 println!(
                     "{}",

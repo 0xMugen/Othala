@@ -36,6 +36,7 @@ pub struct NotificationMessage {
 pub enum NotificationSinkKind {
     Stdout,
     Telegram,
+    Webhook,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +81,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&NotificationSinkKind::Stdout).expect("serialize sink kind"),
             "\"stdout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationSinkKind::Webhook).expect("serialize sink kind"),
+            "\"webhook\""
         );
     }
 

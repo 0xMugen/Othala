@@ -92,7 +92,10 @@ pub fn parse_test_spec(content: &str) -> TestSpec {
                 description: rest.trim().to_string(),
                 checked: false,
             });
-        } else if let Some(rest) = trimmed.strip_prefix("- [x] ").or_else(|| trimmed.strip_prefix("- [X] ")) {
+        } else if let Some(rest) = trimmed
+            .strip_prefix("- [x] ")
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+        {
             criteria.push(SpecCriterion {
                 description: rest.trim().to_string(),
                 checked: true,

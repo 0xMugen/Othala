@@ -109,7 +109,9 @@ pub fn get_head_sha(repo_root: &Path) -> Option<String> {
 /// Read the stored git hash from `.othala/context/.git-hash`.
 pub fn read_stored_hash(repo_root: &Path) -> Option<String> {
     let path = repo_root.join(".othala/context/.git-hash");
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Write the current git hash to `.othala/context/.git-hash`.
@@ -146,10 +148,7 @@ pub fn parse_progress_line(raw: &str) -> Option<String> {
     // Tool calls: "Read(file=...)", "Glob(pattern=...)", "Grep(pattern=...)"
     if let Some(rest) = trimmed.strip_prefix("Read(") {
         if let Some(file) = rest.strip_suffix(')') {
-            let file = file
-                .strip_prefix("file=")
-                .unwrap_or(file)
-                .trim_matches('"');
+            let file = file.strip_prefix("file=").unwrap_or(file).trim_matches('"');
             return Some(format!("reading {file}"));
         }
     }
@@ -173,10 +172,7 @@ pub fn parse_progress_line(raw: &str) -> Option<String> {
     }
     if let Some(rest) = trimmed.strip_prefix("Write(") {
         if let Some(file) = rest.strip_suffix(')') {
-            let file = file
-                .strip_prefix("file=")
-                .unwrap_or(file)
-                .trim_matches('"');
+            let file = file.strip_prefix("file=").unwrap_or(file).trim_matches('"');
             return Some(format!("writing {file}"));
         }
     }
@@ -227,7 +223,11 @@ pub fn parse_progress_line(raw: &str) -> Option<String> {
 }
 
 /// Decide whether we should trigger a regeneration based on cooldown.
-pub fn should_regenerate(state: &ContextGenState, config: &ContextGenConfig, now: DateTime<Utc>) -> bool {
+pub fn should_regenerate(
+    state: &ContextGenState,
+    config: &ContextGenConfig,
+    now: DateTime<Utc>,
+) -> bool {
     if state.status == ContextGenStatus::Running {
         return false;
     }
@@ -307,11 +307,7 @@ pub fn scan_repo_snapshot(repo_root: &Path) -> String {
                 let lib_rs = crates_dir.join(crate_name).join("src/lib.rs");
                 if let Ok(content) = std::fs::read_to_string(&lib_rs) {
                     // Only include the first 80 lines to keep the snapshot manageable.
-                    let truncated: String = content
-                        .lines()
-                        .take(80)
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let truncated: String = content.lines().take(80).collect::<Vec<_>>().join("\n");
                     snapshot.push_str(&format!("## crates/{crate_name}/src/lib.rs\n```rust\n"));
                     snapshot.push_str(&truncated);
                     snapshot.push_str("\n```\n\n");
@@ -362,10 +358,7 @@ pub fn parse_context_gen_output(raw: &str) -> ContextGenOutput {
                 if let Some(filename) = current_filename.take() {
                     let content = current_content.trim().to_string();
                     if !content.is_empty() {
-                        files.push(ContextFile {
-                            filename,
-                            content,
-                        });
+                        files.push(ContextFile { filename, content });
                     }
                 }
                 current_filename = Some(sanitize_path(name.trim()));
@@ -506,10 +499,7 @@ pub fn spawn_context_gen(
 ///
 /// If the process has finished, parses the output and writes files.
 /// Returns the list of written paths on success.
-pub fn poll_context_gen(
-    repo_root: &Path,
-    state: &mut ContextGenState,
-) -> Option<Vec<PathBuf>> {
+pub fn poll_context_gen(repo_root: &Path, state: &mut ContextGenState) -> Option<Vec<PathBuf>> {
     if state.status != ContextGenStatus::Running {
         return None;
     }
@@ -546,10 +536,7 @@ pub fn poll_context_gen(
         // Agent output via stdout delimiters — write them.
         match write_context_files(repo_root, &parsed) {
             Ok(paths) => {
-                eprintln!(
-                    "[context-gen] Wrote {} context files",
-                    paths.len()
-                );
+                eprintln!("[context-gen] Wrote {} context files", paths.len());
                 state.status = ContextGenStatus::Completed;
                 state.last_generated_at = Some(Utc::now());
                 state.child_handle = None;
@@ -572,10 +559,7 @@ pub fn poll_context_gen(
             let _ = write_stored_hash(repo_root, &hash);
         }
         let count = count_context_files(repo_root);
-        eprintln!(
-            "[context-gen] Agent wrote {} context files directly",
-            count
-        );
+        eprintln!("[context-gen] Agent wrote {} context files directly", count);
         state.status = ContextGenStatus::Completed;
         state.last_generated_at = Some(Utc::now());
         state.child_handle = None;
@@ -712,10 +696,7 @@ pub fn ensure_context_exists_blocking(
             write_stored_hash(repo_root, &hash)?;
         }
         let count = count_context_files(repo_root);
-        eprintln!(
-            "[context-gen] Agent wrote {} context files directly",
-            count
-        );
+        eprintln!("[context-gen] Agent wrote {} context files directly", count);
     } else {
         anyhow::bail!("context generation agent produced no context files");
     }
@@ -755,10 +736,8 @@ mod tests {
 
     #[test]
     fn context_is_current_requires_main_md_and_hash() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-ctxgen-current-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("othala-ctxgen-current-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         // No MAIN.md → not current.
@@ -800,8 +779,7 @@ mod tests {
 
         // Old generation → should regenerate.
         let mut state = ContextGenState::new();
-        state.last_generated_at =
-            Some(Utc::now() - chrono::Duration::seconds(600));
+        state.last_generated_at = Some(Utc::now() - chrono::Duration::seconds(600));
         assert!(should_regenerate(&state, &config, Utc::now()));
     }
 
@@ -852,8 +830,14 @@ Crate layout here.
     #[test]
     fn sanitize_path_allows_subdirectories() {
         assert_eq!(sanitize_path("MAIN.md"), "MAIN.md");
-        assert_eq!(sanitize_path("crates/orchd/overview.md"), "crates/orchd/overview.md");
-        assert_eq!(sanitize_path("architecture/data-flow.md"), "architecture/data-flow.md");
+        assert_eq!(
+            sanitize_path("crates/orchd/overview.md"),
+            "crates/orchd/overview.md"
+        );
+        assert_eq!(
+            sanitize_path("architecture/data-flow.md"),
+            "architecture/data-flow.md"
+        );
     }
 
     #[test]
@@ -873,10 +857,7 @@ Crate layout here.
 
     #[test]
     fn write_context_files_creates_subdirs_and_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-ctxgen-write-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-ctxgen-write-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         let output = ContextGenOutput {
@@ -899,12 +880,17 @@ Crate layout here.
         let paths = write_context_files(&tmp, &output).unwrap();
         assert_eq!(paths.len(), 3);
         assert!(tmp.join(".othala/context/MAIN.md").exists());
-        assert!(tmp.join(".othala/context/architecture/overview.md").exists());
-        assert!(tmp.join(".othala/context/crates/orchd/daemon-loop.md").exists());
+        assert!(tmp
+            .join(".othala/context/architecture/overview.md")
+            .exists());
+        assert!(tmp
+            .join(".othala/context/crates/orchd/daemon-loop.md")
+            .exists());
 
         let content = fs::read_to_string(tmp.join(".othala/context/MAIN.md")).unwrap();
         assert_eq!(content, "# Main\n");
-        let content = fs::read_to_string(tmp.join(".othala/context/crates/orchd/daemon-loop.md")).unwrap();
+        let content =
+            fs::read_to_string(tmp.join(".othala/context/crates/orchd/daemon-loop.md")).unwrap();
         assert_eq!(content, "# Daemon Loop\n");
 
         fs::remove_dir_all(&tmp).ok();
@@ -912,10 +898,7 @@ Crate layout here.
 
     #[test]
     fn scan_repo_snapshot_includes_cargo_toml() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-ctxgen-scan-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-ctxgen-scan-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
             tmp.join("Cargo.toml"),
@@ -932,10 +915,7 @@ Crate layout here.
 
     #[test]
     fn build_context_gen_prompt_includes_snapshot() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-ctxgen-prompt-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-ctxgen-prompt-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("Cargo.toml"), "[workspace]\n").unwrap();
 
@@ -957,10 +937,7 @@ Crate layout here.
 
     #[test]
     fn git_hash_roundtrip() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-ctxgen-hash-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-ctxgen-hash-{}", std::process::id()));
         let ctx_dir = tmp.join(".othala/context");
         fs::create_dir_all(&ctx_dir).unwrap();
 

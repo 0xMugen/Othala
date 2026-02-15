@@ -701,6 +701,7 @@ dependencies = [
  "orch-core",
  "orch-git",
  "orch-graphite",
+ "orch-notify",
  "rusqlite",
  "serde",
  "serde_json",

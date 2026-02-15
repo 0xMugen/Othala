@@ -170,7 +170,9 @@ pub fn pick_next_model_with_health(
         return Some(*model);
     }
 
-    cooldown.into_iter().min_by_key(|model| tracker.last_failure(*model))
+    cooldown
+        .into_iter()
+        .min_by_key(|model| tracker.last_failure(*model))
 }
 
 /// Evaluate whether a task should be retried after a failed agent run.
@@ -205,10 +207,7 @@ pub fn evaluate_retry(
         return RetryDecision {
             should_retry: false,
             next_model: None,
-            reason: format!(
-                "max retries ({}) exhausted",
-                task.max_retries
-            ),
+            reason: format!("max retries ({}) exhausted", task.max_retries),
         };
     }
 
