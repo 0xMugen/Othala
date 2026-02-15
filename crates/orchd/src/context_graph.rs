@@ -165,6 +165,41 @@ fn extract_links(content: &str, current_path: &Path) -> (Vec<PathBuf>, Vec<PathB
                 break;
             }
         }
+
+        let mut wiki_rest = line;
+        while let Some(start) = wiki_rest.find("[[") {
+            let after = &wiki_rest[start + 2..];
+            if let Some(end) = after.find("]]") {
+                let target = after[..end].trim();
+                if !target.is_empty() {
+                    let resolved = parent.join(format!("{target}.md"));
+                    let normalised = normalise_path(&resolved);
+
+                    if normalised.starts_with(".othala/")
+                        && normalised.extension().map(|e| e == "md").unwrap_or(false)
+                    {
+                        context_links.push(normalised);
+                    } else {
+                        source_refs.push(normalised);
+                    }
+                }
+                wiki_rest = &after[end + 2..];
+            } else {
+                break;
+            }
+        }
+
+        let mut file_rest = line;
+        while let Some(start) = file_rest.find("@file:") {
+            let after = &file_rest[start + 6..];
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            let target = after[..end].trim();
+            if !target.is_empty() {
+                let resolved = parent.join(target);
+                source_refs.push(normalise_path(&resolved));
+            }
+            file_rest = &after[end..];
+        }
     }
 
     (context_links, source_refs)
@@ -212,6 +247,29 @@ mod tests {
         fs::write(
             ctx.join("patterns.md"),
             "# Patterns\n\nUse `thiserror` for errors.\n",
+        )
+        .unwrap();
+    }
+
+    fn setup_wiki_context_dir(tmp: &Path) {
+        let ctx = tmp.join(".othala/context/wiki");
+        fs::create_dir_all(&ctx).unwrap();
+
+        fs::write(
+            tmp.join(".othala/context/MAIN.md"),
+            "# Main Context\n\nSee [[wiki/architecture]].\n",
+        )
+        .unwrap();
+
+        fs::write(
+            ctx.join("architecture.md"),
+            "# Architecture\n\nSee [[patterns]] for coding style.\n",
+        )
+        .unwrap();
+
+        fs::write(
+            ctx.join("patterns.md"),
+            "# Patterns\n\nKeep modules small.\n",
         )
         .unwrap();
     }
@@ -295,6 +353,83 @@ mod tests {
 
         assert_eq!(links, vec![PathBuf::from(".othala/context/architecture.md")]);
         assert_eq!(refs, vec![PathBuf::from("src/lib.rs")]);
+    }
+
+    #[test]
+    fn extracts_single_wiki_link() {
+        let content = "See [[architecture]].\n";
+        let current = Path::new(".othala/context/MAIN.md");
+        let (links, refs) = extract_links(content, current);
+
+        assert_eq!(links, vec![PathBuf::from(".othala/context/architecture.md")]);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn extracts_multiple_wiki_links() {
+        let content = "See [[architecture]] and [[patterns]].\n";
+        let current = Path::new(".othala/context/MAIN.md");
+        let (links, refs) = extract_links(content, current);
+
+        assert_eq!(
+            links,
+            vec![
+                PathBuf::from(".othala/context/architecture.md"),
+                PathBuf::from(".othala/context/patterns.md")
+            ]
+        );
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn extracts_wiki_links_from_nested_context_directory() {
+        let content = "See [[patterns]].\n";
+        let current = Path::new(".othala/context/wiki/architecture.md");
+        let (links, refs) = extract_links(content, current);
+
+        assert_eq!(links, vec![PathBuf::from(".othala/context/wiki/patterns.md")]);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn extracts_file_references() {
+        let content = "Read @file:../../src/lib.rs and @file:../mod.rs\n";
+        let current = Path::new(".othala/context/wiki/architecture.md");
+        let (links, refs) = extract_links(content, current);
+
+        assert!(links.is_empty());
+        assert_eq!(
+            refs,
+            vec![
+                PathBuf::from(".othala/src/lib.rs"),
+                PathBuf::from(".othala/context/mod.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_context_graph_bfs_with_wiki_links() {
+        let tmp = std::env::temp_dir().join(format!("othala-ctx-wiki-{}", std::process::id()));
+        setup_wiki_context_dir(&tmp);
+
+        let graph = load_context_graph(&tmp, &ContextLoadConfig::default())
+            .expect("should load graph");
+
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(
+            graph.nodes[0].path,
+            PathBuf::from(".othala/context/MAIN.md")
+        );
+        assert_eq!(
+            graph.nodes[1].path,
+            PathBuf::from(".othala/context/wiki/architecture.md")
+        );
+        assert_eq!(
+            graph.nodes[2].path,
+            PathBuf::from(".othala/context/wiki/patterns.md")
+        );
+
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
