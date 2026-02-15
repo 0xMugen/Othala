@@ -11,6 +11,7 @@ use orchd::supervisor::AgentSupervisor;
 use orchd::{provision_chat_workspace_on_base, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "othala")]
@@ -28,11 +29,18 @@ enum Commands {
         action: ChatAction,
     },
     /// List all chats
-    List,
+    List {
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show chat status
     Status {
         /// Chat/task ID
         id: String,
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a chat
     Delete {
@@ -40,7 +48,20 @@ enum Commands {
         id: String,
     },
     /// Run the daemon (orchestration loop)
-    Daemon,
+    Daemon {
+        /// Stop the daemon after N seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Exit when all tasks reach a terminal state (merged/stopped/awaiting_merge)
+        #[arg(long)]
+        exit_on_idle: bool,
+        /// Skip initial context generation (faster startup for testing)
+        #[arg(long)]
+        skip_context_gen: bool,
+        /// Override the default verify command
+        #[arg(long)]
+        verify_command: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,9 +77,16 @@ enum ChatAction {
         /// Preferred model
         #[arg(short, long, default_value = "claude")]
         model: String,
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
     },
     /// List all chats
-    List,
+    List {
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn print_banner() {
@@ -154,7 +182,12 @@ fn run_context_gen_with_status(
     }
 }
 
-fn print_task_list(tasks: &[Task]) {
+fn print_task_list(tasks: &[Task], json: bool) {
+    if json {
+        let out = serde_json::to_string_pretty(tasks).unwrap_or_else(|_| "[]".to_string());
+        println!("{out}");
+        return;
+    }
     if tasks.is_empty() {
         println!("No chats found.");
     } else {
@@ -168,6 +201,29 @@ fn print_task_list(tasks: &[Task]) {
                 task.title
             );
         }
+    }
+}
+
+fn print_task_json(task: &Task) {
+    let out = serde_json::to_string_pretty(task).unwrap_or_else(|_| "{}".to_string());
+    println!("{out}");
+}
+
+fn parse_model(s: &str) -> ModelKind {
+    match s.to_lowercase().as_str() {
+        "codex" => ModelKind::Codex,
+        "gemini" => ModelKind::Gemini,
+        _ => ModelKind::Claude,
+    }
+}
+
+fn all_tasks_idle(service: &OrchdService) -> bool {
+    match service.list_tasks() {
+        Ok(tasks) if tasks.is_empty() => false,
+        Ok(tasks) => tasks
+            .iter()
+            .all(|t| t.state.is_terminal() || t.state == TaskState::AwaitingMerge),
+        Err(_) => false,
     }
 }
 
@@ -212,7 +268,12 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Chat { action } => match action {
-            ChatAction::New { repo, title, model } => {
+            ChatAction::New {
+                repo,
+                title,
+                model,
+                json,
+            } => {
                 let task_id = format!("chat-{}", Utc::now().timestamp_millis());
                 let task_id = TaskId::new(&task_id);
                 let start_path = std::env::current_dir()?;
@@ -238,13 +299,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let model_kind = match model.to_lowercase().as_str() {
-                    "claude" => ModelKind::Claude,
-                    "codex" => ModelKind::Codex,
-                    "gemini" => ModelKind::Gemini,
-                    _ => ModelKind::Claude,
-                };
-                task.preferred_model = Some(model_kind);
+                task.preferred_model = Some(parse_model(&model));
 
                 let event = Event {
                     id: EventId(format!("E-CREATE-{}", task_id.0)),
@@ -255,7 +310,10 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 service.create_task(&task, &event)?;
-                if let Some((parent_task_id, parent_branch)) = parent {
+
+                if json {
+                    print_task_json(&task);
+                } else if let Some((parent_task_id, parent_branch)) = parent {
                     println!(
                         "Created chat: {} - {} [{} @ {}] (stacked on {} / {})",
                         task_id.0,
@@ -275,36 +333,44 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            ChatAction::List => {
-                print_task_list(&service.list_tasks()?);
+            ChatAction::List { json } => {
+                print_task_list(&service.list_tasks()?, json);
             }
         },
-        Commands::List => {
-            print_task_list(&service.list_tasks()?);
+        Commands::List { json } => {
+            print_task_list(&service.list_tasks()?, json);
         }
-        Commands::Status { id } => {
+        Commands::Status { id, json } => {
             let task_id = TaskId::new(&id);
             match service.task(&task_id)? {
                 Some(task) => {
-                    println!("Chat: {}", task.id.0);
-                    println!("Title: {}", task.title);
-                    println!("Repo: {}", task.repo_id.0);
-                    println!("State: {}", task.state);
-                    if let Some(model) = task.preferred_model {
-                        println!("Model: {:?}", model);
+                    if json {
+                        print_task_json(&task);
+                    } else {
+                        println!("Chat: {}", task.id.0);
+                        println!("Title: {}", task.title);
+                        println!("Repo: {}", task.repo_id.0);
+                        println!("State: {}", task.state);
+                        if let Some(model) = task.preferred_model {
+                            println!("Model: {:?}", model);
+                        }
+                        if let Some(pr) = &task.pr {
+                            println!("PR: {} ({})", pr.number, pr.url);
+                        }
+                        if let Some(branch) = &task.branch_name {
+                            println!("Branch: {}", branch);
+                        }
+                        println!("Worktree: {}", task.worktree_path.display());
+                        println!("Created: {}", task.created_at);
+                        println!("Updated: {}", task.updated_at);
                     }
-                    if let Some(pr) = task.pr {
-                        println!("PR: {} ({})", pr.number, pr.url);
-                    }
-                    if let Some(branch) = &task.branch_name {
-                        println!("Branch: {}", branch);
-                    }
-                    println!("Worktree: {}", task.worktree_path.display());
-                    println!("Created: {}", task.created_at);
-                    println!("Updated: {}", task.updated_at);
                 }
                 None => {
-                    println!("Chat not found: {}", id);
+                    if json {
+                        println!("null");
+                    } else {
+                        println!("Chat not found: {}", id);
+                    }
                 }
             }
         }
@@ -316,32 +382,54 @@ fn main() -> anyhow::Result<()> {
                 println!("Chat not found: {}", id);
             }
         }
-        Commands::Daemon => {
+        Commands::Daemon {
+            timeout,
+            exit_on_idle,
+            skip_context_gen,
+            verify_command,
+        } => {
             print_banner();
 
             let repo_root = std::env::current_dir()?;
             let template_dir = PathBuf::from("templates/prompts");
 
-            // Ensure context files exist before entering the loop.
-            if let Err(e) =
-                run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude)
-            {
-                eprintln!("[daemon] Context generation failed (non-fatal): {e}");
+            if !skip_context_gen {
+                if let Err(e) =
+                    run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude)
+                {
+                    eprintln!("[daemon] Context generation failed (non-fatal): {e}");
+                }
+            } else {
+                eprintln!("  Skipping context generation");
             }
             eprintln!();
 
-            let context_gen_config = orchd::context_gen::ContextGenConfig::default();
+            if let Some(secs) = timeout {
+                eprintln!("[daemon] Timeout: {}s", secs);
+            }
+            if exit_on_idle {
+                eprintln!("[daemon] Will exit when all tasks reach terminal state");
+            }
 
+            let context_gen_config = orchd::context_gen::ContextGenConfig::default();
             let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
             let mut daemon_state = orchd::daemon_loop::DaemonState::new();
+
+            let verify_cmd = verify_command
+                .unwrap_or_else(|| "cargo check && cargo test --workspace".to_string());
+
             let daemon_config = orchd::daemon_loop::DaemonConfig {
                 repo_root,
                 template_dir,
                 enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
                 context_config: orchd::context_graph::ContextLoadConfig::default(),
-                verify_command: Some("cargo check && cargo test --workspace".to_string()),
+                verify_command: Some(verify_cmd),
                 context_gen_config,
             };
+
+            let start = Instant::now();
+            let mut idle_grace_ticks: u32 = 0;
+            const IDLE_GRACE_MAX: u32 = 3;
 
             loop {
                 orchd::daemon_loop::run_tick(
@@ -351,47 +439,51 @@ fn main() -> anyhow::Result<()> {
                     &daemon_config,
                 );
 
-                // Print status summary.
                 let tasks = service.list_tasks()?;
                 if !tasks.is_empty() {
-                    let chatting = tasks
-                        .iter()
-                        .filter(|t| t.state == TaskState::Chatting)
-                        .count();
+                    let chatting = tasks.iter().filter(|t| t.state == TaskState::Chatting).count();
                     let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
-                    let submitting = tasks
-                        .iter()
-                        .filter(|t| t.state == TaskState::Submitting)
-                        .count();
-                    let awaiting = tasks
-                        .iter()
-                        .filter(|t| t.state == TaskState::AwaitingMerge)
-                        .count();
-                    let merged = tasks
-                        .iter()
-                        .filter(|t| t.state == TaskState::Merged)
-                        .count();
-                    let stopped = tasks
-                        .iter()
-                        .filter(|t| t.state == TaskState::Stopped)
-                        .count();
+                    let submitting = tasks.iter().filter(|t| t.state == TaskState::Submitting).count();
+                    let awaiting = tasks.iter().filter(|t| t.state == TaskState::AwaitingMerge).count();
+                    let merged = tasks.iter().filter(|t| t.state == TaskState::Merged).count();
+                    let stopped = tasks.iter().filter(|t| t.state == TaskState::Stopped).count();
                     let mut status = format!(
                         "[{}] {} chatting, {} ready, {} submitting, {} awaiting, {} merged",
                         chrono::Local::now().format("%H:%M:%S"),
-                        chatting,
-                        ready,
-                        submitting,
-                        awaiting,
-                        merged
+                        chatting, ready, submitting, awaiting, merged
                     );
                     if stopped > 0 {
                         status.push_str(&format!(", {} stopped", stopped));
                     }
-                    println!("{status}");
+                    eprintln!("{status}");
+                }
+
+                if let Some(secs) = timeout {
+                    if start.elapsed().as_secs() >= secs {
+                        eprintln!("[daemon] Timeout reached ({}s), shutting down", secs);
+                        supervisor.stop_all();
+                        break;
+                    }
+                }
+
+                if exit_on_idle && all_tasks_idle(&service) {
+                    idle_grace_ticks += 1;
+                    if idle_grace_ticks >= IDLE_GRACE_MAX {
+                        eprintln!("[daemon] All tasks idle, shutting down");
+                        supervisor.stop_all();
+                        break;
+                    }
+                } else {
+                    idle_grace_ticks = 0;
                 }
 
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
+
+            let final_tasks = service.list_tasks()?;
+            let json = serde_json::to_string_pretty(&final_tasks)
+                .unwrap_or_else(|_| "[]".to_string());
+            println!("{json}");
         }
     }
 
