@@ -45,8 +45,9 @@ pub struct DaemonConfig {
     pub verify_command: Option<String>,
     /// Context generation configuration.
     pub context_gen_config: ContextGenConfig,
-    /// Skip QA baseline runs (prevents QA agent from mutating state).
-    pub skip_qa_baseline: bool,
+    /// Skip all QA runs (baseline + validation). Prevents QA agent from
+    /// mutating production state via TUI automation.
+    pub skip_qa: bool,
 }
 
 /// Mutable state carried across daemon ticks.
@@ -140,7 +141,7 @@ pub fn daemon_tick(
     // For tasks about to be spawned, check if a baseline QA result exists for
     // the task's branch. If no baseline exists and we have a QA spec, spawn a
     // baseline QA agent first.
-    if !config.skip_qa_baseline {
+    if !config.skip_qa {
     if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
         for task in &chatting {
             let default_branch = format!("task/{}", task.id.0);
@@ -391,9 +392,9 @@ fn handle_agent_completion(
     let mut actions = Vec::new();
 
     if outcome.patch_ready || outcome.success {
-        // If a QA baseline spec exists, spawn a validation QA run instead of
-        // immediately marking ready. The QA Phase 2.5 will mark ready on pass.
-        if load_baseline(&config.repo_root).is_some() {
+        // If a QA baseline spec exists and QA is enabled, spawn a validation
+        // QA run instead of immediately marking ready.
+        if !config.skip_qa && load_baseline(&config.repo_root).is_some() {
             actions.push(DaemonAction::SpawnQA {
                 task_id: outcome.task_id.clone(),
                 qa_type: QAType::Validation,
@@ -1103,7 +1104,7 @@ mod tests {
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
-            skip_qa_baseline: false,
+            skip_qa: false,
         }
     }
 
@@ -1251,7 +1252,7 @@ mod tests {
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
-            skip_qa_baseline: false,
+            skip_qa: false,
         };
         (config, tmp)
     }

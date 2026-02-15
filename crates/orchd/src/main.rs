@@ -61,9 +61,9 @@ enum Commands {
         /// Override the default verify command
         #[arg(long)]
         verify_command: Option<String>,
-        /// Skip QA baseline runs (prevents QA agent from mutating state)
+        /// Skip all QA runs (baseline + validation)
         #[arg(long)]
-        skip_qa_baseline: bool,
+        skip_qa: bool,
     },
 }
 
@@ -390,7 +390,7 @@ fn main() -> anyhow::Result<()> {
             exit_on_idle,
             skip_context_gen,
             verify_command,
-            skip_qa_baseline,
+            skip_qa,
         } => {
             print_banner();
 
@@ -429,7 +429,7 @@ fn main() -> anyhow::Result<()> {
                 context_config: orchd::context_graph::ContextLoadConfig::default(),
                 verify_command: Some(verify_cmd),
                 context_gen_config,
-                skip_qa_baseline,
+                skip_qa,
             };
 
             let start = Instant::now();
