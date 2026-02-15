@@ -114,6 +114,31 @@ enum Commands {
     },
     /// Show aggregate task and agent statistics
     Stats,
+    /// Stop a running chat (agent will be killed)
+    Stop {
+        /// Task/chat ID
+        id: String,
+    },
+    /// Resume a stopped chat
+    Resume {
+        /// Task/chat ID
+        id: String,
+    },
+    /// Show task dependency tree
+    Deps {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove old completed/stopped tasks and their data
+    Prune {
+        /// Only prune tasks older than N days
+        #[arg(long, default_value = "7")]
+        older_than_days: i64,
+        /// Actually delete (default is dry-run showing what would be pruned)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1078,9 +1103,142 @@ fn main() -> anyhow::Result<()> {
             let events = service.global_events()?;
             println!("Events:           {}", events.len());
         }
+        Commands::Stop { id } => {
+            let task_id = TaskId::new(&id);
+            let now = Utc::now();
+            let event_id = EventId(format!("E-STOP-{}-{}", id, now.timestamp_millis()));
+            match service.transition_task_state(&task_id, TaskState::Stopped, event_id, now) {
+                Ok(task) => println!("Stopped: {} (was {})", id, task.state),
+                Err(e) => {
+                    eprintln!("Failed to stop {id}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Resume { id } => {
+            let task_id = TaskId::new(&id);
+            let now = Utc::now();
+            let event_id = EventId(format!("E-RESUME-{}-{}", id, now.timestamp_millis()));
+            match service.transition_task_state(&task_id, TaskState::Chatting, event_id, now) {
+                Ok(_) => println!("Resumed: {id} -> Chatting"),
+                Err(e) => {
+                    eprintln!("Failed to resume {id}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Deps { json } => {
+            let tasks = service.list_tasks()?;
+            if json {
+                let deps: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id.0,
+                            "title": t.title,
+                            "state": format!("{}", t.state),
+                            "parent": t.parent_task_id.as_ref().map(|p| &p.0),
+                            "depends_on": t.depends_on.iter().map(|d| &d.0).collect::<Vec<_>>(),
+                            "branch": t.branch_name,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&deps).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else {
+                let root_tasks: Vec<_> = tasks
+                    .iter()
+                    .filter(|t| t.parent_task_id.is_none())
+                    .collect();
+
+                if tasks.is_empty() {
+                    println!("No tasks.");
+                } else {
+                    for root in &root_tasks {
+                        print_dep_tree(&tasks, root, 0);
+                    }
+                    let orphans: Vec<_> = tasks
+                        .iter()
+                        .filter(|t| {
+                            t.parent_task_id.is_some()
+                                && !tasks.iter().any(|p| Some(&p.id) == t.parent_task_id.as_ref())
+                        })
+                        .collect();
+                    for orphan in &orphans {
+                        print_dep_tree(&tasks, orphan, 0);
+                    }
+                }
+            }
+        }
+        Commands::Prune {
+            older_than_days,
+            force,
+        } => {
+            let now = Utc::now();
+            let cutoff = now - chrono::Duration::days(older_than_days);
+            let tasks = service.list_tasks()?;
+            let prunable: Vec<_> = tasks
+                .iter()
+                .filter(|t| t.state.is_terminal() && t.updated_at < cutoff)
+                .collect();
+
+            if prunable.is_empty() {
+                println!("No tasks to prune (older than {older_than_days} days in terminal state).");
+            } else {
+                println!(
+                    "{}",
+                    if force {
+                        "Pruning tasks:"
+                    } else {
+                        "Would prune (use --force to delete):"
+                    }
+                );
+                for task in &prunable {
+                    let age_days = (now - task.updated_at).num_days();
+                    println!(
+                        "  {} ({}, {} days old) - {}",
+                        task.id.0, task.state, age_days, task.title
+                    );
+                    if force {
+                        if let Err(e) = service.delete_task(&task.id) {
+                            eprintln!("    Failed to delete: {e}");
+                        }
+                    }
+                }
+                if !force {
+                    println!("\nRun with --force to actually delete.");
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_dep_tree(tasks: &[Task], task: &Task, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let state_color = match task.state {
+        TaskState::Chatting => "\x1b[36m",
+        TaskState::Ready => "\x1b[32m",
+        TaskState::Merged => "\x1b[90m",
+        TaskState::Stopped => "\x1b[31m",
+        TaskState::AwaitingMerge => "\x1b[33m",
+        _ => "\x1b[0m",
+    };
+    let branch = task.branch_name.as_deref().unwrap_or("-");
+    println!(
+        "{indent}{state_color}{}\x1b[0m {} [{}] ({})",
+        task.state, task.id.0, task.title, branch
+    );
+    let children: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.parent_task_id.as_ref() == Some(&task.id))
+        .collect();
+    for child in children {
+        print_dep_tree(tasks, child, depth + 1);
+    }
 }
 
 fn format_event_kind(kind: &EventKind) -> String {
