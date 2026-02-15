@@ -24,7 +24,8 @@ use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "othala")]
-#[command(about = "AI coding orchestrator - MVP")]
+#[command(about = "AI coding orchestrator")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -701,9 +702,38 @@ fn main() -> anyhow::Result<()> {
             let repo_root = std::env::current_dir()?;
             let template_dir = PathBuf::from("templates/prompts");
 
+            let config_path = PathBuf::from(".othala/config.toml");
+            let (enabled_models, default_model) = if config_path.exists() {
+                let org_config = load_org_config(&config_path)?;
+                use orch_core::validation::{Validate, ValidationLevel};
+                let issues = org_config.validate();
+                for issue in &issues {
+                    let prefix = match issue.level {
+                        ValidationLevel::Error => "\x1b[31mERROR\x1b[0m",
+                        ValidationLevel::Warning => "\x1b[33mWARN\x1b[0m",
+                    };
+                    eprintln!("  [{prefix}] {}: {}", issue.code, issue.message);
+                }
+                if issues.iter().any(|i| i.level == ValidationLevel::Error) {
+                    anyhow::bail!("config validation failed — run `othala wizard` to fix");
+                }
+                let default = org_config.models.default.unwrap_or(ModelKind::Claude);
+                (org_config.models.enabled, default)
+            } else {
+                eprintln!("  \x1b[33mNo .othala/config.toml — using defaults (run `othala wizard` to configure)\x1b[0m");
+                (
+                    vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                    ModelKind::Claude,
+                )
+            };
+            eprintln!(
+                "  Enabled models: {}",
+                enabled_models.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")
+            );
+
             if !skip_context_gen {
                 if let Err(e) =
-                    run_context_gen_with_status(&repo_root, &template_dir, ModelKind::Claude)
+                    run_context_gen_with_status(&repo_root, &template_dir, default_model)
                 {
                     eprintln!("[daemon] Context generation failed (non-fatal): {e}");
                 }
@@ -720,7 +750,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let context_gen_config = orchd::context_gen::ContextGenConfig::default();
-            let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+            let mut supervisor = AgentSupervisor::new(default_model);
             let mut daemon_state = orchd::daemon_loop::DaemonState::new();
 
             let verify_cmd = verify_command
@@ -729,7 +759,7 @@ fn main() -> anyhow::Result<()> {
             let daemon_config = orchd::daemon_loop::DaemonConfig {
                 repo_root,
                 template_dir,
-                enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                enabled_models,
                 context_config: orchd::context_graph::ContextLoadConfig::default(),
                 verify_command: Some(verify_cmd),
                 context_gen_config,
