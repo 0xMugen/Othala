@@ -315,7 +315,7 @@ pub fn scan_test_infrastructure(repo_root: &Path) -> String {
             crate_names.sort();
 
             for crate_name in &crate_names {
-                let tests_dir = crates_dir.join(&crate_name).join("tests");
+                let tests_dir = crates_dir.join(crate_name).join("tests");
                 if tests_dir.is_dir() {
                     if let Ok(tests) = std::fs::read_dir(&tests_dir) {
                         let test_files: Vec<String> = tests

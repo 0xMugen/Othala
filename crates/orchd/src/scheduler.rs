@@ -184,7 +184,7 @@ fn available_models_in_priority_order(
 
     let mut seen = HashSet::new();
     enabled_models
-        .into_iter()
+        .iter()
         .copied()
         .filter(|model| seen.insert(*model))
         .filter(|model| explicit_availability.get(model).copied().unwrap_or(true))

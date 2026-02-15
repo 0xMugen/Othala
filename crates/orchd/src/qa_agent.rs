@@ -211,7 +211,7 @@ pub fn save_qa_result(repo_root: &Path, result: &QAResult) -> std::io::Result<Pa
     let path = results_dir.join(&filename);
 
     let json = serde_json::to_string_pretty(result)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
 
     // Also save to history.
@@ -220,7 +220,7 @@ pub fn save_qa_result(repo_root: &Path, result: &QAResult) -> std::io::Result<Pa
     let ts = result.timestamp.format("%Y%m%dT%H%M%S").to_string();
     let history_path = history_dir.join(format!("{}.json", ts));
     let json = serde_json::to_string_pretty(result)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(&history_path, json)?;
 
     Ok(path)
