@@ -48,6 +48,8 @@ pub struct DaemonConfig {
     /// Skip all QA runs (baseline + validation). Prevents QA agent from
     /// mutating production state via TUI automation.
     pub skip_qa: bool,
+    /// Skip background context regeneration during tick loop.
+    pub skip_context_regen: bool,
 }
 
 /// Mutable state carried across daemon ticks.
@@ -311,7 +313,8 @@ pub fn daemon_tick(
 
     let is_stale = !context_is_current(&config.repo_root);
 
-    if (has_trigger || is_stale)
+    if !config.skip_context_regen
+        && (has_trigger || is_stale)
         && should_regenerate(&daemon_state.context_gen, &config.context_gen_config, now)
     {
         actions.push(DaemonAction::TriggerContextRegen);
@@ -1105,6 +1108,7 @@ mod tests {
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
+            skip_context_regen: false,
         }
     }
 
@@ -1253,6 +1257,7 @@ mod tests {
             verify_command: Some("cargo test --workspace".to_string()),
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
+            skip_context_regen: false,
         };
         (config, tmp)
     }

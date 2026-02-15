@@ -430,6 +430,7 @@ fn main() -> anyhow::Result<()> {
                 verify_command: Some(verify_cmd),
                 context_gen_config,
                 skip_qa,
+                skip_context_regen: skip_context_gen,
             };
 
             let start = Instant::now();
