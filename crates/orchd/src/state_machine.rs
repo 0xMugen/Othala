@@ -204,4 +204,117 @@ mod tests {
         ));
         assert!(is_transition_allowed(TaskState::Merged, TaskState::Merged));
     }
+
+    #[test]
+    fn chatting_to_stopped_allowed() {
+        assert!(is_transition_allowed(
+            TaskState::Chatting,
+            TaskState::Stopped
+        ));
+    }
+
+    #[test]
+    fn stopped_cannot_transition_to_non_chatting_states() {
+        // Stopped is terminal — only back to Chatting is allowed (via the
+        // "any state → Chatting" rule).
+        assert!(!is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::Ready
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::Submitting
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::Merged
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::AwaitingMerge
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::Restacking
+        ));
+        // But back to Chatting is allowed (retry).
+        assert!(is_transition_allowed(
+            TaskState::Stopped,
+            TaskState::Chatting
+        ));
+    }
+
+    #[test]
+    fn non_chatting_to_stopped_disallowed() {
+        // Only Chatting → Stopped is explicitly allowed.
+        assert!(!is_transition_allowed(
+            TaskState::Ready,
+            TaskState::Stopped
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Submitting,
+            TaskState::Stopped
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::AwaitingMerge,
+            TaskState::Stopped
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Restacking,
+            TaskState::Stopped
+        ));
+        assert!(!is_transition_allowed(
+            TaskState::Merged,
+            TaskState::Stopped
+        ));
+    }
+
+    #[test]
+    fn task_state_tag_returns_correct_strings() {
+        assert_eq!(task_state_tag(TaskState::Chatting), "CHATTING");
+        assert_eq!(task_state_tag(TaskState::Ready), "READY");
+        assert_eq!(task_state_tag(TaskState::Submitting), "SUBMITTING");
+        assert_eq!(task_state_tag(TaskState::Restacking), "RESTACKING");
+        assert_eq!(task_state_tag(TaskState::AwaitingMerge), "AWAITING_MERGE");
+        assert_eq!(task_state_tag(TaskState::Merged), "MERGED");
+        assert_eq!(task_state_tag(TaskState::Stopped), "STOPPED");
+    }
+
+    #[test]
+    fn transition_preserves_task_fields() {
+        let mut task = mk_task(TaskState::Chatting);
+        let original_title = task.title.clone();
+        let original_id = task.id.clone();
+
+        let at = Utc::now();
+        transition_task(&mut task, TaskState::Ready, at).expect("valid");
+
+        assert_eq!(task.id, original_id);
+        assert_eq!(task.title, original_title);
+        assert_eq!(task.state, TaskState::Ready);
+    }
+
+    #[test]
+    fn full_happy_path_transitions() {
+        let mut task = mk_task(TaskState::Chatting);
+        let at = Utc::now();
+
+        transition_task(&mut task, TaskState::Ready, at).expect("→ Ready");
+        transition_task(&mut task, TaskState::Submitting, at).expect("→ Submitting");
+        transition_task(&mut task, TaskState::AwaitingMerge, at).expect("→ AwaitingMerge");
+        transition_task(&mut task, TaskState::Merged, at).expect("→ Merged");
+
+        assert_eq!(task.state, TaskState::Merged);
+    }
+
+    #[test]
+    fn restack_cycle_transitions() {
+        let mut task = mk_task(TaskState::Ready);
+        let at = Utc::now();
+
+        transition_task(&mut task, TaskState::Restacking, at).expect("→ Restacking");
+        transition_task(&mut task, TaskState::Ready, at).expect("→ Ready");
+
+        assert_eq!(task.state, TaskState::Ready);
+    }
 }
