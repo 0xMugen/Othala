@@ -359,4 +359,134 @@ mod tests {
         assert_eq!(plan.assignments[0].model, ModelKind::Gemini);
         assert!(plan.blocked.is_empty());
     }
+
+    #[test]
+    fn plan_respects_priority_ordering() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+
+        let mut low = mk_queued("T-low", "repo", 1, Some(ModelKind::Claude));
+        let mut high = mk_queued("T-high", "repo", 10, Some(ModelKind::Claude));
+        // Ensure low priority was enqueued first.
+        low.enqueued_at = Utc::now() - chrono::Duration::seconds(100);
+        high.enqueued_at = Utc::now();
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![low, high],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 2);
+        // Higher priority should be scheduled first.
+        assert_eq!(plan.assignments[0].task_id.0, "T-high");
+        assert_eq!(plan.assignments[1].task_id.0, "T-low");
+    }
+
+    #[test]
+    fn plan_schedules_multiple_tasks_up_to_repo_limit() {
+        let scheduler = mk_scheduler(3, &[(ModelKind::Claude, 10)]);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![
+                mk_queued("T1", "repo", 1, Some(ModelKind::Claude)),
+                mk_queued("T2", "repo", 1, Some(ModelKind::Claude)),
+                mk_queued("T3", "repo", 1, Some(ModelKind::Claude)),
+                mk_queued("T4", "repo", 1, Some(ModelKind::Claude)),
+            ],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 3);
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, BlockReason::RepoLimitReached);
+    }
+
+    #[test]
+    fn plan_empty_queue_produces_empty_plan() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+        let plan = scheduler.plan(SchedulingInput {
+            queued: Vec::new(),
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert!(plan.assignments.is_empty());
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_different_repos_have_independent_limits() {
+        let scheduler = mk_scheduler(1, &[(ModelKind::Claude, 10)]);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![
+                mk_queued("T1", "repo-a", 1, Some(ModelKind::Claude)),
+                mk_queued("T2", "repo-b", 1, Some(ModelKind::Claude)),
+            ],
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        // Both should be scheduled since they're in different repos.
+        assert_eq!(plan.assignments.len(), 2);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_fifo_within_same_priority() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+
+        let mut t1 = mk_queued("T1", "repo", 5, Some(ModelKind::Claude));
+        let mut t2 = mk_queued("T2", "repo", 5, Some(ModelKind::Claude));
+        t1.enqueued_at = Utc::now() - chrono::Duration::seconds(200);
+        t2.enqueued_at = Utc::now() - chrono::Duration::seconds(100);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![t2, t1], // Intentionally reversed.
+            running: Vec::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 2);
+        // Older task should be first when priorities are equal.
+        assert_eq!(plan.assignments[0].task_id.0, "T1");
+        assert_eq!(plan.assignments[1].task_id.0, "T2");
+    }
+
+    #[test]
+    fn scheduler_config_from_org_config() {
+        use orch_core::config::*;
+        let org = OrgConfig {
+            models: ModelsConfig {
+                enabled: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                default: None,
+            },
+            concurrency: ConcurrencyConfig {
+                per_repo: 8,
+                claude: 3,
+                codex: 4,
+                gemini: 2,
+            },
+            graphite: GraphiteOrgConfig {
+                auto_submit: true,
+                submit_mode_default: orch_core::types::SubmitMode::Single,
+                allow_move: MovePolicy::Manual,
+            },
+            ui: UiConfig {
+                web_bind: "127.0.0.1:9842".to_string(),
+            },
+        };
+
+        let config = SchedulerConfig::from_org_config(&org);
+        assert_eq!(config.per_repo_limit, 8);
+        assert_eq!(config.per_model_limit[&ModelKind::Claude], 3);
+        assert_eq!(config.per_model_limit[&ModelKind::Codex], 4);
+        assert_eq!(config.per_model_limit[&ModelKind::Gemini], 2);
+    }
 }

@@ -1077,4 +1077,199 @@ Running tests...
 
         fs::remove_dir_all(&tmp).ok();
     }
+
+    #[test]
+    fn parse_qa_output_ignores_malformed_result_lines() {
+        let raw = "\
+<!-- QA_RESULT: startup.banner | PASS | ok -->
+<!-- QA_RESULT: missing close tag
+<!-- QA_RESULT: standalone | PASS | ok -->
+not a result line
+<!-- QA_RESULT: build.check | FAIL | error -->
+";
+        let result = parse_qa_output(raw);
+        // Lines without closing `-->` are skipped.
+        assert_eq!(result.tests.len(), 3);
+        assert_eq!(result.tests[0].name, "banner");
+        assert_eq!(result.tests[1].name, "standalone");
+        assert!(!result.tests[2].passed);
+    }
+
+    #[test]
+    fn parse_qa_output_case_insensitive_pass_fail() {
+        let raw = "\
+<!-- QA_RESULT: test_a | pass | lower -->
+<!-- QA_RESULT: test_b | FAIL | upper -->
+<!-- QA_RESULT: test_c | Pass | mixed -->
+";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.tests.len(), 3);
+        assert!(result.tests[0].passed);
+        assert!(!result.tests[1].passed);
+        assert!(result.tests[2].passed);
+    }
+
+    #[test]
+    fn parse_qa_output_meta_without_results() {
+        let raw = "<!-- QA_META: task/T-42 | deadbeef -->\nno results here\n";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.branch, "task/T-42");
+        assert_eq!(result.commit, "deadbeef");
+        assert!(result.tests.is_empty());
+        assert_eq!(result.summary.total, 0);
+    }
+
+    #[test]
+    fn parse_qa_output_detail_with_pipe_characters() {
+        let raw = "<!-- QA_RESULT: build.check | FAIL | exit code 1 | see log -->";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.tests.len(), 1);
+        assert!(!result.tests[0].passed);
+        // The detail should capture at least the first detail part.
+        assert!(result.tests[0].detail.contains("exit code 1"));
+    }
+
+    #[test]
+    fn parse_qa_spec_nested_headings_ignored() {
+        let content = "\
+# Top Level
+## Suite A
+- test one
+### Subsection (not a suite)
+- test two
+## Suite B
+- test three
+";
+        let spec = parse_qa_spec(content);
+        assert_eq!(spec.tests.len(), 3);
+        // h3 should NOT start a new suite — only h2 does.
+        assert_eq!(spec.tests[0].suite, "suite_a");
+        assert_eq!(spec.tests[1].suite, "suite_a");
+        assert_eq!(spec.tests[2].suite, "suite_b");
+    }
+
+    #[test]
+    fn parse_qa_spec_special_characters_in_test_name() {
+        let content = "## Suite\n- test with `backticks` and (parens)\n";
+        let spec = parse_qa_spec(content);
+        assert_eq!(spec.tests.len(), 1);
+        // Special characters should be converted to underscores.
+        assert!(!spec.tests[0].name.contains('`'));
+        assert!(!spec.tests[0].name.contains('('));
+    }
+
+    #[test]
+    fn sanitize_branch_name_preserves_alphanumeric_and_dashes() {
+        assert_eq!(sanitize_branch_name("simple-branch"), "simple-branch");
+        assert_eq!(sanitize_branch_name("with_underscore"), "with_underscore");
+        assert_eq!(sanitize_branch_name("ABC-123"), "ABC-123");
+    }
+
+    #[test]
+    fn sanitize_branch_name_replaces_special_chars() {
+        assert_eq!(sanitize_branch_name("a/b/c"), "a-b-c");
+        assert_eq!(sanitize_branch_name("hello world"), "hello-world");
+        assert_eq!(sanitize_branch_name("a@b#c"), "a-b-c");
+    }
+
+    #[test]
+    fn qa_summary_counts_match_test_results() {
+        let raw = "\
+<!-- QA_RESULT: a | PASS | ok -->
+<!-- QA_RESULT: b | PASS | ok -->
+<!-- QA_RESULT: c | FAIL | broken -->
+<!-- QA_RESULT: d | FAIL | also broken -->
+<!-- QA_RESULT: e | PASS | ok -->
+";
+        let result = parse_qa_output(raw);
+        assert_eq!(result.summary.total, 5);
+        assert_eq!(result.summary.passed, 3);
+        assert_eq!(result.summary.failed, 2);
+    }
+
+    #[test]
+    fn build_qa_failure_context_empty_detail() {
+        let result = QAResult {
+            branch: "main".to_string(),
+            commit: "abc".to_string(),
+            timestamp: Utc::now(),
+            tests: vec![QATestResult {
+                name: "test1".to_string(),
+                suite: "suite".to_string(),
+                passed: true,
+                detail: String::new(),
+                duration_ms: 0,
+            }],
+            summary: QASummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+            },
+        };
+
+        let ctx = build_qa_failure_context(&result);
+        // When detail is empty, there should be no " — " separator.
+        assert!(ctx.contains("suite.test1: PASS"));
+        assert!(!ctx.contains(" — "));
+    }
+
+    #[test]
+    fn load_latest_result_picks_newest_timestamp() {
+        let tmp = std::env::temp_dir().join(format!("othala-qa-latest-{}", std::process::id()));
+        let results_dir = tmp.join(".othala/qa/results");
+        fs::create_dir_all(&results_dir).unwrap();
+
+        let old_result = QAResult {
+            branch: "task/T-1".to_string(),
+            commit: "aaa1111".to_string(),
+            timestamp: Utc::now() - chrono::Duration::seconds(3600),
+            tests: vec![],
+            summary: QASummary {
+                total: 0,
+                passed: 0,
+                failed: 0,
+            },
+        };
+
+        let new_result = QAResult {
+            branch: "task/T-1".to_string(),
+            commit: "bbb2222".to_string(),
+            timestamp: Utc::now(),
+            tests: vec![QATestResult {
+                name: "latest".to_string(),
+                suite: "general".to_string(),
+                passed: true,
+                detail: String::new(),
+                duration_ms: 0,
+            }],
+            summary: QASummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+            },
+        };
+
+        // Write both results.
+        let json1 = serde_json::to_string_pretty(&old_result).unwrap();
+        fs::write(results_dir.join("task-T-1-aaa1111.json"), &json1).unwrap();
+        let json2 = serde_json::to_string_pretty(&new_result).unwrap();
+        fs::write(results_dir.join("task-T-1-bbb2222.json"), &json2).unwrap();
+
+        let loaded = load_latest_result(&tmp, "task/T-1").unwrap();
+        assert_eq!(loaded.commit, "bbb2222");
+        assert_eq!(loaded.tests.len(), 1);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn load_latest_result_returns_none_when_no_match() {
+        let tmp = std::env::temp_dir().join(format!("othala-qa-nomatch-{}", std::process::id()));
+        let results_dir = tmp.join(".othala/qa/results");
+        fs::create_dir_all(&results_dir).unwrap();
+
+        assert!(load_latest_result(&tmp, "nonexistent-branch").is_none());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

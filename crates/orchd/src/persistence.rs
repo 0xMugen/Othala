@@ -502,4 +502,249 @@ mod tests {
         let runs = store.list_open_runs().expect("list");
         assert!(runs.is_empty());
     }
+
+    #[test]
+    fn upsert_task_updates_existing() {
+        let store = mk_store();
+        let mut task = mk_task("T1", TaskState::Chatting);
+        store.upsert_task(&task).expect("initial upsert");
+
+        // Update state and upsert again.
+        task.state = TaskState::Ready;
+        task.updated_at = Utc::now();
+        store.upsert_task(&task).expect("update upsert");
+
+        let loaded = store.load_task(&task.id).expect("load").expect("exists");
+        assert_eq!(loaded.state, TaskState::Ready);
+
+        // Should still be a single task, not duplicated.
+        let all = store.list_tasks().expect("list");
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn load_task_returns_none_for_missing() {
+        let store = mk_store();
+        let result = store
+            .load_task(&TaskId("nonexistent".to_string()))
+            .expect("load");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_task_returns_false_for_missing() {
+        let store = mk_store();
+        let deleted = store
+            .delete_task(&TaskId("nonexistent".to_string()))
+            .expect("delete");
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn insert_and_query_artifact() {
+        let store = mk_store();
+        let artifact = ArtifactRecord {
+            artifact_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            kind: "patch".to_string(),
+            path: "/tmp/patch.diff".to_string(),
+            created_at: Utc::now(),
+            metadata_json: Some("{\"lines\":42}".to_string()),
+        };
+
+        store.insert_artifact(&artifact).expect("insert artifact");
+
+        // Verify by querying directly.
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE task_id = 'T1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn append_and_list_events_global() {
+        let store = mk_store();
+
+        let e1 = Event {
+            id: EventId("E1".to_string()),
+            task_id: Some(TaskId("T1".to_string())),
+            repo_id: Some(RepoId("repo".to_string())),
+            at: Utc::now() - chrono::Duration::seconds(10),
+            kind: EventKind::TaskCreated,
+        };
+        let e2 = Event {
+            id: EventId("E2".to_string()),
+            task_id: Some(TaskId("T2".to_string())),
+            repo_id: Some(RepoId("repo".to_string())),
+            at: Utc::now(),
+            kind: EventKind::ReadyReached,
+        };
+
+        store.append_event(&e1).expect("append e1");
+        store.append_event(&e2).expect("append e2");
+
+        let events = store.list_events_global().expect("list global");
+        assert_eq!(events.len(), 2);
+        // Ordered by time ascending.
+        assert_eq!(events[0].id.0, "E1");
+        assert_eq!(events[1].id.0, "E2");
+    }
+
+    #[test]
+    fn latest_event_at_returns_most_recent() {
+        let store = mk_store();
+
+        let earlier = Utc::now() - chrono::Duration::seconds(100);
+        let later = Utc::now();
+
+        let e1 = Event {
+            id: EventId("E1".to_string()),
+            task_id: Some(TaskId("T1".to_string())),
+            repo_id: None,
+            at: earlier,
+            kind: EventKind::TaskCreated,
+        };
+        let e2 = Event {
+            id: EventId("E2".to_string()),
+            task_id: Some(TaskId("T1".to_string())),
+            repo_id: None,
+            at: later,
+            kind: EventKind::ReadyReached,
+        };
+
+        store.append_event(&e1).expect("append e1");
+        store.append_event(&e2).expect("append e2");
+
+        let latest = store
+            .latest_event_at_for_task(&TaskId("T1".to_string()))
+            .expect("latest");
+        assert!(latest.is_some());
+        let ts = latest.unwrap();
+        assert!(ts >= later - chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn latest_event_at_returns_none_when_no_events() {
+        let store = mk_store();
+        let result = store
+            .latest_event_at_for_task(&TaskId("T-absent".to_string()))
+            .expect("latest");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn finish_open_runs_only_affects_target_task() {
+        let store = mk_store();
+
+        let run1 = TaskRunRecord {
+            run_id: "R1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+        let run2 = TaskRunRecord {
+            run_id: "R2".to_string(),
+            task_id: TaskId("T2".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Codex,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+
+        store.insert_run(&run1).expect("insert r1");
+        store.insert_run(&run2).expect("insert r2");
+
+        // Finish only T1's runs.
+        store
+            .finish_open_runs_for_task(&TaskId("T1".to_string()), Utc::now(), "done", Some(0))
+            .expect("finish");
+
+        let open = store.list_open_runs().expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].task_id.0, "T2");
+    }
+
+    #[test]
+    fn delete_task_cascades_to_runs_and_artifacts() {
+        let store = mk_store();
+        let task = mk_task("T1", TaskState::Chatting);
+        store.upsert_task(&task).expect("upsert");
+
+        let run = TaskRunRecord {
+            run_id: "R1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Claude,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+        };
+        store.insert_run(&run).expect("insert run");
+
+        let artifact = ArtifactRecord {
+            artifact_id: "A1".to_string(),
+            task_id: TaskId("T1".to_string()),
+            kind: "log".to_string(),
+            path: "/tmp/log.txt".to_string(),
+            created_at: Utc::now(),
+            metadata_json: None,
+        };
+        store.insert_artifact(&artifact).expect("insert artifact");
+
+        // Delete the task — should cascade.
+        assert!(store.delete_task(&task.id).expect("delete"));
+
+        let run_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE task_id = 'T1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count runs");
+        assert_eq!(run_count, 0);
+
+        let art_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE task_id = 'T1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count artifacts");
+        assert_eq!(art_count, 0);
+    }
+
+    #[test]
+    fn list_tasks_by_state_returns_empty_for_no_matches() {
+        let store = mk_store();
+        store
+            .upsert_task(&mk_task("T1", TaskState::Chatting))
+            .expect("upsert");
+
+        let ready = store.list_tasks_by_state(TaskState::Ready).expect("list");
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let store = mk_store();
+        // Second migration should succeed without error.
+        store.migrate().expect("second migrate");
+        store
+            .upsert_task(&mk_task("T1", TaskState::Chatting))
+            .expect("upsert after double-migrate");
+    }
 }
