@@ -372,6 +372,48 @@ enum Commands {
     Skill {
         name: String,
     },
+    #[allow(clippy::enum_variant_names)]
+    /// List available custom commands
+    #[command(name = "commands")]
+    ListCommands {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a custom command
+    RunCommand {
+        /// Command name (e.g., "user:review" or "project:deploy")
+        name: String,
+        /// Arguments as KEY=VALUE pairs
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute a single prompt non-interactively (for scripting/CI)
+    Prompt {
+        /// The prompt text
+        text: String,
+        /// Model to use
+        #[arg(short, long, default_value = "claude")]
+        model: String,
+        /// Output format: text or json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Suppress progress output (for piping)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Check for updates or upgrade Othala
+    Upgrade {
+        /// Actually install the update (default is check-only)
+        #[arg(long)]
+        install: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3561,6 +3603,88 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("Skill not found: {name}");
                 std::process::exit(1);
+            }
+        }
+        Commands::ListCommands { json } => {
+            let commands = orchd::custom_commands::discover_all_commands(Path::new("."));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&commands).unwrap_or_default());
+            } else if commands.is_empty() {
+                println!("No custom commands found.");
+                println!("Add .md files to:");
+                println!("  ~/.config/othala/commands/  (user commands)");
+                println!("  .othala/commands/           (project commands)");
+            } else {
+                println!("{}", orchd::custom_commands::display_commands_table(&commands));
+            }
+        }
+        Commands::RunCommand { name, args, json } => {
+            let commands = orchd::custom_commands::discover_all_commands(Path::new("."));
+            let Some(cmd) = commands
+                .iter()
+                .find(|c| format!("{}:{}", c.prefix, c.name) == name || c.name == name)
+            else {
+                eprintln!("Command not found: {name}");
+                std::process::exit(1);
+            };
+            let mut arg_map = std::collections::HashMap::new();
+            for a in &args {
+                if let Some((k, v)) = a.split_once('=') {
+                    arg_map.insert(k.to_string(), v.to_string());
+                }
+            }
+            match orchd::custom_commands::render_command(cmd, &arg_map) {
+                Ok(rendered) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "command": name,
+                                "rendered": rendered,
+                            })
+                        );
+                    } else {
+                        println!("{rendered}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Prompt {
+            text,
+            model,
+            format,
+            quiet,
+        } => {
+            let result = orchd::custom_commands::execute_prompt(&text, &model, &format);
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default()),
+                _ => {
+                    if !quiet {
+                        eprintln!("Model: {}", result.model);
+                    }
+                    println!("{}", result.response);
+                }
+            }
+        }
+        Commands::Upgrade { install, json } => {
+            let info = orchd::upgrade::check_for_update();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+            } else if install && info.update_available {
+                println!("Upgrading from {} to {} ...", info.current, info.latest.as_deref().unwrap_or("unknown"));
+                match orchd::upgrade::perform_upgrade() {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => {
+                        eprintln!("Upgrade failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", orchd::upgrade::display_version_check(&info));
             }
         }
     }
