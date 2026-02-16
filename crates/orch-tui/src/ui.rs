@@ -17,8 +17,8 @@ use crate::ui_activity::status_activity;
 use crate::ui_footer::wrapped_visual_line_count;
 use crate::ui_footer::{build_footer_content, footer_height};
 use crate::ui_format::{
-    divider_line, format_category_tabs, format_task_row, pane_meta_lines, status_sidebar_lines,
-    to_local_time,
+    divider_line, format_category_tabs, format_task_row, pane_meta_lines, state_color,
+    status_sidebar_lines, to_local_time,
 };
 #[cfg(test)]
 use crate::ui_format::{format_pane_tabs, pane_status_tag, status_line_color};
@@ -115,11 +115,13 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 
     let footer_height = footer_height(app, frame.area().width);
+    let error_height = error_summary_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
+            Constraint::Length(error_height),
             Constraint::Length(footer_height),
         ])
         .split(frame.area());
@@ -139,7 +141,8 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
         render_pane_summary(frame, body[1], app);
     }
 
-    render_footer(frame, root[2], app);
+    render_error_summary(frame, root[2], app);
+    render_footer(frame, root[3], app);
 
     if let Some((active_field, repo, title, model)) = app.new_task_dialog_display() {
         render_new_task_dialog_modal(frame, active_field, repo, title, model);
@@ -284,7 +287,8 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .find(|pane| pane.task_id == task.task_id)
             .map(|pane| pane.model);
         let cost = format_cost_display(estimate_task_cost_usd(task, task_model));
-        lines.push(format_task_row(is_selected, task, cost));
+        let state_style = Style::default().fg(state_color(task.state));
+        lines.push(format_task_row(is_selected, task, cost, state_style));
     }
 
     if app.state.tasks.is_empty() {
@@ -655,6 +659,49 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(widget, area);
 }
 
+fn error_summary_height(app: &TuiApp) -> u16 {
+    let entry_count = app.state.recent_errors.len().min(3);
+    if entry_count == 0 {
+        0
+    } else {
+        u16::try_from(entry_count + 2).unwrap_or(5)
+    }
+}
+
+fn format_error_timestamp(timestamp: &str) -> String {
+    if let Some((_, rest)) = timestamp.split_once('T') {
+        return rest.chars().take(8).collect();
+    }
+    timestamp.chars().take(8).collect()
+}
+
+fn render_error_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 || app.state.recent_errors.is_empty() {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    for entry in app.state.recent_errors.iter().rev().take(3) {
+        let timestamp = format_error_timestamp(&entry.timestamp);
+        let body = match entry.task_id.as_deref() {
+            Some(task_id) => format!("[{timestamp}] {task_id}: {}", entry.message),
+            None => format!("[{timestamp}] {}", entry.message),
+        };
+
+        let style = if entry.level.eq_ignore_ascii_case("warning") {
+            Style::default().bg(Color::Yellow).fg(Color::Black)
+        } else {
+            Style::default().bg(Color::Red).fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(body, style)));
+    }
+
+    let widget = Paragraph::new(lines)
+        .block(normal_block("Recent Errors"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
+}
+
 fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Option<&str>) {
     let area = centered_rect(64, 36, frame.area());
     let branch_line = match branch {
@@ -811,14 +858,14 @@ mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
     use orch_core::types::{ModelKind, RepoId, TaskId};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Style};
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
     use crate::TuiApp;
 
     use super::{
         estimate_task_cost_usd, footer_height, format_cost_display, format_pane_tabs,
-        format_task_row, pane_status_tag, status_activity, status_line_color,
+        format_task_row, pane_status_tag, state_color, status_activity, status_line_color,
         status_sidebar_lines, to_local_time, wrapped_visual_line_count,
     };
 
@@ -894,7 +941,12 @@ mod tests {
     #[test]
     fn format_task_row_includes_expected_columns() {
         let row = mk_row("T9");
-        let line = format_task_row(true, &row, "$0.12".to_string());
+        let line = format_task_row(
+            true,
+            &row,
+            "$0.12".to_string(),
+            Style::default().fg(state_color(row.state)),
+        );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         let expected_ts = to_local_time(row.last_activity);
 
@@ -950,7 +1002,7 @@ mod tests {
         use crate::app::InputMode;
 
         let mut app = TuiApp::default();
-        assert_eq!(footer_height(&app, 120), 3);
+        assert_eq!(footer_height(&app, 120), 4);
 
         app.input_mode = InputMode::NewChatPrompt {
             buffer: "line 1\nline 2".to_string(),

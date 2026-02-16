@@ -12,12 +12,14 @@ const DIM: Color = Color::DarkGray;
 const MUTED: Color = Color::Gray;
 const SELECTED_BG: Color = Color::Indexed(236);
 
-fn state_color(state: TaskState) -> Color {
+pub fn state_color(state: TaskState) -> Color {
     match state {
-        TaskState::Chatting => Color::Green,
-        TaskState::Ready | TaskState::Merged => Color::Cyan,
-        TaskState::Submitting | TaskState::AwaitingMerge => Color::Blue,
-        TaskState::Restacking => Color::Yellow,
+        TaskState::Chatting => Color::Yellow,
+        TaskState::Ready => Color::Blue,
+        TaskState::Submitting => Color::Cyan,
+        TaskState::Restacking => Color::Magenta,
+        TaskState::AwaitingMerge => Color::LightBlue,
+        TaskState::Merged => Color::Green,
         TaskState::Stopped => Color::Red,
     }
 }
@@ -65,9 +67,9 @@ pub(crate) fn format_task_row<'a>(
     is_selected: bool,
     task: &'a TaskOverviewRow,
     cost_display: String,
+    state_style: Style,
 ) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
-    let sc = display_state_color(task.state, &task.display_state);
 
     let base_style = if is_selected {
         Style::default().bg(SELECTED_BG).fg(Color::White)
@@ -76,6 +78,11 @@ pub(crate) fn format_task_row<'a>(
     };
 
     let prefix = if is_selected { "\u{25B6} " } else { "  " };
+    let mut state_cell_style = state_style.add_modifier(Modifier::BOLD);
+    if is_selected {
+        state_cell_style = state_cell_style.bg(SELECTED_BG);
+    }
+    let state_label = format!("{:?}", task.state);
 
     Line::from(vec![
         Span::styled(
@@ -102,10 +109,7 @@ pub(crate) fn format_task_row<'a>(
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.title, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(
-            task.display_state.as_str(),
-            Style::default().fg(sc).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(state_label, state_cell_style),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
@@ -586,4 +590,22 @@ pub(crate) fn to_local_time(value: DateTime<Utc>) -> String {
         .with_timezone(&Local)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_color;
+    use orch_core::state::TaskState;
+    use ratatui::style::Color;
+
+    #[test]
+    fn state_color_returns_correct_colors() {
+        assert_eq!(state_color(TaskState::Chatting), Color::Yellow);
+        assert_eq!(state_color(TaskState::Ready), Color::Blue);
+        assert_eq!(state_color(TaskState::Submitting), Color::Cyan);
+        assert_eq!(state_color(TaskState::Restacking), Color::Magenta);
+        assert_eq!(state_color(TaskState::AwaitingMerge), Color::LightBlue);
+        assert_eq!(state_color(TaskState::Merged), Color::Green);
+        assert_eq!(state_color(TaskState::Stopped), Color::Red);
+    }
 }

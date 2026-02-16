@@ -1,8 +1,9 @@
+use orch_core::state::TaskState;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::{InputMode, TuiApp};
-use crate::model::ModelHealthDisplay;
+use crate::model::{DashboardState, ModelHealthDisplay};
 use crate::ui_activity::footer_activity_indicator;
 use crate::ui_format::status_line_color;
 
@@ -11,7 +12,7 @@ const HEADER_FG: Color = Color::White;
 const DIM: Color = Color::DarkGray;
 const KEY_FG: Color = Color::Yellow;
 const MUTED: Color = Color::Gray;
-const FOOTER_DEFAULT_HEIGHT: u16 = 3;
+const FOOTER_DEFAULT_HEIGHT: u16 = 4;
 const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
 const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
 
@@ -214,12 +215,42 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
     if !app.state.model_health.is_empty() {
         lines.push(model_health_line(&app.state.model_health));
     }
+    lines.push(Line::from(Span::styled(
+        progress_bar_text(&app.state),
+        Style::default().fg(HEADER_FG),
+    )));
 
     FooterContent {
         title: "Actions",
         lines,
         wrap_trim: true,
     }
+}
+
+pub(crate) fn progress_bar_text(state: &DashboardState) -> String {
+    const BAR_WIDTH: usize = 16;
+
+    let total = state.tasks.len();
+    let done = state
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Merged | TaskState::Stopped))
+        .count();
+    let filled = if total == 0 {
+        0
+    } else {
+        (done * BAR_WIDTH + (total / 2)) / total
+    }
+    .min(BAR_WIDTH);
+    let empty = BAR_WIDTH.saturating_sub(filled);
+    let percentage = state.completion_percentage().round() as u32;
+
+    format!(
+        "Progress: [{}{}] {}% ({done}/{total} tasks)",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        percentage
+    )
 }
 
 fn model_health_line(model_health: &[ModelHealthDisplay]) -> Line<'static> {
@@ -248,12 +279,39 @@ fn model_health_line(model_health: &[ModelHealthDisplay]) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use orch_core::state::TaskState;
+    use orch_core::types::{RepoId, TaskId};
     use ratatui::style::Color;
 
-    use crate::model::ModelHealthDisplay;
+    use crate::model::{ModelHealthDisplay, TaskOverviewRow};
     use crate::TuiApp;
 
-    use super::build_footer_content;
+    use super::{build_footer_content, progress_bar_text};
+
+    fn mk_row(task_id: &str, state: TaskState) -> TaskOverviewRow {
+        TaskOverviewRow {
+            task_id: TaskId(task_id.to_string()),
+            repo_id: RepoId("example".to_string()),
+            title: format!("Task {task_id}"),
+            branch: format!("task/{task_id}"),
+            stack_position: None,
+            state,
+            display_state: format!("{state:?}"),
+            verify_summary: "not_run".to_string(),
+            last_activity: Utc::now(),
+            qa_status: None,
+            qa_tests: Vec::new(),
+            qa_targets: Vec::new(),
+            estimated_tokens: None,
+            estimated_cost_usd: None,
+            retry_count: 0,
+            retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
+        }
+    }
 
     #[test]
     fn model_health_all_healthy() {
@@ -339,5 +397,25 @@ mod tests {
             .find(|span| span.content.as_ref().contains("gemini:✗"))
             .expect("gemini health span");
         assert_eq!(gemini_span.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn progress_bar_format() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![
+            mk_row("T1", TaskState::Merged),
+            mk_row("T2", TaskState::Stopped),
+            mk_row("T3", TaskState::Merged),
+            mk_row("T4", TaskState::Stopped),
+            mk_row("T5", TaskState::Merged),
+            mk_row("T6", TaskState::Chatting),
+            mk_row("T7", TaskState::Chatting),
+            mk_row("T8", TaskState::Chatting),
+            mk_row("T9", TaskState::Ready),
+            mk_row("T10", TaskState::Submitting),
+        ];
+
+        let line = progress_bar_text(&app.state);
+        assert_eq!(line, "Progress: [████████░░░░░░░░] 50% (5/10 tasks)");
     }
 }

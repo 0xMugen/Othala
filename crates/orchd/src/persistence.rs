@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{Task, TaskId, TaskPriority};
+use orch_core::types::{ModelKind, Task, TaskId, TaskPriority};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -18,6 +18,13 @@ pub struct ArchivedTaskRecord {
     pub payload_json: String,
     pub created_at: DateTime<Utc>,
     pub archived_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskCloneOverrides {
+    pub title: Option<String>,
+    pub preferred_model: Option<ModelKind>,
+    pub priority: Option<TaskPriority>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +45,8 @@ pub enum PersistenceError {
         #[source]
         source: chrono::ParseError,
     },
+    #[error("task not found: {task_id}")]
+    TaskNotFound { task_id: String },
 }
 
 /// SQLite-based store for tasks and events.
@@ -208,6 +217,39 @@ ON CONFLICT(task_id) DO UPDATE SET
         })
         .transpose()
         .map_err(PersistenceError::from)
+    }
+
+    pub fn clone_task(
+        &self,
+        source_id: &str,
+        new_id: &str,
+        overrides: TaskCloneOverrides,
+    ) -> Result<(), PersistenceError> {
+        let source_task = self
+            .load_task(&TaskId::new(source_id))?
+            .ok_or_else(|| PersistenceError::TaskNotFound {
+                task_id: source_id.to_string(),
+            })?;
+
+        let mut cloned = source_task;
+        let now = Utc::now();
+        cloned.id = TaskId::new(new_id);
+        if let Some(title) = overrides.title {
+            cloned.title = title;
+        }
+        if let Some(model) = overrides.preferred_model {
+            cloned.preferred_model = Some(model);
+        }
+        if let Some(priority) = overrides.priority {
+            cloned.priority = priority;
+        }
+        cloned.state = TaskState::Chatting;
+        cloned.retry_count = 0;
+        cloned.failed_models.clear();
+        cloned.created_at = now;
+        cloned.updated_at = now;
+
+        self.upsert_task(&cloned)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, PersistenceError> {
@@ -879,5 +921,94 @@ mod tests {
 
         let count = store.total_event_count().expect("count events");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn clone_creates_new_task_from_source() {
+        let store = mk_store();
+        let mut source = mk_task("T-SRC-1", TaskState::Ready);
+        source.branch_name = Some("task/T-SRC-1".to_string());
+        source.preferred_model = Some(ModelKind::Codex);
+        source.depends_on = vec![TaskId::new("T-DEP-1")];
+        source.priority = TaskPriority::High;
+        store.upsert_task(&source).expect("upsert source");
+
+        let new_id = "T-SRC-1-clone-1";
+        store
+            .clone_task(&source.id.0, new_id, TaskCloneOverrides::default())
+            .expect("clone task");
+
+        let cloned = store
+            .load_task(&TaskId::new(new_id))
+            .expect("load cloned")
+            .expect("cloned exists");
+
+        assert_eq!(cloned.id.0, new_id);
+        assert_eq!(cloned.repo_id, source.repo_id);
+        assert_eq!(cloned.title, source.title);
+        assert_eq!(cloned.branch_name, source.branch_name);
+        assert_eq!(cloned.preferred_model, source.preferred_model);
+        assert_eq!(cloned.depends_on, source.depends_on);
+        assert_eq!(cloned.priority, source.priority);
+    }
+
+    #[test]
+    fn clone_resets_state_and_retries() {
+        let store = mk_store();
+        let mut source = mk_task("T-SRC-2", TaskState::Stopped);
+        source.retry_count = 3;
+        source.failed_models = vec![ModelKind::Claude, ModelKind::Gemini];
+        store.upsert_task(&source).expect("upsert source");
+
+        store
+            .clone_task(&source.id.0, "T-SRC-2-clone-1", TaskCloneOverrides::default())
+            .expect("clone task");
+
+        let cloned = store
+            .load_task(&TaskId::new("T-SRC-2-clone-1"))
+            .expect("load cloned")
+            .expect("cloned exists");
+
+        assert_eq!(cloned.state, TaskState::Chatting);
+        assert_eq!(cloned.retry_count, 0);
+        assert!(cloned.failed_models.is_empty());
+    }
+
+    #[test]
+    fn clone_applies_title_override() {
+        let store = mk_store();
+        let source = mk_task("T-SRC-3", TaskState::Ready);
+        store.upsert_task(&source).expect("upsert source");
+
+        store
+            .clone_task(
+                &source.id.0,
+                "T-SRC-3-clone-1",
+                TaskCloneOverrides {
+                    title: Some("Override title".to_string()),
+                    preferred_model: None,
+                    priority: None,
+                },
+            )
+            .expect("clone task");
+
+        let cloned = store
+            .load_task(&TaskId::new("T-SRC-3-clone-1"))
+            .expect("load cloned")
+            .expect("cloned exists");
+        assert_eq!(cloned.title, "Override title");
+    }
+
+    #[test]
+    fn clone_fails_for_missing_source() {
+        let store = mk_store();
+        let err = store
+            .clone_task(
+                "T-DOES-NOT-EXIST",
+                "T-DOES-NOT-EXIST-clone-1",
+                TaskCloneOverrides::default(),
+            )
+            .expect_err("missing source should fail");
+        assert!(matches!(err, PersistenceError::TaskNotFound { .. }));
     }
 }

@@ -19,6 +19,7 @@ use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookS
 use orchd::supervisor::AgentSupervisor;
 use orchd::{
     provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
+    TaskCloneOverrides,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -92,6 +93,24 @@ enum Commands {
     Delete {
         /// Chat/task ID
         id: String,
+    },
+    Clone {
+        task_id: String,
+        /// Override title for the clone
+        #[arg(long)]
+        title: Option<String>,
+        /// Override model for the clone
+        #[arg(long)]
+        model: Option<String>,
+        /// Override priority for the clone
+        #[arg(long)]
+        priority: Option<String>,
+    },
+    Diff {
+        task_id: String,
+        /// Show stat summary instead of full diff
+        #[arg(long)]
+        stat: bool,
     },
     /// Run the daemon (orchestration loop)
     Daemon {
@@ -1642,6 +1661,35 @@ fn cancel_task(service: &OrchdService, task_id: &TaskId, reason: &str) -> anyhow
     Ok(from_state)
 }
 
+fn resolve_base_branch() -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !branch.is_empty() {
+                return branch
+                    .strip_prefix("origin/")
+                    .unwrap_or(&branch)
+                    .to_string();
+            }
+        }
+    }
+
+    "main".to_string()
+}
+
+fn build_diff_args(base_branch: &str, task_branch: &str, stat: bool) -> Vec<String> {
+    let mut args = vec!["diff".to_string()];
+    if stat {
+        args.push("--stat".to_string());
+    }
+    args.push(format!("{base_branch}...{task_branch}"));
+    args
+}
+
 fn archive_old_tasks(service: &OrchdService, older_than_days: i64) -> anyhow::Result<usize> {
     let now = Utc::now();
     let cutoff = now - chrono::Duration::days(older_than_days);
@@ -2033,6 +2081,63 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!("Chat not found: {}", id);
             }
+        }
+        Commands::Clone {
+            task_id,
+            title,
+            model,
+            priority,
+        } => {
+            let source_id = TaskId::new(&task_id);
+            if service.store.load_task(&source_id)?.is_none() {
+                anyhow::bail!("task not found: {task_id}");
+            }
+
+            let model_override = if let Some(value) = model {
+                let Some(parsed) = parse_model_name(&value) else {
+                    anyhow::bail!("unknown model '{value}'. valid values: claude,codex,gemini");
+                };
+                Some(parsed)
+            } else {
+                None
+            };
+            let priority_override = priority
+                .as_deref()
+                .map(parse_task_priority)
+                .transpose()?;
+
+            let new_id = format!("{}-clone-{}", task_id, Utc::now().timestamp_millis());
+            service.store.clone_task(
+                &task_id,
+                &new_id,
+                TaskCloneOverrides {
+                    title,
+                    preferred_model: model_override,
+                    priority: priority_override,
+                },
+            )?;
+
+            println!("Cloned {} → {}", task_id, new_id);
+        }
+        Commands::Diff { task_id, stat } => {
+            let task = service
+                .store
+                .load_task(&TaskId::new(&task_id))?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+
+            let Some(task_branch) = task.branch_name else {
+                println!("Task has no branch assigned");
+                return Ok(());
+            };
+
+            let base_branch = resolve_base_branch();
+            let args = build_diff_args(&base_branch, &task_branch, stat);
+            let output = Command::new("git").args(&args).output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("git diff failed: {stderr}");
+            }
+            print!("{}", String::from_utf8_lossy(&output.stdout));
         }
         Commands::Daemon {
             timeout,
@@ -2984,6 +3089,27 @@ mod tests {
                 assert_eq!(priority, "critical");
             }
             _ => panic!("expected set-priority command"),
+        }
+    }
+
+    #[test]
+    fn diff_stat_flag_works() {
+        let cli = Cli::try_parse_from(["othala", "diff", "T-42", "--stat"]).expect("parse diff");
+
+        match cli.command {
+            Commands::Diff { task_id, stat } => {
+                assert_eq!(task_id, "T-42");
+                assert!(stat);
+                assert_eq!(
+                    build_diff_args("main", "task/T-42", stat),
+                    vec![
+                        "diff".to_string(),
+                        "--stat".to_string(),
+                        "main...task/T-42".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected diff command"),
         }
     }
 
