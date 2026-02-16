@@ -84,6 +84,12 @@ fn pipe_child_output(child: &mut Child, tx: mpsc::Sender<String>) {
     }
 }
 
+fn rotate_task_log_if_needed(task_id: &TaskId) {
+    let log_dir = crate::agent_log::agent_log_dir(Path::new("."), task_id);
+    let log_path = log_dir.join("latest.log");
+    let _ = crate::agent_log::rotate_log_if_needed(&log_path);
+}
+
 /// Manages running agent sessions.
 pub struct AgentSupervisor {
     sessions: HashMap<String, AgentSession>,
@@ -281,6 +287,7 @@ impl AgentSupervisor {
                 lines.push(line);
             }
             if !lines.is_empty() {
+                rotate_task_log_if_needed(&session.task_id);
                 output.push(OutputChunk {
                     task_id: session.task_id.clone(),
                     model: session.model,

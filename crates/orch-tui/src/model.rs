@@ -62,6 +62,14 @@ pub struct RetryEntry {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorEntry {
+    pub timestamp: String,
+    pub task_id: Option<String>,
+    pub message: String,
+    pub level: String,
+}
+
 impl TaskOverviewRow {
     pub fn from_task(task: &Task) -> Self {
         let verify_summary = match &task.verify_status {
@@ -323,6 +331,8 @@ pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
     pub panes: Vec<AgentPane>,
     #[serde(default)]
+    pub recent_errors: Vec<ErrorEntry>,
+    #[serde(default)]
     pub log_root: Option<String>,
     pub model_health: Vec<ModelHealthDisplay>,
     pub filter_text: Option<String>,
@@ -344,6 +354,7 @@ impl Default for DashboardState {
         Self {
             tasks: Vec::new(),
             panes: Vec::new(),
+            recent_errors: Vec::new(),
             log_root: None,
             model_health: Vec::new(),
             filter_text: None,
@@ -395,6 +406,19 @@ impl DashboardState {
             .collect();
 
         parts.join(" | ")
+    }
+
+    pub fn completion_percentage(&self) -> f64 {
+        if self.tasks.is_empty() {
+            return 0.0;
+        }
+
+        let done = self
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, TaskState::Merged | TaskState::Stopped))
+            .count();
+        (done as f64 / self.tasks.len() as f64) * 100.0
     }
 
     pub fn selected_task(&self) -> Option<&TaskOverviewRow> {
@@ -837,6 +861,7 @@ mod tests {
                 mk_row("T6", "Task 6", TaskState::Merged),
                 mk_row("T7", "Task 7", TaskState::Stopped),
             ],
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -851,6 +876,43 @@ mod tests {
     fn state_summary_empty_tasks() {
         let state = DashboardState::default();
         assert_eq!(state.state_summary(), "");
+    }
+
+    #[test]
+    fn completion_percentage_with_mixed_states() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Task 1", TaskState::Merged),
+                mk_row("T2", "Task 2", TaskState::Stopped),
+                mk_row("T3", "Task 3", TaskState::Chatting),
+                mk_row("T4", "Task 4", TaskState::Ready),
+            ],
+            recent_errors: vec![],
+            log_root: None,
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.completion_percentage(), 50.0);
+    }
+
+    #[test]
+    fn completion_percentage_empty_tasks() {
+        let state = DashboardState::default();
+        assert_eq!(state.completion_percentage(), 0.0);
+    }
+
+    #[test]
+    fn error_entry_serialization() {
+        let entry = ErrorEntry {
+            timestamp: "2026-02-16T10:30:22Z".to_string(),
+            task_id: Some("T123".to_string()),
+            message: "verify failed — compile error".to_string(),
+            level: "error".to_string(),
+        };
+
+        let json = serde_json::to_string(&entry).expect("serialize error entry");
+        let parsed: ErrorEntry = serde_json::from_str(&json).expect("deserialize error entry");
+        assert_eq!(parsed, entry);
     }
 
     #[test]
@@ -871,6 +933,7 @@ mod tests {
                 mk_row("T2", "Fix panic on submit", TaskState::Ready),
             ],
             filter_text: Some("oauth".to_string()),
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -886,6 +949,7 @@ mod tests {
                 mk_row("T200", "Fix panic on submit", TaskState::Ready),
             ],
             filter_text: Some("t100".to_string()),
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -902,6 +966,7 @@ mod tests {
                 mk_row("T3", "Wire merge checks", TaskState::Ready),
             ],
             filter_state: Some(TaskState::Ready),
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -919,6 +984,7 @@ mod tests {
             ],
             filter_text: Some("oauth".to_string()),
             filter_state: Some(TaskState::Ready),
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -964,6 +1030,7 @@ mod tests {
                 pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1", "new 2"]),
             ],
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -979,6 +1046,7 @@ mod tests {
                 pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
             ],
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -999,6 +1067,7 @@ mod tests {
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
             ],
             focused_pane_idx: Some(1),
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1047,6 +1116,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::Agent,
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1070,6 +1140,7 @@ mod tests {
                 pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
                 pane_with_lines("agent-T2", "T2", ModelKind::Codex, &["agent2"]),
             ],
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1090,6 +1161,7 @@ mod tests {
                 pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent"]),
                 pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
             ],
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1119,6 +1191,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::QA,
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1146,6 +1219,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 1, // qa-T1
             selected_pane_category: PaneCategory::QA,
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
@@ -1168,6 +1242,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::Agent,
+            recent_errors: vec![],
             log_root: None,
             ..DashboardState::default()
         };
