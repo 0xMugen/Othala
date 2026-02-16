@@ -28,6 +28,15 @@ pub enum UiCommand {
     SelectPreviousTask,
     SelectNextPane,
     SelectPreviousPane,
+    ScrollUp,
+    ScrollDown,
+    ScrollToTop,
+    ScrollToBottom,
+    GoToFirstTask,
+    GoToLastTask,
+    CycleTheme,
+    CycleSort,
+    ToggleSortReverse,
     StartFilter,
     CycleStateFilter,
     ToggleFocusedPane,
@@ -44,6 +53,12 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(UiCommand::Quit);
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        return Some(UiCommand::ScrollUp);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        return Some(UiCommand::ScrollDown);
+    }
     if key.code == KeyCode::Esc {
         return Some(UiCommand::Quit);
     }
@@ -52,10 +67,17 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
     }
 
     match key.code {
-        KeyCode::Down => Some(UiCommand::SelectNextTask),
-        KeyCode::Up => Some(UiCommand::SelectPreviousTask),
-        KeyCode::Right => Some(UiCommand::SelectNextPane),
-        KeyCode::Left => Some(UiCommand::SelectPreviousPane),
+        KeyCode::Down | KeyCode::Char('j') => Some(UiCommand::SelectNextTask),
+        KeyCode::Up | KeyCode::Char('k') => Some(UiCommand::SelectPreviousTask),
+        KeyCode::Right | KeyCode::Char('l') => Some(UiCommand::SelectNextPane),
+        KeyCode::Left | KeyCode::Char('h') => Some(UiCommand::SelectPreviousPane),
+        KeyCode::PageUp => Some(UiCommand::ScrollUp),
+        KeyCode::PageDown => Some(UiCommand::ScrollDown),
+        KeyCode::Home => Some(UiCommand::GoToFirstTask),
+        KeyCode::End | KeyCode::Char('G') => Some(UiCommand::GoToLastTask),
+        KeyCode::Char('T') => Some(UiCommand::CycleTheme),
+        KeyCode::Char('S') => Some(UiCommand::CycleSort),
+        KeyCode::Char('R') => Some(UiCommand::ToggleSortReverse),
         KeyCode::Tab => Some(UiCommand::ToggleFocusedPane),
         KeyCode::Enter => Some(UiCommand::ToggleFocusedTask),
         KeyCode::Char('/') => Some(UiCommand::StartFilter),
@@ -113,7 +135,15 @@ mod tests {
             Some(UiCommand::SelectNextTask)
         );
         assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(UiCommand::SelectNextTask)
+        );
+        assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(UiCommand::SelectPreviousTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(UiCommand::SelectPreviousTask)
         );
         assert_eq!(
@@ -121,7 +151,15 @@ mod tests {
             Some(UiCommand::SelectNextPane)
         );
         assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Some(UiCommand::SelectNextPane)
+        );
+        assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(UiCommand::SelectPreviousPane)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
             Some(UiCommand::SelectPreviousPane)
         );
         assert_eq!(
@@ -191,6 +229,50 @@ mod tests {
         assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn map_key_to_command_maps_vim_keybindings() {
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(UiCommand::ScrollUp)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(UiCommand::ScrollDown)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(UiCommand::ScrollUp)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(UiCommand::ScrollDown)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Some(UiCommand::GoToFirstTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Some(UiCommand::GoToLastTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            Some(UiCommand::GoToLastTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            Some(UiCommand::CycleTheme)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Some(UiCommand::CycleSort)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some(UiCommand::ToggleSortReverse)
         );
     }
 

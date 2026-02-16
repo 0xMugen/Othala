@@ -244,28 +244,6 @@ impl TuiApp {
             return;
         }
 
-        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('S') {
-            self.state.sort_mode = self.state.sort_mode.next();
-            self.state.show_sessions = !self.state.show_sessions;
-            self.state.ensure_selected_session_visible();
-            self.state.status_line = if self.state.show_sessions {
-                format!("sort: {} | sessions shown", self.state.sort_mode.label())
-            } else {
-                format!("sort: {} | sessions hidden", self.state.sort_mode.label())
-            };
-            return;
-        }
-
-        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('R') {
-            self.state.sort_reversed = !self.state.sort_reversed;
-            self.state.status_line = if self.state.sort_reversed {
-                "sort direction: reversed".to_string()
-            } else {
-                "sort direction: normal".to_string()
-            };
-            return;
-        }
-
         if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('t') {
             self.state.show_timeline = !self.state.show_timeline;
             self.state.status_line = if self.state.show_timeline {
@@ -404,6 +382,27 @@ impl TuiApp {
             UiCommand::SelectPreviousTask => self.state.move_task_selection_previous(),
             UiCommand::SelectNextPane => self.state.move_pane_selection_next(),
             UiCommand::SelectPreviousPane => self.state.move_pane_selection_previous(),
+            UiCommand::ScrollUp => self.state.scroll_up(5),
+            UiCommand::ScrollDown => self.state.scroll_down(5),
+            UiCommand::ScrollToTop => self.state.scroll_to_top(),
+            UiCommand::ScrollToBottom => self.state.scroll_to_bottom(),
+            UiCommand::GoToFirstTask => {
+                self.state.selected_task_idx = 0;
+                self.state.ensure_selected_task_visible();
+            }
+            UiCommand::GoToLastTask => {
+                self.state.selected_task_idx = self.state.tasks.len().saturating_sub(1);
+                self.state.ensure_selected_task_visible();
+            }
+            UiCommand::CycleTheme => {
+                self.state.cycle_theme();
+            }
+            UiCommand::CycleSort => {
+                self.state.sort_mode = self.state.sort_mode.next();
+            }
+            UiCommand::ToggleSortReverse => {
+                self.state.sort_reversed = !self.state.sort_reversed;
+            }
             UiCommand::StartFilter => self.begin_filter_input(),
             UiCommand::CycleStateFilter => self.cycle_state_filter(),
             UiCommand::ToggleFocusedPane => {
@@ -1488,15 +1487,12 @@ mod tests {
     fn s_key_changes_sort_mode() {
         let mut app = TuiApp::default();
         assert_eq!(app.state.sort_mode, SortMode::ByState);
-        assert!(!app.state.show_sessions);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(app.state.sort_mode, SortMode::ByPriority);
-        assert!(app.state.show_sessions);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(app.state.sort_mode, SortMode::ByLastActivity);
-        assert!(!app.state.show_sessions);
     }
 
     #[test]
