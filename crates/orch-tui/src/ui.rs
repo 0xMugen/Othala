@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use orch_core::state::TaskState;
-use orch_core::types::ModelKind;
+use orch_core::types::{ModelKind, SessionStatus};
 
 use crate::app::{InputMode, TuiApp};
 use crate::chat_parse;
@@ -148,6 +148,93 @@ fn format_timeline_timestamp(timestamp: &str) -> String {
     timestamp.chars().take(8).collect()
 }
 
+fn session_status_color(status: SessionStatus, theme: &TuiTheme) -> Color {
+    match status {
+        SessionStatus::Active => Color::Green,
+        SessionStatus::Completed => Color::Blue,
+        SessionStatus::Archived => theme.muted,
+    }
+}
+
+fn session_status_label(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Active => "active",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Archived => "archived",
+    }
+}
+
+fn render_session_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
+    if area.height == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " id            | title                      | status     | tasks | updated",
+            Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if app.state.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no sessions",
+            Style::default().fg(theme.dim),
+        )));
+    } else {
+        let visible_rows = area.height.saturating_sub(3) as usize;
+        for (idx, session) in app.state.sessions.iter().take(visible_rows).enumerate() {
+            let selected = idx == app.state.session_list_index;
+            let row_style = if selected {
+                Style::default()
+                    .bg(theme.selected_bg)
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.header_fg)
+            };
+            let marker = if selected { ">" } else { " " };
+            let updated = to_local_time(session.updated_at);
+            let status_style = if selected {
+                Style::default()
+                    .bg(theme.selected_bg)
+                    .fg(session_status_color(session.status, theme))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(session_status_color(session.status, theme))
+                    .add_modifier(Modifier::BOLD)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{marker}{:<13} | {:<26} | ",
+                        session.id,
+                        session.title.chars().take(26).collect::<String>()
+                    ),
+                    row_style,
+                ),
+                Span::styled(
+                    format!("[{:<8}]", session_status_label(session.status)),
+                    status_style,
+                ),
+                Span::styled(
+                    format!(" | {:>5} | {updated}", session.task_count),
+                    row_style,
+                ),
+            ]));
+        }
+    }
+
+    let widget = Paragraph::new(lines)
+        .block(normal_block("Sessions", theme))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
 fn render_timeline_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let theme = &app.state.current_theme;
     if area.height == 0 {
@@ -251,15 +338,39 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
 
     render_header(frame, root[0], app);
 
-    if app.state.show_timeline {
-        let body = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(root[1]);
-        render_main_content(frame, body[0], app);
-        render_timeline_panel(frame, body[1], app);
-    } else {
-        render_main_content(frame, root[1], app);
+    match (app.state.show_timeline, app.state.show_sessions) {
+        (true, true) => {
+            let body = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(40),
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(30),
+                ])
+                .split(root[1]);
+            render_main_content(frame, body[0], app);
+            render_timeline_panel(frame, body[1], app);
+            render_session_panel(frame, body[2], app);
+        }
+        (true, false) => {
+            let body = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .split(root[1]);
+            render_main_content(frame, body[0], app);
+            render_timeline_panel(frame, body[1], app);
+        }
+        (false, true) => {
+            let body = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .split(root[1]);
+            render_main_content(frame, body[0], app);
+            render_session_panel(frame, body[1], app);
+        }
+        (false, false) => {
+            render_main_content(frame, root[1], app);
+        }
     }
 
     render_error_summary(frame, root[2], app);
@@ -1046,7 +1157,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use chrono::Utc;
     use orch_core::state::TaskState;
-    use orch_core::types::{ModelKind, RepoId, TaskId};
+    use orch_core::types::{ModelKind, RepoId, SessionStatus, TaskId};
     use ratatui::style::{Color, Style};
 
     use crate::model::{AgentPane, AgentPaneStatus, DashboardState, TaskOverviewRow};
@@ -1056,7 +1167,8 @@ mod tests {
         estimate_task_cost_usd, footer_height, format_cost_display, format_dependency_chain,
         format_pane_tabs,
         format_task_row, pane_status_tag, state_color, status_activity, status_line_color,
-        status_sidebar_lines, to_local_time, wrapped_visual_line_count,
+        status_sidebar_lines, to_local_time, wrapped_visual_line_count, session_status_color,
+        session_status_label,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -1190,6 +1302,18 @@ mod tests {
     }
 
     #[test]
+    fn session_status_helpers_render_expected_values() {
+        let theme = crate::model::default_theme();
+        assert_eq!(session_status_label(SessionStatus::Active), "active");
+        assert_eq!(session_status_label(SessionStatus::Completed), "completed");
+        assert_eq!(session_status_label(SessionStatus::Archived), "archived");
+
+        assert_eq!(session_status_color(SessionStatus::Active, &theme), Color::Green);
+        assert_eq!(session_status_color(SessionStatus::Completed, &theme), Color::Blue);
+        assert_eq!(session_status_color(SessionStatus::Archived, &theme), theme.muted);
+    }
+
+    #[test]
     fn to_local_time_uses_fixed_format() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-02-08T12:34:56Z")
             .expect("parse rfc3339")
@@ -1240,10 +1364,8 @@ mod tests {
         ));
         state.panes[0].status = AgentPaneStatus::Starting;
 
-        let app = TuiApp {
-            state,
-            ..TuiApp::default()
-        };
+        let mut app = TuiApp::default();
+        app.state = state;
         let tabs = format_pane_tabs(&app);
         let text: String = tabs.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1:A1"));

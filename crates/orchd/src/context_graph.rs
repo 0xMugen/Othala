@@ -1,11 +1,202 @@
 //! Context graph loader — reads `.othala/context/MAIN.md` and follows markdown
 //! links (BFS) to build a flattened context blob for prompt injection.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CMD_OUTPUT_LINE_LIMIT: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub source_path: PathBuf,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillRegistry {
+    skills: Vec<Skill>,
+    index_by_name: HashMap<String, usize>,
+}
+
+impl SkillRegistry {
+    pub fn discover(repo_root: &Path) -> Self {
+        let mut registry = Self::default();
+        let mut candidates = discover_skill_paths(repo_root);
+        candidates.sort();
+
+        for skill_path in candidates {
+            if let Some(skill) = load_skill_file(&skill_path) {
+                if !registry.index_by_name.contains_key(&skill.name) {
+                    let idx = registry.skills.len();
+                    registry.index_by_name.insert(skill.name.clone(), idx);
+                    registry.skills.push(skill);
+                }
+            }
+        }
+
+        registry
+    }
+
+    pub fn load_skill(&self, name: &str) -> Option<Skill> {
+        self.index_by_name
+            .get(name)
+            .and_then(|idx| self.skills.get(*idx))
+            .cloned()
+    }
+
+    pub fn list_skills(&self) -> Vec<Skill> {
+        let mut skills = self.skills.clone();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills
+    }
+}
+
+fn discover_skill_paths(repo_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    paths.extend(collect_skills_from_root(&repo_root.join(".othala/skills")));
+
+    if let Ok(home) = std::env::var("HOME") {
+        let user_skills = Path::new(&home).join(".config/othala/skills");
+        paths.extend(collect_skills_from_root(&user_skills));
+    }
+
+    paths
+}
+
+fn collect_skills_from_root(root: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut skills = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let skill_file = path.join("SKILL.md");
+        if skill_file.is_file() {
+            skills.push(skill_file);
+        }
+    }
+
+    skills
+}
+
+fn load_skill_file(path: &Path) -> Option<Skill> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let (meta, content) = parse_skill_frontmatter(&raw);
+    let fallback_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut name = meta.name.unwrap_or(fallback_name);
+    if name.trim().is_empty() {
+        name = "unknown".to_string();
+    }
+
+    Some(Skill {
+        name,
+        description: meta.description.unwrap_or_default(),
+        content,
+        source_path: path.to_path_buf(),
+        tags: meta.tags,
+    })
+}
+
+#[derive(Debug, Default)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+}
+
+fn parse_skill_frontmatter(raw: &str) -> (SkillFrontmatter, String) {
+    let mut lines = raw.lines();
+    let Some(first) = lines.next() else {
+        return (SkillFrontmatter::default(), String::new());
+    };
+
+    if first.trim() != "---" {
+        return (SkillFrontmatter::default(), raw.to_string());
+    }
+
+    let mut meta_lines = Vec::new();
+    let mut end_found = false;
+    for line in lines.by_ref() {
+        if line.trim() == "---" {
+            end_found = true;
+            break;
+        }
+        meta_lines.push(line);
+    }
+
+    if !end_found {
+        return (SkillFrontmatter::default(), raw.to_string());
+    }
+
+    let mut meta = SkillFrontmatter::default();
+    for line in meta_lines {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "name" => meta.name = Some(trim_yaml_value(value)),
+            "description" => meta.description = Some(trim_yaml_value(value)),
+            "tags" => meta.tags = parse_yaml_tags(value),
+            _ => {}
+        }
+    }
+
+    let mut body = lines.collect::<Vec<_>>().join("\n");
+    if raw.ends_with('\n') {
+        body.push('\n');
+    }
+
+    (meta, body)
+}
+
+fn trim_yaml_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        return trimmed[1..trimmed.len().saturating_sub(1)].trim().to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn parse_yaml_tags(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let inner = if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        &trimmed[1..trimmed.len().saturating_sub(1)]
+    } else {
+        trimmed
+    };
+
+    inner
+        .split(',')
+        .map(trim_yaml_value)
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
 
 /// A single node in the context graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +740,23 @@ fn normalise_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn home_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_tmp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_nanos()
+        ))
+    }
 
     fn setup_context_dir(tmp: &Path) {
         let ctx = tmp.join(".othala/context");
@@ -942,5 +1150,133 @@ mod tests {
         assert!(content.contains("[... truncated 5 lines]"));
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn parses_skill_frontmatter_fields() {
+        let raw = "---\nname: playwright\ndescription: Browser automation via Playwright\ntags: [browser, testing, automation]\n---\n# Playwright Skill\nDo the work.\n";
+        let (meta, content) = parse_skill_frontmatter(raw);
+
+        assert_eq!(meta.name.as_deref(), Some("playwright"));
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Browser automation via Playwright")
+        );
+        assert_eq!(
+            meta.tags,
+            vec![
+                "browser".to_string(),
+                "testing".to_string(),
+                "automation".to_string()
+            ]
+        );
+        assert_eq!(content, "# Playwright Skill\nDo the work.\n");
+    }
+
+    #[test]
+    fn skill_registry_empty_when_no_skill_dirs() {
+        let _guard = home_env_lock().lock().expect("lock home env");
+        let repo_root = unique_tmp_dir("othala-skill-empty");
+        let home = unique_tmp_dir("othala-skill-empty-home");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&home).expect("create home root");
+
+        std::env::set_var("HOME", &home);
+        let registry = SkillRegistry::discover(&repo_root);
+
+        assert!(registry.list_skills().is_empty());
+
+        fs::remove_dir_all(repo_root).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn skill_registry_load_skill_returns_none_for_missing_name() {
+        let _guard = home_env_lock().lock().expect("lock home env");
+        let repo_root = unique_tmp_dir("othala-skill-missing");
+        let home = unique_tmp_dir("othala-skill-missing-home");
+        let local_skill_dir = repo_root.join(".othala/skills/local");
+        fs::create_dir_all(&local_skill_dir).expect("create local skill dir");
+        fs::create_dir_all(&home).expect("create home root");
+        fs::write(
+            local_skill_dir.join("SKILL.md"),
+            "---\nname: local\ndescription: Local skill\ntags: [a]\n---\n# Local\n",
+        )
+        .expect("write skill");
+
+        std::env::set_var("HOME", &home);
+        let registry = SkillRegistry::discover(&repo_root);
+
+        assert!(registry.load_skill("unknown").is_none());
+
+        fs::remove_dir_all(repo_root).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn skill_registry_discovers_local_and_user_skills() {
+        let _guard = home_env_lock().lock().expect("lock home env");
+        let repo_root = unique_tmp_dir("othala-skill-discover");
+        let home = unique_tmp_dir("othala-skill-discover-home");
+        let local_skill_dir = repo_root.join(".othala/skills/local");
+        let user_skill_dir = home.join(".config/othala/skills/global");
+        fs::create_dir_all(&local_skill_dir).expect("create local skill dir");
+        fs::create_dir_all(&user_skill_dir).expect("create user skill dir");
+
+        fs::write(
+            local_skill_dir.join("SKILL.md"),
+            "---\nname: local\ndescription: Local skill\ntags: [repo]\n---\n# Local\n",
+        )
+        .expect("write local skill");
+        fs::write(
+            user_skill_dir.join("SKILL.md"),
+            "---\nname: global\ndescription: User skill\ntags: [user]\n---\n# Global\n",
+        )
+        .expect("write user skill");
+
+        std::env::set_var("HOME", &home);
+        let registry = SkillRegistry::discover(&repo_root);
+        let names: Vec<String> = registry.list_skills().into_iter().map(|s| s.name).collect();
+
+        assert_eq!(names, vec!["global".to_string(), "local".to_string()]);
+
+        fs::remove_dir_all(repo_root).ok();
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn skill_registry_prefers_local_on_duplicate_name() {
+        let _guard = home_env_lock().lock().expect("lock home env");
+        let repo_root = unique_tmp_dir("othala-skill-duplicate");
+        let home = unique_tmp_dir("othala-skill-duplicate-home");
+        let local_skill_dir = repo_root.join(".othala/skills/playwright");
+        let user_skill_dir = home.join(".config/othala/skills/playwright");
+        fs::create_dir_all(&local_skill_dir).expect("create local skill dir");
+        fs::create_dir_all(&user_skill_dir).expect("create user skill dir");
+
+        fs::write(
+            local_skill_dir.join("SKILL.md"),
+            "---\nname: playwright\ndescription: Local description\ntags: [repo]\n---\n# Local\n",
+        )
+        .expect("write local skill");
+        fs::write(
+            user_skill_dir.join("SKILL.md"),
+            "---\nname: playwright\ndescription: User description\ntags: [user]\n---\n# User\n",
+        )
+        .expect("write user skill");
+
+        std::env::set_var("HOME", &home);
+        let registry = SkillRegistry::discover(&repo_root);
+        let skill = registry
+            .load_skill("playwright")
+            .expect("playwright should exist");
+
+        assert_eq!(skill.description, "Local description");
+        assert_eq!(skill.content, "# Local\n");
+        assert_eq!(skill.tags, vec!["repo".to_string()]);
+        assert_eq!(registry.list_skills().len(), 1);
+
+        fs::remove_dir_all(repo_root).ok();
+        fs::remove_dir_all(home).ok();
     }
 }

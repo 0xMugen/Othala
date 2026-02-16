@@ -1,12 +1,12 @@
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use orch_core::state::TaskState;
-use orch_core::types::{ModelKind, Task, TaskId};
-use std::collections::{HashMap, VecDeque};
+use orch_core::types::{ModelKind, Session, Task, TaskId};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::action::{action_label, map_key_to_command, UiAction, UiCommand};
 use crate::event::TuiEvent;
-use crate::model::{pane_category_of, AgentPane, AgentPaneStatus, DashboardState};
+use crate::model::{pane_category_of, AgentPane, AgentPaneStatus, DashboardState, SessionDisplay};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedAction {
@@ -72,6 +72,9 @@ pub struct TuiApp {
     pub should_quit: bool,
     /// Per-task history of submitted chat messages (most recent last).
     pub chat_history: HashMap<TaskId, Vec<String>>,
+    all_tasks: Vec<crate::model::TaskOverviewRow>,
+    session_task_ids: HashMap<String, Vec<TaskId>>,
+    active_session_id: Option<String>,
 }
 
 impl Default for TuiApp {
@@ -82,25 +85,27 @@ impl Default for TuiApp {
             input_mode: InputMode::Normal,
             should_quit: false,
             chat_history: HashMap::new(),
+            all_tasks: Vec::new(),
+            session_task_ids: HashMap::new(),
+            active_session_id: None,
         }
     }
 }
 
 impl TuiApp {
     pub fn from_tasks(tasks: &[Task]) -> Self {
-        Self {
-            state: DashboardState::with_tasks(tasks),
-            ..Self::default()
-        }
+        let mut app = Self::default();
+        app.set_tasks(tasks);
+        app
     }
 
     pub fn set_tasks(&mut self, tasks: &[Task]) {
         // Build a lookup of existing QA data so we can carry it across refreshes.
         // (QA status is set by QAUpdate events and has no backing in the Task struct.)
         let prev_qa: std::collections::HashMap<_, _> = self
-            .state
-            .tasks
+            .all_tasks
             .iter()
+            .chain(self.state.tasks.iter())
             .filter(|t| {
                 t.qa_status.is_some()
                     || !t.qa_tests.is_empty()
@@ -122,7 +127,7 @@ impl TuiApp {
             })
             .collect();
 
-        self.state.tasks = tasks
+        let rows: Vec<_> = tasks
             .iter()
             .map(|task| {
                 let mut row = crate::model::TaskOverviewRow::from_task(task);
@@ -138,7 +143,61 @@ impl TuiApp {
                 row
             })
             .collect();
+        self.all_tasks = rows;
+        self.apply_active_session_filter();
+    }
+
+    pub fn set_sessions(&mut self, sessions: &[Session]) {
+        self.state.sessions = sessions.iter().map(SessionDisplay::from_session).collect();
+        self.session_task_ids = sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.task_ids.clone()))
+            .collect();
+        self.state.ensure_selected_session_visible();
+
+        if let Some(active) = self.active_session_id.as_ref() {
+            if !self.session_task_ids.contains_key(active) {
+                self.active_session_id = None;
+            }
+        }
+
+        self.apply_active_session_filter();
+    }
+
+    fn apply_active_session_filter(&mut self) {
+        if let Some(session_id) = self.active_session_id.as_ref() {
+            if let Some(task_ids) = self.session_task_ids.get(session_id) {
+                let allowed_ids: HashSet<&str> = task_ids.iter().map(|id| id.0.as_str()).collect();
+                self.state.tasks = self
+                    .all_tasks
+                    .iter()
+                    .filter(|task| allowed_ids.contains(task.task_id.0.as_str()))
+                    .cloned()
+                    .collect();
+            } else {
+                self.active_session_id = None;
+                self.state.tasks = self.all_tasks.clone();
+            }
+        } else {
+            self.state.tasks = self.all_tasks.clone();
+        }
         self.state.ensure_selected_task_visible();
+    }
+
+    fn load_selected_session_tasks(&mut self) {
+        let Some(session) = self.state.selected_session().cloned() else {
+            self.state.status_line = "no sessions available".to_string();
+            return;
+        };
+
+        self.active_session_id = Some(session.id.clone());
+        self.apply_active_session_filter();
+        self.state.show_sessions = false;
+        self.state.status_line = format!(
+            "loaded session {} ({} tasks)",
+            session.id,
+            self.state.tasks.len()
+        );
     }
 
     pub fn set_panes(&mut self, panes: Vec<AgentPane>) {
@@ -187,7 +246,13 @@ impl TuiApp {
 
         if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('S') {
             self.state.sort_mode = self.state.sort_mode.next();
-            self.state.status_line = format!("sort: {}", self.state.sort_mode.label());
+            self.state.show_sessions = !self.state.show_sessions;
+            self.state.ensure_selected_session_visible();
+            self.state.status_line = if self.state.show_sessions {
+                format!("sort: {} | sessions shown", self.state.sort_mode.label())
+            } else {
+                format!("sort: {} | sessions hidden", self.state.sort_mode.label())
+            };
             return;
         }
 
@@ -209,6 +274,40 @@ impl TuiApp {
                 "timeline hidden".to_string()
             };
             return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal)
+            && self.state.show_sessions
+            && !self.state.focused_task
+            && self.state.focused_pane_idx.is_none()
+        {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.state.move_session_selection_previous();
+                    let selected = self
+                        .state
+                        .selected_session()
+                        .map(|session| session.id.as_str())
+                        .unwrap_or("-");
+                    self.state.status_line = format!("session selected: {selected}");
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.state.move_session_selection_next();
+                    let selected = self
+                        .state
+                        .selected_session()
+                        .map(|session| session.id.as_str())
+                        .unwrap_or("-");
+                    self.state.status_line = format!("session selected: {selected}");
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.load_selected_session_tasks();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         if matches!(self.input_mode, InputMode::Normal)
@@ -1016,12 +1115,11 @@ mod tests {
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use orch_core::state::TaskState;
-    use orch_core::types::RepoId;
-    use orch_core::types::{ModelKind, TaskId};
-
+    use orch_core::types::{ModelKind, RepoId, Session, SessionStatus, Task, TaskId};
+    use std::path::PathBuf;
     use crate::{
-        AgentPane, AgentPaneStatus, QueuedAction, SortMode, TaskOverviewRow, TuiApp, TuiEvent,
-        UiAction,
+        AgentPane, AgentPaneStatus, QueuedAction, SessionDisplay, SortMode, TaskOverviewRow,
+        TuiApp, TuiEvent, UiAction,
     };
 
     fn assert_dispatch_action(
@@ -1390,12 +1488,118 @@ mod tests {
     fn s_key_changes_sort_mode() {
         let mut app = TuiApp::default();
         assert_eq!(app.state.sort_mode, SortMode::ByState);
+        assert!(!app.state.show_sessions);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(app.state.sort_mode, SortMode::ByPriority);
+        assert!(app.state.show_sessions);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(app.state.sort_mode, SortMode::ByLastActivity);
+        assert!(!app.state.show_sessions);
+    }
+
+    #[test]
+    fn set_sessions_builds_session_display_rows() {
+        let mut app = TuiApp::default();
+        let now = Utc::now();
+        let sessions = vec![Session {
+            id: "S1".to_string(),
+            title: "Session One".to_string(),
+            created_at: now,
+            updated_at: now,
+            task_ids: vec![TaskId("T1".to_string()), TaskId("T2".to_string())],
+            parent_session_id: None,
+            status: SessionStatus::Active,
+        }];
+
+        app.set_sessions(&sessions);
+        assert_eq!(app.state.sessions.len(), 1);
+        let display = &app.state.sessions[0];
+        assert_eq!(display.id, "S1");
+        assert_eq!(display.title, "Session One");
+        assert_eq!(display.status, SessionStatus::Active);
+        assert_eq!(display.task_count, 2);
+        assert_eq!(display.updated_at, now);
+    }
+
+    #[test]
+    fn up_down_navigates_session_list_when_visible() {
+        let mut app = TuiApp::default();
+        let now = Utc::now();
+        app.state.sessions = vec![
+            SessionDisplay {
+                id: "S1".to_string(),
+                title: "Session One".to_string(),
+                status: SessionStatus::Active,
+                task_count: 1,
+                updated_at: now,
+            },
+            SessionDisplay {
+                id: "S2".to_string(),
+                title: "Session Two".to_string(),
+                status: SessionStatus::Completed,
+                task_count: 2,
+                updated_at: now,
+            },
+        ];
+        app.state.show_sessions = true;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state.session_list_index, 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state.session_list_index, 0);
+    }
+
+    #[test]
+    fn enter_loads_selected_session_tasks_and_hides_sessions() {
+        let mut app = TuiApp::default();
+        let mut task_one = Task::new(
+            TaskId("T1".to_string()),
+            RepoId("example".to_string()),
+            "Task T1".to_string(),
+            PathBuf::from(".orch/wt/T1"),
+        );
+        task_one.updated_at = Utc::now();
+        let mut task_two = Task::new(
+            TaskId("T2".to_string()),
+            RepoId("example".to_string()),
+            "Task T2".to_string(),
+            PathBuf::from(".orch/wt/T2"),
+        );
+        task_two.updated_at = Utc::now();
+        app.set_tasks(&[task_one, task_two]);
+
+        let now = Utc::now();
+        app.set_sessions(&[
+            Session {
+                id: "S1".to_string(),
+                title: "Session One".to_string(),
+                created_at: now,
+                updated_at: now,
+                task_ids: vec![TaskId("T1".to_string())],
+                parent_session_id: None,
+                status: SessionStatus::Active,
+            },
+            Session {
+                id: "S2".to_string(),
+                title: "Session Two".to_string(),
+                created_at: now,
+                updated_at: now,
+                task_ids: vec![TaskId("T2".to_string())],
+                parent_session_id: None,
+                status: SessionStatus::Completed,
+            },
+        ]);
+
+        app.state.show_sessions = true;
+        app.state.session_list_index = 1;
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.state.show_sessions);
+        assert_eq!(app.state.tasks.len(), 1);
+        assert_eq!(app.state.tasks[0].task_id.0, "T2");
     }
 
     #[test]
