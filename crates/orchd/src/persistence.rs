@@ -10,6 +10,16 @@ use std::path::Path;
 use crate::state_machine::task_state_tag;
 use crate::types::{ArtifactRecord, TaskRunRecord};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedTaskRecord {
+    pub task_id: TaskId,
+    pub repo_id: String,
+    pub state_tag: String,
+    pub payload_json: String,
+    pub created_at: DateTime<Utc>,
+    pub archived_at: DateTime<Utc>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
     #[error("sqlite error: {source}")]
@@ -98,6 +108,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS archived_tasks (
+    task_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL,
+    state_tag TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    archived_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_archived_tasks_repo ON archived_tasks(repo_id);
+CREATE INDEX IF NOT EXISTS idx_archived_tasks_archived_at ON archived_tasks(archived_at);
 "#,
         )?;
 
@@ -240,6 +262,81 @@ ON CONFLICT(task_id) DO UPDATE SET
             tasks.push(task);
         }
         Ok(tasks)
+    }
+
+    pub fn archive_task(
+        &self,
+        task: &Task,
+        archived_at: DateTime<Utc>,
+    ) -> Result<(), PersistenceError> {
+        let payload = serde_json::to_string(task)?;
+        self.conn.execute(
+            r#"
+INSERT INTO archived_tasks (task_id, repo_id, state_tag, payload_json, created_at, archived_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(task_id) DO UPDATE SET
+  repo_id = excluded.repo_id,
+  state_tag = excluded.state_tag,
+  payload_json = excluded.payload_json,
+  created_at = excluded.created_at,
+  archived_at = excluded.archived_at
+"#,
+            params![
+                task.id.0,
+                task.repo_id.0,
+                task_state_tag(task.state),
+                payload,
+                task.created_at.to_rfc3339(),
+                archived_at.to_rfc3339(),
+            ],
+        )?;
+        self.conn
+            .execute("DELETE FROM tasks WHERE task_id = ?1", params![task.id.0.as_str()])?;
+        Ok(())
+    }
+
+    pub fn list_archived(&self) -> Result<Vec<ArchivedTaskRecord>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, repo_id, state_tag, payload_json, created_at, archived_at FROM archived_tasks ORDER BY archived_at DESC, task_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut archived = Vec::new();
+        for row in rows {
+            let (task_id, repo_id, state_tag, payload_json, created_at_raw, archived_at_raw) = row?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|source| PersistenceError::TimestampParse {
+                    value: created_at_raw,
+                    source,
+                })?;
+            let archived_at = DateTime::parse_from_rfc3339(&archived_at_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|source| PersistenceError::TimestampParse {
+                    value: archived_at_raw,
+                    source,
+                })?;
+
+            archived.push(ArchivedTaskRecord {
+                task_id: TaskId::new(task_id),
+                repo_id,
+                state_tag,
+                payload_json,
+                created_at,
+                archived_at,
+            });
+        }
+
+        Ok(archived)
     }
 
     // --- Events ---
@@ -709,5 +806,36 @@ mod tests {
             .expect("list");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].estimated_tokens, Some(777));
+    }
+
+    #[test]
+    fn archive_table_created() {
+        let store = mk_store();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='archived_tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn archive_task_moves_row_to_archive_table() {
+        let store = mk_store();
+        let task = mk_task("T-ARCHIVE-1", TaskState::Merged);
+        store.upsert_task(&task).expect("upsert");
+
+        store
+            .archive_task(&task, Utc::now())
+            .expect("archive task should succeed");
+
+        assert!(store.load_task(&task.id).expect("load").is_none());
+        let archived = store.list_archived().expect("list archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].task_id, task.id);
+        assert_eq!(archived[0].state_tag, "MERGED");
     }
 }

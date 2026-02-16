@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use orch_core::state::{TaskState, VerifyStatus};
 use orch_core::types::{ModelKind, RepoId, Task, TaskId};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Display-friendly QA test result for the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +46,12 @@ pub struct TaskOverviewRow {
     pub retry_count: u32,
     #[serde(default)]
     pub retry_history: Vec<RetryEntry>,
+    #[serde(default)]
+    pub depends_on_display: Vec<String>,
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    #[serde(default)]
+    pub model_display: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,6 +93,9 @@ impl TaskOverviewRow {
             estimated_cost_usd: None,
             retry_count: task.retry_count,
             retry_history: Vec::new(),
+            depends_on_display: task.depends_on.iter().map(|d| d.0.clone()).collect(),
+            pr_url: task.pr.as_ref().map(|p| p.url.clone()),
+            model_display: task.preferred_model.map(|m| m.as_str().to_string()),
         }
     }
 }
@@ -357,6 +366,34 @@ impl DashboardState {
         }
     }
 
+    pub fn state_summary(&self) -> String {
+        let mut counts: HashMap<TaskState, usize> = HashMap::new();
+        for task in &self.tasks {
+            *counts.entry(task.state).or_default() += 1;
+        }
+
+        let ordered_states = [
+            TaskState::Chatting,
+            TaskState::Ready,
+            TaskState::Submitting,
+            TaskState::Restacking,
+            TaskState::AwaitingMerge,
+            TaskState::Merged,
+            TaskState::Stopped,
+        ];
+
+        let parts: Vec<String> = ordered_states
+            .iter()
+            .filter_map(|state| {
+                counts
+                    .get(state)
+                    .map(|count| format!("{count} {}", task_state_label(*state)))
+            })
+            .collect();
+
+        parts.join(" | ")
+    }
+
     pub fn selected_task(&self) -> Option<&TaskOverviewRow> {
         self.tasks.get(self.selected_task_idx)
     }
@@ -623,6 +660,18 @@ impl DashboardState {
     }
 }
 
+fn task_state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Chatting => "chatting",
+        TaskState::Ready => "ready",
+        TaskState::Submitting => "submitting",
+        TaskState::Restacking => "restacking",
+        TaskState::AwaitingMerge => "awaiting_merge",
+        TaskState::Merged => "merged",
+        TaskState::Stopped => "stopped",
+    }
+}
+
 /// Produce a user-facing state label.
 pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> String {
     match state {
@@ -713,6 +762,33 @@ mod tests {
     }
 
     #[test]
+    fn task_row_includes_pr_url() {
+        use orch_core::types::PullRequestRef;
+
+        let mut task = mk_task("T1");
+        task.pr = Some(PullRequestRef {
+            number: 42,
+            url: "https://github.com/example/repo/pull/42".to_string(),
+            draft: false,
+        });
+
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(
+            row.pr_url.as_deref(),
+            Some("https://github.com/example/repo/pull/42")
+        );
+    }
+
+    #[test]
+    fn task_row_includes_dependencies() {
+        let mut task = mk_task("T1");
+        task.depends_on = vec![TaskId("task-1".to_string()), TaskId("task-2".to_string())];
+
+        let row = TaskOverviewRow::from_task(&task);
+        assert_eq!(row.depends_on_display, vec!["task-1", "task-2"]);
+    }
+
+    #[test]
     fn retry_history_default_empty() {
         let value = serde_json::json!({
             "task_id": "T1",
@@ -720,7 +796,7 @@ mod tests {
             "title": "Task T1",
             "branch": "task/T1",
             "stack_position": null,
-            "state": "chatting",
+            "state": "CHATTING",
             "display_state": "Chatting",
             "verify_summary": "not_run",
             "last_activity": "2026-02-01T00:00:00Z",
@@ -744,6 +820,33 @@ mod tests {
     fn dashboard_model_health_default() {
         let state = DashboardState::default();
         assert!(state.model_health.is_empty());
+    }
+
+    #[test]
+    fn state_summary_counts_tasks() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Task 1", TaskState::Chatting),
+                mk_row("T2", "Task 2", TaskState::Chatting),
+                mk_row("T3", "Task 3", TaskState::Chatting),
+                mk_row("T4", "Task 4", TaskState::Ready),
+                mk_row("T5", "Task 5", TaskState::Merged),
+                mk_row("T6", "Task 6", TaskState::Merged),
+                mk_row("T7", "Task 7", TaskState::Stopped),
+            ],
+            ..DashboardState::default()
+        };
+
+        assert_eq!(
+            state.state_summary(),
+            "3 chatting | 1 ready | 2 merged | 1 stopped"
+        );
+    }
+
+    #[test]
+    fn state_summary_empty_tasks() {
+        let state = DashboardState::default();
+        assert_eq!(state.state_summary(), "");
     }
 
     #[test]

@@ -253,6 +253,9 @@ pub enum DaemonAction {
     MarkReady {
         task_id: TaskId,
     },
+    MarkMerged {
+        task_id: TaskId,
+    },
     /// Record that a task needs human intervention.
     RecordNeedsHuman {
         task_id: TaskId,
@@ -502,7 +505,17 @@ pub fn daemon_tick(
         .restack_retries
         .retain(|task_id, _| daemon_state.pipelines.contains_key(task_id));
 
-    // --- Phase 4: Context generation ---
+    if let Ok(awaiting) = service.list_tasks_by_state(TaskState::AwaitingMerge) {
+        for task in &awaiting {
+            if let Some(pr) = &task.pr {
+                if check_pr_merged(pr.number, &config.repo_root) {
+                    actions.push(DaemonAction::MarkMerged {
+                        task_id: task.id.clone(),
+                    });
+                }
+            }
+        }
+    }
 
     // Poll any running context gen process.
     let was_context_regen_running = daemon_state.context_gen.status == ContextGenStatus::Running;
@@ -522,6 +535,7 @@ pub fn daemon_tick(
     // or git hash mismatch (cheap check — file read + git rev-parse).
     let has_trigger = actions.iter().any(|a| {
         matches!(a, DaemonAction::MarkReady { .. })
+            || matches!(a, DaemonAction::MarkMerged { .. })
             || matches!(
                 a,
                 DaemonAction::ExecutePipeline {
@@ -772,6 +786,29 @@ fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
     ))
 }
 
+fn is_gh_pr_state_merged(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).trim() == "MERGED"
+}
+
+fn check_pr_merged(pr_number: u64, repo_root: &Path) -> bool {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ])
+        .current_dir(repo_root)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => is_gh_pr_state_merged(&o.stdout),
+        _ => false,
+    }
+}
+
 fn get_worktree_head_sha(path: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -988,6 +1025,21 @@ pub fn execute_actions(
                 match service.mark_ready(task_id, event_id, now) {
                     Ok(_) => eprintln!("[daemon] {} -> Ready", task_id.0),
                     Err(e) => eprintln!("[daemon] Failed to mark {} ready: {}", task_id.0, e),
+                }
+            }
+            DaemonAction::MarkMerged { task_id } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would mark {} merged", task_id.0);
+                    continue;
+                }
+                let event_id = EventId(format!(
+                    "E-MERGED-{}-{}",
+                    task_id.0,
+                    now.timestamp_nanos_opt().unwrap_or_default()
+                ));
+                match service.mark_merged(task_id, event_id, now) {
+                    Ok(_) => eprintln!("[daemon] {} -> Merged", task_id.0),
+                    Err(e) => eprintln!("[daemon] Failed to mark {} merged: {}", task_id.0, e),
                 }
             }
             DaemonAction::RecordNeedsHuman { task_id, reason } => {
@@ -2409,6 +2461,40 @@ agent_timeout_secs = {agent_timeout_secs}
         assert!(actions
             .iter()
             .any(|a| matches!(a, DaemonAction::RecordNeedsHuman { .. })));
+    }
+
+    #[test]
+    fn check_pr_merged_parses_state() {
+        assert!(is_gh_pr_state_merged(b"MERGED\n"));
+        assert!(!is_gh_pr_state_merged(b"OPEN\n"));
+        assert!(!is_gh_pr_state_merged(b"CLOSED\n"));
+    }
+
+    #[test]
+    fn mark_merged_action_transitions_state() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let mut task = mk_task("T-MERGE-1");
+        task.state = TaskState::AwaitingMerge;
+        task.pr = Some(orch_core::types::PullRequestRef {
+            number: 42,
+            url: "https://example.test/pr/42".to_string(),
+            draft: false,
+        });
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let actions = vec![DaemonAction::MarkMerged {
+            task_id: task.id.clone(),
+        }];
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+
+        let updated = service.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(updated.state, TaskState::Merged);
     }
 
     #[test]

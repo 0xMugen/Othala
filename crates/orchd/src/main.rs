@@ -21,7 +21,7 @@ use orchd::{
     provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::io::ErrorKind;
@@ -41,6 +41,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
     CreateTask {
         /// Repository ID
         #[arg(short, long)]
@@ -60,6 +64,10 @@ enum Commands {
         /// Chat/task ID
         id: String,
         priority: String,
+    },
+    Bulk {
+        #[command(subcommand)]
+        action: BulkAction,
     },
     /// Create a new chat (AI coding session)
     Chat {
@@ -217,6 +225,14 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    Archive {
+        /// Only archive tasks older than N days
+        #[arg(long, default_value = "7")]
+        older_than_days: i64,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +257,26 @@ enum ChatAction {
         /// Output as JSON (for scripting/E2E tests)
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BulkAction {
+    Retry {
+        #[arg(long)]
+        state: Option<String>,
+        ids: Vec<String>,
+    },
+    Cancel {
+        #[arg(long)]
+        state: Option<String>,
+        ids: Vec<String>,
+    },
+    SetPriority {
+        priority: String,
+        #[arg(long)]
+        state: Option<String>,
+        ids: Vec<String>,
     },
 }
 
@@ -668,6 +704,197 @@ fn parse_model_name(s: &str) -> Option<ModelKind> {
 
 fn parse_task_priority(s: &str) -> anyhow::Result<TaskPriority> {
     s.parse::<TaskPriority>().map_err(|e| anyhow::anyhow!(e))
+}
+
+fn parse_task_state_filter(value: &str) -> anyhow::Result<TaskState> {
+    match value.trim().to_lowercase().replace('-', "_").as_str() {
+        "chatting" => Ok(TaskState::Chatting),
+        "ready" => Ok(TaskState::Ready),
+        "submitting" => Ok(TaskState::Submitting),
+        "restacking" => Ok(TaskState::Restacking),
+        "awaiting_merge" => Ok(TaskState::AwaitingMerge),
+        "merged" => Ok(TaskState::Merged),
+        "stopped" => Ok(TaskState::Stopped),
+        other => anyhow::bail!("unknown state filter: {other}"),
+    }
+}
+
+fn set_priority(service: &OrchdService, task_id: &TaskId, priority: TaskPriority) -> anyhow::Result<()> {
+    let Some(mut task) = service.task(task_id)? else {
+        anyhow::bail!("task not found: {}", task_id.0);
+    };
+    task.priority = priority;
+    task.updated_at = Utc::now();
+    service.store.upsert_task(&task)?;
+    Ok(())
+}
+
+fn init_project(repo_root: &Path, force: bool) -> anyhow::Result<Vec<String>> {
+    let othala_dir = repo_root.join(".othala");
+    let config_path = othala_dir.join("config.toml");
+    let context_dir = othala_dir.join("context");
+    let main_context_path = context_dir.join("MAIN.md");
+    let templates_dir = othala_dir.join("templates");
+
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists (pass --force to overwrite)",
+            config_path.display()
+        );
+    }
+
+    let mut actions = Vec::new();
+
+    if !othala_dir.exists() {
+        std::fs::create_dir_all(&othala_dir)?;
+        actions.push("Created .othala/".to_string());
+    }
+    if !context_dir.exists() {
+        std::fs::create_dir_all(&context_dir)?;
+        actions.push("Created .othala/context/".to_string());
+    }
+    if !templates_dir.exists() {
+        std::fs::create_dir_all(&templates_dir)?;
+        actions.push("Created .othala/templates/".to_string());
+    }
+
+    let config_existed = config_path.exists();
+    let org_config = default_org_config(vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini]);
+    save_org_config(&config_path, &org_config)?;
+    if config_existed {
+        actions.push("Overwrote .othala/config.toml".to_string());
+    } else {
+        actions.push("Created .othala/config.toml".to_string());
+    }
+
+    let context_existed = main_context_path.exists();
+    if force || !context_existed {
+        std::fs::write(
+            &main_context_path,
+            "# Project Context\n\nDescribe your project here.\n",
+        )?;
+        if context_existed {
+            actions.push("Overwrote .othala/context/MAIN.md".to_string());
+        } else {
+            actions.push("Created .othala/context/MAIN.md".to_string());
+        }
+    }
+
+    Ok(actions)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BulkSummary {
+    processed: usize,
+    succeeded: usize,
+    skipped: usize,
+}
+
+fn select_bulk_tasks(
+    service: &OrchdService,
+    state: Option<&str>,
+    ids: &[String],
+) -> anyhow::Result<Vec<Task>> {
+    let state_filter = match state {
+        Some(value) => Some(parse_task_state_filter(value)?),
+        None => None,
+    };
+    let id_filter: HashSet<&str> = ids.iter().map(String::as_str).collect();
+
+    let tasks = service
+        .list_tasks()?
+        .into_iter()
+        .filter(|task| match state_filter {
+            Some(wanted) => task.state == wanted,
+            None => true,
+        })
+        .filter(|task| id_filter.is_empty() || id_filter.contains(task.id.0.as_str()))
+        .collect();
+
+    Ok(tasks)
+}
+
+fn bulk_retry(
+    service: &OrchdService,
+    state: Option<&str>,
+    ids: &[String],
+) -> anyhow::Result<BulkSummary> {
+    let tasks = select_bulk_tasks(service, state, ids)?;
+    let mut summary = BulkSummary {
+        processed: tasks.len(),
+        succeeded: 0,
+        skipped: 0,
+    };
+
+    for task in tasks {
+        let now = Utc::now();
+        let event_id = EventId(format!("E-BULK-RETRY-{}-{}", task.id.0, now.timestamp_millis()));
+        if service
+            .transition_task_state(&task.id, TaskState::Chatting, event_id, now)
+            .is_err()
+        {
+            summary.skipped += 1;
+            continue;
+        }
+
+        let Some(mut updated) = service.task(&task.id)? else {
+            summary.skipped += 1;
+            continue;
+        };
+        updated.retry_count = 0;
+        updated.updated_at = Utc::now();
+        service.store.upsert_task(&updated)?;
+        summary.succeeded += 1;
+    }
+
+    Ok(summary)
+}
+
+fn bulk_cancel(
+    service: &OrchdService,
+    state: Option<&str>,
+    ids: &[String],
+) -> anyhow::Result<BulkSummary> {
+    let tasks = select_bulk_tasks(service, state, ids)?;
+    let mut summary = BulkSummary {
+        processed: tasks.len(),
+        succeeded: 0,
+        skipped: 0,
+    };
+
+    for task in tasks {
+        if cancel_task(service, &task.id, "requested by user").is_ok() {
+            summary.succeeded += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    Ok(summary)
+}
+
+fn bulk_set_priority(
+    service: &OrchdService,
+    priority: TaskPriority,
+    state: Option<&str>,
+    ids: &[String],
+) -> anyhow::Result<BulkSummary> {
+    let tasks = select_bulk_tasks(service, state, ids)?;
+    let mut summary = BulkSummary {
+        processed: tasks.len(),
+        succeeded: 0,
+        skipped: 0,
+    };
+
+    for task in tasks {
+        if set_priority(service, &task.id, priority).is_ok() {
+            summary.succeeded += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    Ok(summary)
 }
 
 fn create_task_command(
@@ -1406,6 +1633,24 @@ fn cancel_task(service: &OrchdService, task_id: &TaskId, reason: &str) -> anyhow
     Ok(from_state)
 }
 
+fn archive_old_tasks(service: &OrchdService, older_than_days: i64) -> anyhow::Result<usize> {
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::days(older_than_days);
+    let tasks = service.list_tasks()?;
+
+    let mut archived = 0usize;
+    for task in tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Merged | TaskState::Stopped))
+        .filter(|task| task.updated_at < cutoff)
+    {
+        service.store.archive_task(task, now)?;
+        archived += 1;
+    }
+
+    Ok(archived)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1432,6 +1677,13 @@ fn main() -> anyhow::Result<()> {
     let mut service = OrchdService::open(&db_path, &event_log_path, scheduler)?;
 
     match cli.command {
+        Commands::Init { force } => {
+            let repo_root = std::env::current_dir()?;
+            let actions = init_project(&repo_root, force)?;
+            for action in actions {
+                println!("{action}");
+            }
+        }
         Commands::CreateTask {
             repo,
             title,
@@ -1450,13 +1702,28 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::SetPriority { id, priority } => {
             let task_id = TaskId::new(&id);
-            let Some(mut task) = service.task(&task_id)? else {
-                anyhow::bail!("task not found: {id}");
+            let parsed = parse_task_priority(&priority)?;
+            set_priority(&service, &task_id, parsed)?;
+            println!("Updated priority: {} -> {}", task_id.0, parsed);
+        }
+        Commands::Bulk { action } => {
+            let summary = match action {
+                BulkAction::Retry { state, ids } => bulk_retry(&service, state.as_deref(), &ids)?,
+                BulkAction::Cancel { state, ids } => bulk_cancel(&service, state.as_deref(), &ids)?,
+                BulkAction::SetPriority {
+                    priority,
+                    state,
+                    ids,
+                } => {
+                    let parsed = parse_task_priority(&priority)?;
+                    bulk_set_priority(&service, parsed, state.as_deref(), &ids)?
+                }
             };
-            task.priority = parse_task_priority(&priority)?;
-            task.updated_at = Utc::now();
-            service.store.upsert_task(&task)?;
-            println!("Updated priority: {} -> {}", task.id.0, task.priority);
+
+            println!(
+                "Processed {} tasks, {} succeeded, {} skipped",
+                summary.processed, summary.succeeded, summary.skipped
+            );
         }
         Commands::Chat { action } => match action {
             ChatAction::New {
@@ -2307,6 +2574,20 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Archive {
+            older_than_days,
+            json,
+        } => {
+            let archived = archive_old_tasks(&service, older_than_days)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "archived": archived }))?
+                );
+            } else {
+                println!("Archived {} tasks", archived);
+            }
+        }
     }
 
     Ok(())
@@ -2425,7 +2706,7 @@ fn format_event_kind(kind: &EventKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use orchd::event_log::JsonlEventLog;
     use orchd::persistence::SqliteStore;
     use orchd::scheduler::SchedulerConfig;
@@ -2465,6 +2746,44 @@ mod tests {
             }
             _ => panic!("expected set-priority command"),
         }
+    }
+
+    #[test]
+    fn init_creates_directory_structure() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-init-structure-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+
+        init_project(&root, false).expect("initialize project");
+
+        assert!(root.join(".othala").is_dir());
+        assert!(root.join(".othala/context").is_dir());
+        assert!(root.join(".othala/templates").is_dir());
+        assert!(root.join(".othala/config.toml").is_file());
+        assert!(root.join(".othala/context/MAIN.md").is_file());
+        assert_eq!(
+            fs::read_to_string(root.join(".othala/context/MAIN.md")).expect("read main context"),
+            "# Project Context\n\nDescribe your project here.\n"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn init_refuses_overwrite_without_force() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-init-no-force-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+
+        init_project(&root, false).expect("initialize project");
+        let err = init_project(&root, false).expect_err("should reject overwrite");
+        assert!(err.to_string().contains("already exists"));
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2821,6 +3140,208 @@ mod tests {
                 EventKind::CancellationRequested { reason } if reason == "requested by user"
             )
         }));
+    }
+
+    #[test]
+    fn bulk_cancel_by_state() {
+        let service = mk_test_service();
+        let task_a = mk_task("T-BULK-CANCEL-A", TaskState::Chatting);
+        let task_b = mk_task("T-BULK-CANCEL-B", TaskState::Chatting);
+        let task_c = mk_task("T-BULK-CANCEL-C", TaskState::Ready);
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+        service
+            .create_task(&task_c, &mk_created_event(&task_c))
+            .expect("create task c");
+
+        let ids = Vec::new();
+        let summary = bulk_cancel(&service, Some("chatting"), &ids).expect("bulk cancel");
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.skipped, 0);
+
+        assert_eq!(
+            service
+                .task(&task_a.id)
+                .expect("load a")
+                .expect("a exists")
+                .state,
+            TaskState::Stopped
+        );
+        assert_eq!(
+            service
+                .task(&task_b.id)
+                .expect("load b")
+                .expect("b exists")
+                .state,
+            TaskState::Stopped
+        );
+        assert_eq!(
+            service
+                .task(&task_c.id)
+                .expect("load c")
+                .expect("c exists")
+                .state,
+            TaskState::Ready
+        );
+    }
+
+    #[test]
+    fn bulk_retry_by_ids() {
+        let service = mk_test_service();
+        let mut task_a = mk_task("T-BULK-RETRY-A", TaskState::Stopped);
+        task_a.retry_count = 3;
+        let mut task_b = mk_task("T-BULK-RETRY-B", TaskState::Ready);
+        task_b.retry_count = 1;
+        let mut task_c = mk_task("T-BULK-RETRY-C", TaskState::Merged);
+        task_c.retry_count = 2;
+
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+        service
+            .create_task(&task_c, &mk_created_event(&task_c))
+            .expect("create task c");
+
+        let ids = vec!["T-BULK-RETRY-A".to_string(), "T-BULK-RETRY-B".to_string()];
+        let summary = bulk_retry(&service, None, &ids).expect("bulk retry");
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.skipped, 0);
+
+        let updated_a = service.task(&task_a.id).expect("load a").expect("a exists");
+        let updated_b = service.task(&task_b.id).expect("load b").expect("b exists");
+        let updated_c = service.task(&task_c.id).expect("load c").expect("c exists");
+        assert_eq!(updated_a.state, TaskState::Chatting);
+        assert_eq!(updated_a.retry_count, 0);
+        assert_eq!(updated_b.state, TaskState::Chatting);
+        assert_eq!(updated_b.retry_count, 0);
+        assert_eq!(updated_c.state, TaskState::Merged);
+        assert_eq!(updated_c.retry_count, 2);
+    }
+
+    #[test]
+    fn bulk_set_priority_by_state() {
+        let service = mk_test_service();
+        let mut task_a = mk_task("T-BULK-PRIO-A", TaskState::Stopped);
+        task_a.priority = TaskPriority::Low;
+        let mut task_b = mk_task("T-BULK-PRIO-B", TaskState::Stopped);
+        task_b.priority = TaskPriority::Normal;
+        let mut task_c = mk_task("T-BULK-PRIO-C", TaskState::Ready);
+        task_c.priority = TaskPriority::Low;
+
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+        service
+            .create_task(&task_c, &mk_created_event(&task_c))
+            .expect("create task c");
+
+        let ids = Vec::new();
+        let summary =
+            bulk_set_priority(&service, TaskPriority::Critical, Some("stopped"), &ids)
+                .expect("bulk set-priority");
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.skipped, 0);
+
+        assert_eq!(
+            service
+                .task(&task_a.id)
+                .expect("load a")
+                .expect("a exists")
+                .priority,
+            TaskPriority::Critical
+        );
+        assert_eq!(
+            service
+                .task(&task_b.id)
+                .expect("load b")
+                .expect("b exists")
+                .priority,
+            TaskPriority::Critical
+        );
+        assert_eq!(
+            service
+                .task(&task_c.id)
+                .expect("load c")
+                .expect("c exists")
+                .priority,
+            TaskPriority::Low
+        );
+    }
+
+    #[test]
+    fn archive_cli_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "othala",
+            "archive",
+            "--older-than-days",
+            "14",
+            "--json",
+        ])
+        .expect("parse archive");
+
+        match cli.command {
+            Commands::Archive {
+                older_than_days,
+                json,
+            } => {
+                assert_eq!(older_than_days, 14);
+                assert!(json);
+            }
+            _ => panic!("expected archive command"),
+        }
+    }
+
+    #[test]
+    fn archive_moves_old_tasks() {
+        let service = mk_test_service();
+        let mut old_task = mk_task("T-ARCH-MOVE-1", TaskState::Merged);
+        old_task.updated_at = Utc::now() - Duration::days(30);
+        service
+            .create_task(&old_task, &mk_created_event(&old_task))
+            .expect("create task");
+
+        let archived = archive_old_tasks(&service, 7).expect("archive should succeed");
+        assert_eq!(archived, 1);
+        assert!(service.task(&old_task.id).expect("load task").is_none());
+
+        let archived_rows = service.store.list_archived().expect("list archived");
+        assert_eq!(archived_rows.len(), 1);
+        assert_eq!(archived_rows[0].task_id, old_task.id);
+    }
+
+    #[test]
+    fn archive_skips_recent_tasks() {
+        let service = mk_test_service();
+        let mut recent_task = mk_task("T-ARCH-SKIP-1", TaskState::Stopped);
+        recent_task.updated_at = Utc::now() - Duration::days(1);
+        service
+            .create_task(&recent_task, &mk_created_event(&recent_task))
+            .expect("create task");
+
+        let archived = archive_old_tasks(&service, 7).expect("archive should succeed");
+        assert_eq!(archived, 0);
+        assert!(service
+            .task(&recent_task.id)
+            .expect("load task")
+            .is_some());
+        assert!(service
+            .store
+            .list_archived()
+            .expect("list archived")
+            .is_empty());
     }
 
     #[test]

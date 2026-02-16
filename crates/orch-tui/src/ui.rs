@@ -18,9 +18,10 @@ use crate::ui_footer::wrapped_visual_line_count;
 use crate::ui_footer::{build_footer_content, footer_height};
 use crate::ui_format::{
     divider_line, format_category_tabs, format_task_row, pane_meta_lines, status_sidebar_lines,
+    to_local_time,
 };
 #[cfg(test)]
-use crate::ui_format::{format_pane_tabs, pane_status_tag, status_line_color, to_local_time};
+use crate::ui_format::{format_pane_tabs, pane_status_tag, status_line_color};
 
 // -- Color palette ----------------------------------------------------------
 
@@ -475,6 +476,38 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         status_lines.push(Line::from(vec![
             Span::styled(task_cost_summary(task, model_hint), Style::default().fg(MUTED)),
         ]));
+        let timestamp = to_local_time(task.last_activity);
+        status_lines.push(Line::from(""));
+        status_lines.push(Line::from(vec![
+            Span::styled("Branch: ", Style::default().fg(DIM)),
+            Span::styled(task.branch.clone(), Style::default().fg(HEADER_FG)),
+        ]));
+        if !task.depends_on_display.is_empty() {
+            status_lines.push(Line::from(vec![
+                Span::styled("Deps: ", Style::default().fg(DIM)),
+                Span::styled(task.depends_on_display.join(", "), Style::default().fg(HEADER_FG)),
+            ]));
+        }
+        if let Some(pr_url) = &task.pr_url {
+            status_lines.push(Line::from(vec![
+                Span::styled("PR: ", Style::default().fg(DIM)),
+                Span::styled(pr_url.clone(), Style::default().fg(ACCENT)),
+            ]));
+        }
+        if let Some(model) = &task.model_display {
+            status_lines.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(DIM)),
+                Span::styled(model.clone(), Style::default().fg(HEADER_FG)),
+            ]));
+        }
+        status_lines.push(Line::from(vec![
+            Span::styled("Created: ", Style::default().fg(DIM)),
+            Span::styled(timestamp.clone(), Style::default().fg(MUTED)),
+        ]));
+        status_lines.push(Line::from(vec![
+            Span::styled("Updated: ", Style::default().fg(DIM)),
+            Span::styled(timestamp, Style::default().fg(MUTED)),
+        ]));
     }
     let status_widget = Paragraph::new(status_lines)
     .block(focused_block(&status_title))
@@ -597,7 +630,11 @@ fn render_new_task_dialog_modal(
     title: &str,
     model: &str,
 ) {
-    let area = centered_rect(60, 36, frame.area());
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(10), Constraint::Min(0)])
+        .split(frame.area());
+    let area = centered_rect(60, 100, rows[1]);
 
     let selected_style = Style::default()
         .fg(Color::Black)
@@ -647,66 +684,37 @@ fn render_new_task_dialog_modal(
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>) {
-    let area = centered_rect(60, 80, frame.area());
-    let shortcuts = [
-        ("?", "Help"),
-        ("Esc", "Quit / Back"),
-        ("Ctrl+C", "Force quit"),
-        ("Up/Down", "Navigate tasks"),
-        ("Left/Right", "Navigate panes"),
-        ("Tab", "Toggle focus"),
-        ("Enter", "Toggle task detail"),
-        ("/", "Filter text"),
-        ("F", "Cycle state filter"),
-        ("c", "Create task"),
-        ("N", "New task dialog"),
-        ("a", "Approve task"),
-        ("g", "Submit to Graphite"),
-        ("s", "Start agent"),
-        ("x", "Stop agent"),
-        ("r", "Restart agent"),
-        ("d", "Delete task"),
-        ("q", "Quick verify"),
-        ("f", "Full verify"),
-        ("t", "Trigger restack"),
-        ("n", "Mark needs human"),
-        ("w", "Open web UI"),
-        ("p", "Pause task"),
-        ("u", "Resume task"),
-        ("i", "Chat input"),
+    let area = centered_rect(72, 86, frame.area());
+    let lines = vec![
+        Line::from(Span::styled(
+            "KEYBOARD SHORTCUTS",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "──────────────────",
+            Style::default().fg(DIM),
+        )),
+        Line::from("Navigation:"),
+        Line::from("  j/↓    Move down          k/↑    Move up"),
+        Line::from("  Enter  Focus/unfocus      Esc    Back/quit"),
+        Line::from(""),
+        Line::from("Tasks:"),
+        Line::from("  n      New task            d      Delete task"),
+        Line::from("  s      Stop task           r      Resume task"),
+        Line::from(""),
+        Line::from("Filtering:"),
+        Line::from("  /      Text filter         F      State filter"),
+        Line::from(""),
+        Line::from("Views:"),
+        Line::from("  Tab    Switch pane         1-9    Jump to pane"),
+        Line::from("  PgUp   Scroll up           PgDn   Scroll down"),
+        Line::from(""),
+        Line::from("Other:"),
+        Line::from("  ?      This help           q      Quit"),
+        Line::from("  Ctrl+C Force quit"),
+        Line::from(""),
+        Line::from(Span::styled("Press ? or Esc to close", Style::default().fg(DIM))),
     ];
-
-    let mut lines = Vec::with_capacity(shortcuts.len() + 4);
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<12}", "Key"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "Action",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "-".repeat(46),
-        Style::default().fg(DIM),
-    )));
-
-    for (key, description) in shortcuts {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{key:<12}"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(description, Style::default().fg(HEADER_FG)),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press ? or Esc to close",
-        Style::default().fg(DIM),
-    )));
 
     let widget = Paragraph::new(lines)
         .block(focused_block("Keyboard Shortcuts"))
@@ -769,6 +777,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }
     }
 

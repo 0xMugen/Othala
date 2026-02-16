@@ -1041,6 +1041,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -1059,6 +1062,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
         ];
         app.state.selected_task_idx = 1;
@@ -1125,6 +1131,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -1146,6 +1155,15 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
 
         assert!(matches!(app.input_mode, super::InputMode::HelpOverlay));
+    }
+
+    #[test]
+    fn help_overlay_renders() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::HelpOverlay));
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -1281,6 +1299,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.state.focused_task = true;
 
@@ -1372,6 +1393,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -1538,6 +1562,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -1585,6 +1612,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -1657,6 +1687,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         // Set a focused pane to verify it gets cleared
@@ -1726,6 +1759,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.apply_event(TuiEvent::QAUpdate {
@@ -1788,6 +1824,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         // Press 'i' to enter chat input mode
@@ -1850,6 +1889,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1883,6 +1925,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1918,6 +1963,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1955,6 +2003,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1994,6 +2045,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -2036,6 +2090,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -2078,6 +2135,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
 
         // Simulate a TasksReplaced event (same task, fresh data from DB).
@@ -2179,6 +2239,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.state.focused_task = true;
         assert_eq!(
@@ -2225,6 +2288,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2295,6 +2361,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.state.focused_pane_idx = Some(0);
 
@@ -2328,6 +2397,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2380,6 +2452,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2419,6 +2494,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -2437,6 +2515,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
         ];
         app.apply_event(TuiEvent::AgentPaneOutput {
@@ -2501,6 +2582,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -2519,6 +2603,9 @@ mod tests {
                 estimated_cost_usd: None,
                 retry_count: 0,
                 retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
             },
         ];
         // No panes at all
@@ -2551,7 +2638,10 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
-            retry_history: Vec::new(),
+                retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2636,7 +2726,10 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
-            retry_history: Vec::new(),
+                retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2675,7 +2768,10 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
-            retry_history: Vec::new(),
+                retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2732,7 +2828,10 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
-            retry_history: Vec::new(),
+                retry_history: Vec::new(),
+                depends_on_display: Vec::new(),
+                pr_url: None,
+                model_display: None,
         }];
         app.state.focused_task = true;
 
@@ -2797,6 +2896,9 @@ mod tests {
             estimated_cost_usd: None,
             retry_count: 0,
             retry_history: Vec::new(),
+            depends_on_display: Vec::new(),
+            pr_url: None,
+            model_display: None,
         }
     }
 

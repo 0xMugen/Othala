@@ -185,6 +185,14 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
             Style::default().fg(DIM),
         ));
     }
+    let state_summary = app.state.state_summary();
+    if !state_summary.is_empty() {
+        spans.push(Span::styled(" | tasks: ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            state_summary,
+            Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some((activity, color)) = footer_activity_indicator(app) {
         spans.push(Span::styled(" | thinking: ", Style::default().fg(DIM)));
         spans.push(Span::styled(
