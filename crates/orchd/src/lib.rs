@@ -8,7 +8,9 @@ pub mod daemon_loop;
 pub mod dependency_graph;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod event_log;
+pub mod mcp;
 pub mod persistence;
+pub mod permissions;
 pub mod prompt_builder;
 pub mod qa_agent;
 pub mod qa_spec_gen;
@@ -26,6 +28,7 @@ pub use context_graph::*;
 pub use dependency_graph::*;
 pub use event_log::*;
 pub use persistence::*;
+pub use permissions::*;
 pub use scheduler::*;
 pub use service::*;
 pub use state_machine::*;

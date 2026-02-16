@@ -1,7 +1,7 @@
 //! Configuration types for the MVP orchestrator.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -107,6 +107,8 @@ pub struct OrgConfig {
     pub daemon: DaemonOrgConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 impl Default for OrgConfig {
@@ -134,6 +136,41 @@ impl Default for OrgConfig {
             notifications: NotificationConfig::default(),
             daemon: DaemonOrgConfig::default(),
             budget: BudgetConfig::default(),
+            permissions: PermissionsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRuleConfig {
+    pub category: String,
+    pub permission: String,
+    #[serde(default)]
+    pub path_pattern: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionsConfig {
+    #[serde(default = "default_permission_mode")]
+    pub default_permission: String,
+    #[serde(default)]
+    pub rules: Vec<PermissionRuleConfig>,
+    #[serde(default)]
+    pub model_overrides: HashMap<String, Vec<PermissionRuleConfig>>,
+}
+
+fn default_permission_mode() -> String {
+    "ask".to_string()
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            default_permission: default_permission_mode(),
+            rules: Vec::new(),
+            model_overrides: HashMap::new(),
         }
     }
 }
