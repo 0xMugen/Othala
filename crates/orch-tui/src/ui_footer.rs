@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::{InputMode, TuiApp};
-use crate::model::{DashboardState, ModelHealthDisplay};
+use crate::model::{DashboardState, ModelHealthDisplay, StatusBarData};
 use crate::ui_activity::footer_activity_indicator;
 use crate::ui_format::status_line_color;
 
@@ -12,6 +12,7 @@ const HEADER_FG: Color = Color::White;
 const DIM: Color = Color::DarkGray;
 const KEY_FG: Color = Color::Yellow;
 const MUTED: Color = Color::Gray;
+const STATUS_BAR_HEIGHT: u16 = 1;
 const FOOTER_DEFAULT_HEIGHT: u16 = 4;
 const FOOTER_PROMPT_MIN_HEIGHT: u16 = 6;
 const FOOTER_PROMPT_MAX_HEIGHT: u16 = 12;
@@ -27,10 +28,10 @@ pub(crate) fn footer_height(app: &TuiApp, width: u16) -> u16 {
     // When in focused view with ChatInput, the inline box handles display
     let in_focused = app.state.focused_task || app.state.focused_pane_idx.is_some();
     if in_focused && app.chat_input_display().is_some() {
-        return FOOTER_DEFAULT_HEIGHT + model_health_lines;
+        return FOOTER_DEFAULT_HEIGHT + model_health_lines + STATUS_BAR_HEIGHT;
     }
     let Some(prompt) = app.input_prompt() else {
-        return FOOTER_DEFAULT_HEIGHT + model_health_lines;
+        return FOOTER_DEFAULT_HEIGHT + model_health_lines + STATUS_BAR_HEIGHT;
     };
     let content_width = width.saturating_sub(2).max(1);
     let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width.saturating_sub(1));
@@ -41,9 +42,16 @@ pub(crate) fn footer_height(app: &TuiApp, width: u16) -> u16 {
     let total_height = prompt_visual_lines
         .saturating_add(controls_visual_lines)
         .saturating_add(3);
-    u16::try_from(total_height.saturating_add(model_health_lines as usize))
+    u16::try_from(
+        total_height
+            .saturating_add(model_health_lines as usize)
+            .saturating_add(usize::from(STATUS_BAR_HEIGHT)),
+    )
         .unwrap_or(FOOTER_PROMPT_MAX_HEIGHT)
-        .clamp(FOOTER_PROMPT_MIN_HEIGHT, FOOTER_PROMPT_MAX_HEIGHT)
+        .clamp(
+            FOOTER_PROMPT_MIN_HEIGHT + STATUS_BAR_HEIGHT,
+            FOOTER_PROMPT_MAX_HEIGHT + STATUS_BAR_HEIGHT,
+        )
 }
 
 pub(crate) fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
@@ -61,6 +69,101 @@ pub(crate) fn wrapped_visual_line_count(text: &str, width: u16) -> usize {
             }
         })
         .sum()
+}
+
+pub(crate) fn render_status_bar(state: &DashboardState) -> Line<'static> {
+    let mut merged = state.status_bar.clone();
+    if merged.active_tasks_count == 0
+        && merged.chatting_count == 0
+        && merged.ready_count == 0
+        && merged.merged_count == 0
+        && merged.stopped_count == 0
+        && !state.tasks.is_empty()
+    {
+        let derived = StatusBarData::from_dashboard(state);
+        merged.active_tasks_count = derived.active_tasks_count;
+        merged.chatting_count = derived.chatting_count;
+        merged.ready_count = derived.ready_count;
+        merged.merged_count = derived.merged_count;
+        merged.stopped_count = derived.stopped_count;
+    }
+
+    let sb = &merged;
+    let mut spans = Vec::new();
+
+    spans.push(Span::styled(
+        format!(" {} tasks", sb.active_tasks_count),
+        Style::default().fg(HEADER_FG),
+    ));
+
+    if sb.chatting_count > 0 {
+        spans.push(Span::styled(
+            format!(" {}ch", sb.chatting_count),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if sb.ready_count > 0 {
+        spans.push(Span::styled(
+            format!(" {}r", sb.ready_count),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if sb.merged_count > 0 {
+        spans.push(Span::styled(
+            format!(" {}m", sb.merged_count),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    spans.push(Span::styled(" | ", Style::default().fg(DIM)));
+
+    let token_str = if sb.total_tokens_used >= 1_000_000 {
+        format!("{:.1}M tok", sb.total_tokens_used as f64 / 1_000_000.0)
+    } else if sb.total_tokens_used >= 1_000 {
+        format!("{:.0}K tok", sb.total_tokens_used as f64 / 1_000.0)
+    } else {
+        format!("{} tok", sb.total_tokens_used)
+    };
+    let token_color = if sb.context_utilization_pct > 90.0 {
+        Color::Red
+    } else if sb.context_utilization_pct > 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    spans.push(Span::styled(token_str, Style::default().fg(token_color)));
+
+    if sb.context_utilization_pct > 0.0 {
+        spans.push(Span::styled(
+            format!(" ({:.0}%)", sb.context_utilization_pct),
+            Style::default().fg(token_color),
+        ));
+    }
+
+    spans.push(Span::styled(" | ", Style::default().fg(DIM)));
+
+    if let Some(model) = &sb.active_model {
+        spans.push(Span::styled(model.clone(), Style::default().fg(Color::Magenta)));
+    } else {
+        spans.push(Span::styled("no model", Style::default().fg(DIM)));
+    }
+
+    if sb.watcher_enabled {
+        spans.push(Span::styled(" | ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("{}f", sb.watcher_file_count),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+
+    if sb.auto_compact_enabled && sb.compaction_count > 0 {
+        spans.push(Span::styled(
+            format!(" {}c", sb.compaction_count),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {

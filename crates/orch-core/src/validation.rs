@@ -183,9 +183,9 @@ impl Validate for TaskSpec {
 mod tests {
     use super::{Validate, ValidationLevel};
     use crate::config::{
-        BudgetConfig, ConcurrencyConfig, DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig,
-        MovePolicy, NixConfig, NotificationConfig, OrgConfig, PermissionsConfig, RepoConfig,
-        RepoGraphiteConfig, UiConfig, VerifyConfig,
+        BudgetConfig, ConcurrencyConfig, ContextPathsConfig, DaemonOrgConfig, GraphiteOrgConfig,
+        ModelsConfig, MovePolicy, NixConfig, NotificationConfig, OrgConfig, PermissionsConfig,
+        RepoConfig, RepoGraphiteConfig, UiConfig, VerifyConfig,
     };
     use crate::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskSpec};
     use std::path::PathBuf;
@@ -215,6 +215,10 @@ mod tests {
             daemon: DaemonOrgConfig::default(),
             budget: BudgetConfig::default(),
             permissions: PermissionsConfig::default(),
+            context_paths: ContextPathsConfig {
+                paths: Vec::new(),
+                auto_detect: true,
+            },
         }
     }
 

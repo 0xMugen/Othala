@@ -386,6 +386,24 @@ struct CliArgs {
     event_log_path: PathBuf,
 }
 
+fn is_models_command(args: &[String]) -> bool {
+    args.len() == 1 && args[0] == "models"
+}
+
+fn available_models_lines() -> Vec<String> {
+    [ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini]
+        .iter()
+        .map(|model| model.as_str().to_string())
+        .collect()
+}
+
+fn print_available_models() {
+    println!("available models:");
+    for line in available_models_lines() {
+        println!("- {line}");
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum MainError {
     #[error("{0}")]
@@ -571,7 +589,12 @@ fn main() {
 fn run() -> Result<(), MainError> {
     let mut argv = std::env::args();
     let program = argv.next().unwrap_or_else(|| "orch-tui".to_string());
-    let args = parse_cli_args(argv.collect::<Vec<_>>(), &program)?;
+    let raw_args = argv.collect::<Vec<_>>();
+    if is_models_command(&raw_args) {
+        print_available_models();
+        return Ok(());
+    }
+    let args = parse_cli_args(raw_args, &program)?;
 
     // Ensure directories exist.
     if let Some(parent) = args.sqlite_path.parent() {
@@ -2285,19 +2308,21 @@ fn parse_cli_args(args: Vec<String>, program: &str) -> Result<CliArgs, MainError
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} [--tick-ms <u64>] [--sqlite-path <path>] [--event-log-path <path>]\n\
+        "Usage: {program} [models] [--tick-ms <u64>] [--sqlite-path <path>] [--event-log-path <path>]\n\
 Defaults:\n\
   --tick-ms {DEFAULT_TICK_MS}\n\
   --sqlite-path {DEFAULT_SQLITE_PATH}\n\
-  --event-log-path {DEFAULT_EVENT_LOG_PATH}"
+  --event-log-path {DEFAULT_EVENT_LOG_PATH}\n\
+Commands:\n\
+  models               list available models"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_chat_log, chat_log_path, discover_qa_stack_head, load_chat_log, parse_cli_args,
-        usage, CliArgs,
+        append_chat_log, available_models_lines, chat_log_path, discover_qa_stack_head,
+        is_models_command, load_chat_log, parse_cli_args, usage, CliArgs,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use orch_core::state::TaskState;
@@ -2369,6 +2394,26 @@ mod tests {
     fn parse_cli_args_help_returns_usage() {
         let err = parse_cli_args(vec!["--help".to_string()], "orch-tui").expect_err("help path");
         assert_eq!(err.to_string(), usage("orch-tui"));
+    }
+
+    #[test]
+    fn models_command_is_detected() {
+        assert!(is_models_command(&["models".to_string()]));
+        assert!(!is_models_command(&[]));
+        assert!(!is_models_command(&["models".to_string(), "extra".to_string()]));
+        assert!(!is_models_command(&["--tick-ms".to_string(), "250".to_string()]));
+    }
+
+    #[test]
+    fn available_models_command_lists_all_models() {
+        assert_eq!(
+            available_models_lines(),
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "gemini".to_string()
+            ]
+        );
     }
 
     fn temp_chat_dir() -> PathBuf {

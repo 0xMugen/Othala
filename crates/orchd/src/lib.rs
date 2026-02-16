@@ -12,10 +12,12 @@ pub mod dependency_graph;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod event_log;
 pub mod file_watcher;
+pub mod ignore;
 pub mod mcp;
 pub mod persistence;
 pub mod permissions;
 pub mod prompt_builder;
+pub mod provider_registry;
 pub mod qa_agent;
 pub mod qa_spec_gen;
 pub mod retry;

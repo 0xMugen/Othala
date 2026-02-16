@@ -510,6 +510,41 @@ pub struct ModelHealthDisplay {
     pub cooldown_until: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatusBarData {
+    pub total_tokens_used: u64,
+    pub context_utilization_pct: f64,
+    pub active_model: Option<String>,
+    pub active_tasks_count: usize,
+    pub chatting_count: usize,
+    pub ready_count: usize,
+    pub merged_count: usize,
+    pub stopped_count: usize,
+    pub watcher_file_count: usize,
+    pub watcher_enabled: bool,
+    pub auto_compact_enabled: bool,
+    pub compaction_count: usize,
+    pub uptime_secs: u64,
+    pub last_event_time: Option<String>,
+}
+
+impl StatusBarData {
+    pub fn from_dashboard(state: &DashboardState) -> Self {
+        let mut data = Self::default();
+        for task in &state.tasks {
+            match task.state {
+                TaskState::Chatting => data.chatting_count += 1,
+                TaskState::Ready => data.ready_count += 1,
+                TaskState::Merged => data.merged_count += 1,
+                TaskState::Stopped => data.stopped_count += 1,
+                _ => {}
+            }
+        }
+        data.active_tasks_count = state.tasks.len();
+        data
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
@@ -541,6 +576,8 @@ pub struct DashboardState {
     pub focused_pane_idx: Option<usize>,
     pub focused_task: bool,
     pub status_line: String,
+    #[serde(default)]
+    pub status_bar: StatusBarData,
     /// Lines scrolled back from the bottom in focused views.
     pub scroll_back: usize,
     /// Which pane category (Agent / QA) is currently selected.
@@ -574,6 +611,7 @@ impl Default for DashboardState {
             focused_pane_idx: None,
             focused_task: false,
             status_line: "ready".to_string(),
+            status_bar: StatusBarData::default(),
             scroll_back: 0,
             selected_pane_category: PaneCategory::Agent,
             current_theme: default_theme(),
@@ -1059,6 +1097,7 @@ fn summarize(value: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui_footer::render_status_bar;
     use ratatui::style::Color;
     use std::path::PathBuf;
 
@@ -1769,5 +1808,223 @@ mod tests {
         state.move_pane_selection_previous();
         assert_eq!(state.selected_pane_category, PaneCategory::Agent);
         assert_eq!(state.selected_pane_idx, 0);
+    }
+
+    #[test]
+    fn status_bar_data_default_values() {
+        let data = StatusBarData::default();
+        assert_eq!(data.total_tokens_used, 0);
+        assert_eq!(data.context_utilization_pct, 0.0);
+        assert_eq!(data.active_model, None);
+        assert_eq!(data.active_tasks_count, 0);
+        assert_eq!(data.chatting_count, 0);
+        assert_eq!(data.ready_count, 0);
+        assert_eq!(data.merged_count, 0);
+        assert_eq!(data.stopped_count, 0);
+        assert_eq!(data.watcher_file_count, 0);
+        assert!(!data.watcher_enabled);
+        assert!(!data.auto_compact_enabled);
+        assert_eq!(data.compaction_count, 0);
+        assert_eq!(data.uptime_secs, 0);
+        assert_eq!(data.last_event_time, None);
+    }
+
+    #[test]
+    fn status_bar_data_from_dashboard_counts_states() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "chatting", TaskState::Chatting),
+                mk_row("T2", "ready", TaskState::Ready),
+                mk_row("T3", "ready-2", TaskState::Ready),
+                mk_row("T4", "merged", TaskState::Merged),
+                mk_row("T5", "stopped", TaskState::Stopped),
+                mk_row("T6", "submitting", TaskState::Submitting),
+            ],
+            ..DashboardState::default()
+        };
+
+        let data = StatusBarData::from_dashboard(&state);
+        assert_eq!(data.active_tasks_count, 6);
+        assert_eq!(data.chatting_count, 1);
+        assert_eq!(data.ready_count, 2);
+        assert_eq!(data.merged_count, 1);
+        assert_eq!(data.stopped_count, 1);
+    }
+
+    #[test]
+    fn status_bar_data_from_empty_dashboard() {
+        let state = DashboardState::default();
+        let data = StatusBarData::from_dashboard(&state);
+        assert_eq!(data.active_tasks_count, 0);
+        assert_eq!(data.chatting_count, 0);
+        assert_eq!(data.ready_count, 0);
+        assert_eq!(data.merged_count, 0);
+        assert_eq!(data.stopped_count, 0);
+    }
+
+    #[test]
+    fn render_status_bar_with_typical_data() {
+        let mut state = DashboardState::default();
+        state.status_bar = StatusBarData {
+            total_tokens_used: 2_450,
+            context_utilization_pct: 68.0,
+            active_model: Some("claude".to_string()),
+            active_tasks_count: 5,
+            chatting_count: 2,
+            ready_count: 1,
+            merged_count: 1,
+            watcher_file_count: 9,
+            watcher_enabled: true,
+            auto_compact_enabled: true,
+            compaction_count: 3,
+            ..StatusBarData::default()
+        };
+
+        let line = render_status_bar(&state);
+        let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("5 tasks"));
+        assert!(text.contains("2ch"));
+        assert!(text.contains("1r"));
+        assert!(text.contains("1m"));
+        assert!(text.contains("2K tok"));
+        assert!(text.contains("(68%)"));
+        assert!(text.contains("claude"));
+        assert!(text.contains("9f"));
+        assert!(text.contains("3c"));
+    }
+
+    #[test]
+    fn render_status_bar_token_formatting_k_and_m() {
+        let mut k_state = DashboardState::default();
+        k_state.status_bar = StatusBarData {
+            total_tokens_used: 1_500,
+            active_tasks_count: 1,
+            ..StatusBarData::default()
+        };
+        let k_line = render_status_bar(&k_state);
+        let k_text: String = k_line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(k_text.contains("2K tok"));
+
+        let mut m_state = DashboardState::default();
+        m_state.status_bar = StatusBarData {
+            total_tokens_used: 1_500_000,
+            active_tasks_count: 1,
+            ..StatusBarData::default()
+        };
+        let m_line = render_status_bar(&m_state);
+        let m_text: String = m_line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(m_text.contains("1.5M tok"));
+    }
+
+    #[test]
+    fn render_status_bar_token_color_thresholds() {
+        let mut green_state = DashboardState::default();
+        green_state.status_bar = StatusBarData {
+            total_tokens_used: 100,
+            context_utilization_pct: 65.0,
+            active_tasks_count: 1,
+            ..StatusBarData::default()
+        };
+        let green_line = render_status_bar(&green_state);
+        let green_token_span = green_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("tok"))
+            .expect("token span");
+        assert_eq!(green_token_span.style.fg, Some(Color::Green));
+
+        let mut yellow_state = DashboardState::default();
+        yellow_state.status_bar = StatusBarData {
+            total_tokens_used: 100,
+            context_utilization_pct: 75.0,
+            active_tasks_count: 1,
+            ..StatusBarData::default()
+        };
+        let yellow_line = render_status_bar(&yellow_state);
+        let yellow_token_span = yellow_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("tok"))
+            .expect("token span");
+        assert_eq!(yellow_token_span.style.fg, Some(Color::Yellow));
+
+        let mut red_state = DashboardState::default();
+        red_state.status_bar = StatusBarData {
+            total_tokens_used: 100,
+            context_utilization_pct: 95.0,
+            active_tasks_count: 1,
+            ..StatusBarData::default()
+        };
+        let red_line = render_status_bar(&red_state);
+        let red_token_span = red_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("tok"))
+            .expect("token span");
+        assert_eq!(red_token_span.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn render_status_bar_watcher_enabled_and_disabled() {
+        let mut enabled_state = DashboardState::default();
+        enabled_state.status_bar = StatusBarData {
+            active_tasks_count: 1,
+            watcher_enabled: true,
+            watcher_file_count: 12,
+            ..StatusBarData::default()
+        };
+        let enabled_line = render_status_bar(&enabled_state);
+        let enabled_text: String = enabled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(enabled_text.contains("12f"));
+
+        let mut disabled_state = DashboardState::default();
+        disabled_state.status_bar = StatusBarData {
+            active_tasks_count: 1,
+            watcher_enabled: false,
+            watcher_file_count: 12,
+            ..StatusBarData::default()
+        };
+        let disabled_line = render_status_bar(&disabled_state);
+        let disabled_text: String = disabled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!disabled_text.contains("12f"));
+    }
+
+    #[test]
+    fn render_status_bar_with_model_name_and_none() {
+        let mut with_model = DashboardState::default();
+        with_model.status_bar = StatusBarData {
+            active_tasks_count: 1,
+            active_model: Some("codex".to_string()),
+            ..StatusBarData::default()
+        };
+        let model_line = render_status_bar(&with_model);
+        let model_text: String = model_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(model_text.contains("codex"));
+
+        let mut without_model = DashboardState::default();
+        without_model.status_bar = StatusBarData {
+            active_tasks_count: 1,
+            active_model: None,
+            ..StatusBarData::default()
+        };
+        let no_model_line = render_status_bar(&without_model);
+        let no_model_text: String = no_model_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(no_model_text.contains("no model"));
     }
 }

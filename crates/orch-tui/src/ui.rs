@@ -16,7 +16,7 @@ use crate::ui_activity::pane_activity_indicator;
 use crate::ui_activity::status_activity;
 #[cfg(test)]
 use crate::ui_footer::wrapped_visual_line_count;
-use crate::ui_footer::{build_footer_content, footer_height};
+use crate::ui_footer::{build_footer_content, footer_height, render_status_bar};
 use crate::ui_format::{
     divider_line, format_category_tabs, format_task_row, pane_meta_lines, state_color,
     status_sidebar_lines, to_local_time,
@@ -938,13 +938,25 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let theme = &app.state.current_theme;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    let status_widget = Paragraph::new(render_status_bar(&app.state)).wrap(Wrap { trim: true });
+    frame.render_widget(status_widget, sections[0]);
+
+    if sections[1].height == 0 {
+        return;
+    }
+
     let content = build_footer_content(app);
     let widget = Paragraph::new(content.lines)
         .block(normal_block(content.title, theme))
         .wrap(Wrap {
             trim: content.wrap_trim,
         });
-    frame.render_widget(widget, area);
+    frame.render_widget(widget, sections[1]);
 }
 
 fn error_summary_height(app: &TuiApp) -> u16 {
@@ -1341,7 +1353,7 @@ mod tests {
         use crate::app::InputMode;
 
         let mut app = TuiApp::default();
-        assert_eq!(footer_height(&app, 120), 4);
+        assert_eq!(footer_height(&app, 120), 5);
 
         app.input_mode = InputMode::NewChatPrompt {
             buffer: "line 1\nline 2".to_string(),
@@ -1351,7 +1363,7 @@ mod tests {
         app.input_mode = InputMode::NewChatPrompt {
             buffer: "x".repeat(4000),
         };
-        assert_eq!(footer_height(&app, 40), 12);
+        assert_eq!(footer_height(&app, 40), 13);
     }
 
     #[test]
