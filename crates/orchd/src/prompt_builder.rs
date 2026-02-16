@@ -7,7 +7,7 @@
 use orch_core::types::{ModelKind, TaskId};
 use std::path::Path;
 
-use crate::context_graph::{render_context_for_prompt, ContextGraph};
+use crate::context_graph::{render_context_with_sources, ContextGraph};
 
 /// The type of task being performed — drives which template to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub struct PromptConfig {
     pub verify_command: Option<String>,
     /// QA failure details injected when retrying after a QA validation failure.
     pub qa_failure_context: Option<String>,
+    /// Repository root path — used for inlining source files from context graph @file: refs.
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 /// Build a rich prompt from config and template directory.
@@ -73,10 +75,19 @@ pub fn build_rich_prompt(config: &PromptConfig, template_dir: &Path) -> String {
         config.task_id.0, config.task_title
     ));
 
-    // 3. Repository context (from context graph).
+    // 3. Repository context (from context graph), with source inlining when repo_root is available.
     if let Some(ctx) = &config.context {
         if !ctx.nodes.is_empty() {
-            sections.push(render_context_for_prompt(ctx));
+            const SOURCE_BUDGET: usize = 64_000;
+            if let Some(root) = &config.repo_root {
+                sections.push(render_context_with_sources(ctx, root, SOURCE_BUDGET));
+            } else {
+                sections.push(render_context_with_sources(
+                    ctx,
+                    &std::env::current_dir().unwrap_or_default(),
+                    SOURCE_BUDGET,
+                ));
+            }
         }
     }
 
@@ -147,6 +158,7 @@ mod tests {
             retry: None,
             verify_command: None,
             qa_failure_context: None,
+            repo_root: None,
         }
     }
 
@@ -280,5 +292,33 @@ mod tests {
         assert!(prompt.contains("QA Failures"));
         assert!(prompt.contains("tui.create_chat: FAIL"));
         assert!(prompt.contains("branch not created"));
+    }
+
+    #[test]
+    fn prompt_inlines_source_files_from_context_refs() {
+        use crate::context_graph::{ContextGraph, ContextNode};
+        use std::path::PathBuf;
+
+        let tmp = std::env::temp_dir().join(format!("othala-src-inline-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("lib.rs"), "pub fn greet() -> &'static str { \"hello\" }\n").unwrap();
+
+        let mut config = mk_config();
+        config.repo_root = Some(tmp.clone());
+        config.context = Some(ContextGraph {
+            nodes: vec![ContextNode {
+                path: PathBuf::from(".othala/context/MAIN.md"),
+                content: "# Main\nSee @file:lib.rs for the greeting.\n".to_string(),
+                links: vec![],
+                source_refs: vec![PathBuf::from("lib.rs")],
+            }],
+            total_chars: 44,
+        });
+
+        let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
+        assert!(prompt.contains("Referenced Source Files"));
+        assert!(prompt.contains("pub fn greet()"));
+
+        fs::remove_dir_all(&tmp).ok();
     }
 }

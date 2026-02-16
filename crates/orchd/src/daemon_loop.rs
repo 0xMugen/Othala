@@ -373,6 +373,7 @@ fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction
         retry,
         verify_command: config.verify_command.clone(),
         qa_failure_context,
+        repo_root: Some(config.repo_root.clone()),
     };
 
     let prompt = build_rich_prompt(&prompt_config, &config.template_dir);
