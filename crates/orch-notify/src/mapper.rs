@@ -44,6 +44,24 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
             task_id: event.task_id.clone(),
             repo_id: event.repo_id.clone(),
         }),
+        EventKind::AgentCompleted {
+            model,
+            success: false,
+            duration_secs,
+        } => Some(NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::TaskError,
+            severity: NotificationSeverity::Error,
+            title: format!("Agent failed ({model})"),
+            body: format!("Agent run failed after {duration_secs}s."),
+            task_id: event.task_id.clone(),
+            repo_id: event.repo_id.clone(),
+        }),
+        EventKind::AgentSpawned { .. }
+        | EventKind::AgentCompleted { success: true, .. }
+        | EventKind::ModelFallback { .. }
+        | EventKind::ContextRegenStarted
+        | EventKind::ContextRegenCompleted { .. } => None,
         _ => None,
     }
 }
@@ -115,5 +133,20 @@ mod tests {
     fn ignores_non_notifying_events() {
         let event = mk_event(EventKind::TaskCreated);
         assert!(notification_for_event(&event).is_none());
+    }
+
+    #[test]
+    fn maps_failed_agent_completion_to_error_notification() {
+        let event = mk_event(EventKind::AgentCompleted {
+            model: "claude".to_string(),
+            success: false,
+            duration_secs: 15,
+        });
+
+        let message = notification_for_event(&event).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::TaskError);
+        assert_eq!(message.severity, NotificationSeverity::Error);
+        assert!(message.title.contains("Agent failed"));
+        assert!(message.body.contains("15s"));
     }
 }

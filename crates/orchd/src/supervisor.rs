@@ -40,6 +40,7 @@ pub struct AgentOutcome {
     pub patch_ready: bool,
     pub needs_human: bool,
     pub success: bool,
+    pub duration_secs: u64,
 }
 
 /// A batch of output lines from one agent session.
@@ -293,6 +294,10 @@ impl AgentSupervisor {
                 Ok(Some(status)) => {
                     let exit_code = status.code();
                     let success = session.patch_ready || exit_code == Some(0);
+                    let duration_secs = Utc::now()
+                        .signed_duration_since(session.started_at)
+                        .num_seconds()
+                        .max(0) as u64;
                     completed.push(AgentOutcome {
                         task_id: session.task_id.clone(),
                         model: session.model,
@@ -300,11 +305,16 @@ impl AgentSupervisor {
                         patch_ready: session.patch_ready,
                         needs_human: session.needs_human,
                         success,
+                        duration_secs,
                     });
                     finished_keys.push(key.clone());
                 }
                 Ok(None) => {} // still running
                 Err(_) => {
+                    let duration_secs = Utc::now()
+                        .signed_duration_since(session.started_at)
+                        .num_seconds()
+                        .max(0) as u64;
                     completed.push(AgentOutcome {
                         task_id: session.task_id.clone(),
                         model: session.model,
@@ -312,6 +322,7 @@ impl AgentSupervisor {
                         patch_ready: false,
                         needs_human: false,
                         success: false,
+                        duration_secs,
                     });
                     finished_keys.push(key.clone());
                 }
@@ -871,6 +882,7 @@ mod tests {
             patch_ready: true,
             needs_human: false,
             success: true,
+            duration_secs: 12,
         };
         assert_eq!(outcome.task_id.0, "T-1");
         assert_eq!(outcome.model, ModelKind::Gemini);
@@ -878,6 +890,7 @@ mod tests {
         assert!(outcome.patch_ready);
         assert!(!outcome.needs_human);
         assert!(outcome.success);
+        assert_eq!(outcome.duration_secs, 12);
     }
 
     #[test]

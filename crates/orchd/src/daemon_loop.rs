@@ -3,7 +3,7 @@
 //! Replaces the inline loop in `main.rs` with a testable `daemon_tick()` that
 //! returns actions for the caller to execute.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
@@ -11,7 +11,7 @@ use orch_graphite::GraphiteClient;
 
 use crate::context_gen::{
     build_context_gen_prompt, context_is_current, poll_context_gen, should_regenerate,
-    spawn_context_gen, ContextGenConfig, ContextGenState,
+    spawn_context_gen, ContextGenConfig, ContextGenState, ContextGenStatus,
 };
 use crate::context_graph::{load_context_graph, ContextLoadConfig};
 use crate::prompt_builder::{build_rich_prompt, PromptConfig, PromptRole, RetryContext};
@@ -20,8 +20,8 @@ use crate::qa_agent::{
     load_task_spec as load_qa_task_spec, poll_qa_agent, save_qa_result, spawn_qa_agent, QAResult,
     QAState, QAStatus, QAType,
 };
-use crate::retry::evaluate_retry;
-use crate::stack_pipeline::{next_action, PipelineAction, PipelineState};
+use crate::retry::{evaluate_retry, pick_next_model_with_health, ModelHealthTracker};
+use crate::stack_pipeline::{next_action, PipelineAction, PipelineStage, PipelineState};
 use crate::supervisor::{AgentOutcome, AgentSupervisor};
 use crate::test_spec::load_test_spec;
 use crate::OrchdService;
@@ -60,6 +60,51 @@ pub struct DaemonState {
     pub context_gen: ContextGenState,
     /// Per-task QA agent state (keyed by task_id).
     pub qa_agents: HashMap<String, QAState>,
+    pub model_health: ModelHealthTracker,
+    pub restack_retries: HashMap<String, RestackRetryState>,
+}
+
+const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
+const RESTACK_RETRY_INITIAL_BACKOFF_SECS: u64 = 5;
+
+#[derive(Debug, Clone)]
+pub struct RestackRetryState {
+    pub attempts: u32,
+    pub max_retries: u32,
+    pub last_attempt: DateTime<Utc>,
+    pub backoff_secs: u64,
+}
+
+impl RestackRetryState {
+    fn first(now: DateTime<Utc>) -> Self {
+        Self {
+            attempts: 1,
+            max_retries: RESTACK_RETRY_MAX_RETRIES,
+            last_attempt: now,
+            backoff_secs: RESTACK_RETRY_INITIAL_BACKOFF_SECS,
+        }
+    }
+
+    fn next(&self, now: DateTime<Utc>) -> Option<Self> {
+        if self.attempts >= self.max_retries {
+            return None;
+        }
+
+        Some(Self {
+            attempts: self.attempts + 1,
+            max_retries: self.max_retries,
+            last_attempt: now,
+            backoff_secs: self.backoff_secs.saturating_mul(2),
+        })
+    }
+
+    fn retry_ready_at(&self) -> DateTime<Utc> {
+        self.last_attempt + Duration::seconds(self.backoff_secs as i64)
+    }
+
+    fn is_ready(&self, now: DateTime<Utc>) -> bool {
+        now >= self.retry_ready_at()
+    }
 }
 
 impl DaemonState {
@@ -68,7 +113,63 @@ impl DaemonState {
             pipelines: HashMap::new(),
             context_gen: ContextGenState::new(),
             qa_agents: HashMap::new(),
+            model_health: ModelHealthTracker::new(),
+            restack_retries: HashMap::new(),
         }
+    }
+}
+
+fn schedule_restack_retry(
+    daemon_state: &mut DaemonState,
+    task_id: &TaskId,
+    now: DateTime<Utc>,
+) -> Option<RestackRetryState> {
+    let next = match daemon_state.restack_retries.get(&task_id.0) {
+        Some(existing) => existing.next(now),
+        None => Some(RestackRetryState::first(now)),
+    };
+
+    match next {
+        Some(state) => {
+            daemon_state
+                .restack_retries
+                .insert(task_id.0.clone(), state.clone());
+            Some(state)
+        }
+        None => {
+            daemon_state.restack_retries.remove(&task_id.0);
+            None
+        }
+    }
+}
+
+fn stop_task_with_failure_reason(
+    service: &OrchdService,
+    task_id: &TaskId,
+    reason: &str,
+    at: DateTime<Utc>,
+) {
+    let event = Event {
+        id: EventId(format!(
+            "E-FAILED-{}-{}",
+            task_id.0,
+            at.timestamp_nanos_opt().unwrap_or_default()
+        )),
+        task_id: Some(task_id.clone()),
+        repo_id: None,
+        at,
+        kind: EventKind::TaskFailed {
+            reason: reason.to_string(),
+            is_final: true,
+        },
+    };
+    let _ = service.record_event(&event);
+
+    if let Ok(Some(mut task)) = service.task(task_id) {
+        task.state = TaskState::Stopped;
+        task.updated_at = at;
+        task.last_failure_reason = Some(reason.to_string());
+        let _ = service.store.upsert_task(&task);
     }
 }
 
@@ -104,6 +205,7 @@ pub enum DaemonAction {
     ExecutePipeline { action: PipelineAction },
     /// Trigger background context regeneration.
     TriggerContextRegen,
+    ContextRegenCompleted { success: bool },
     /// Spawn a QA agent (baseline or validation).
     SpawnQA { task_id: TaskId, qa_type: QAType },
     /// QA run completed successfully — all tests passed.
@@ -184,7 +286,8 @@ pub fn daemon_tick(
     }
 
     for outcome in &poll_result.completed {
-        let outcome_actions = handle_agent_completion(service, outcome, config, now);
+        let outcome_actions =
+            handle_agent_completion(service, outcome, config, daemon_state, now);
         actions.extend(outcome_actions);
     }
 
@@ -280,6 +383,13 @@ pub fn daemon_tick(
     for key in pipeline_keys {
         if let Some(pipeline) = daemon_state.pipelines.get(&key) {
             if !pipeline.is_terminal() {
+                if pipeline.stage == PipelineStage::StackOnParent {
+                    if let Some(retry_state) = daemon_state.restack_retries.get(&key) {
+                        if !retry_state.is_ready(now) {
+                            continue;
+                        }
+                    }
+                }
                 let action = next_action(pipeline);
                 actions.push(DaemonAction::ExecutePipeline { action });
             }
@@ -288,14 +398,22 @@ pub fn daemon_tick(
 
     // Clean up terminal pipelines.
     daemon_state.pipelines.retain(|_, p| !p.is_terminal());
+    daemon_state
+        .restack_retries
+        .retain(|task_id, _| daemon_state.pipelines.contains_key(task_id));
 
     // --- Phase 4: Context generation ---
 
     // Poll any running context gen process.
+    let was_context_regen_running = daemon_state.context_gen.status == ContextGenStatus::Running;
     if let Some(paths) = poll_context_gen(&config.repo_root, &mut daemon_state.context_gen) {
         actions.push(DaemonAction::Log {
             message: format!("[context-gen] Updated {} context files", paths.len()),
         });
+        actions.push(DaemonAction::ContextRegenCompleted { success: true });
+    } else if was_context_regen_running && daemon_state.context_gen.status == ContextGenStatus::Failed
+    {
+        actions.push(DaemonAction::ContextRegenCompleted { success: false });
     }
 
     // Check if we should trigger a regen based on transitions or stale hash.
@@ -391,11 +509,35 @@ fn handle_agent_completion(
     service: &OrchdService,
     outcome: &AgentOutcome,
     config: &DaemonConfig,
-    _now: DateTime<Utc>,
+    daemon_state: &mut DaemonState,
+    now: DateTime<Utc>,
 ) -> Vec<DaemonAction> {
     let mut actions = Vec::new();
 
+    let completion_event = Event {
+        id: EventId(format!(
+            "E-AGENT-COMPLETED-{}-{}",
+            outcome.task_id.0,
+            now.timestamp_nanos_opt().unwrap_or_default()
+        )),
+        task_id: Some(outcome.task_id.clone()),
+        repo_id: service.task(&outcome.task_id).ok().flatten().map(|t| t.repo_id),
+        at: now,
+        kind: EventKind::AgentCompleted {
+            model: outcome.model.as_str().to_string(),
+            success: outcome.success,
+            duration_secs: outcome.duration_secs,
+        },
+    };
+    if let Err(e) = service.record_event(&completion_event) {
+        eprintln!(
+            "[daemon] Failed to record agent completion for {}: {}",
+            outcome.task_id.0, e
+        );
+    }
+
     if outcome.patch_ready || outcome.success {
+        daemon_state.model_health.record_success(outcome.model);
         // If a QA baseline spec exists and QA is enabled, spawn a validation
         // QA run instead of immediately marking ready.
         if !config.skip_qa && load_baseline(&config.repo_root).is_some() {
@@ -420,15 +562,31 @@ fn handle_agent_completion(
     }
 
     // Agent failed — evaluate retry.
+    daemon_state.model_health.record_failure_at(outcome.model, now);
+
     if let Ok(Some(task)) = service.task(&outcome.task_id) {
         let decision = evaluate_retry(&task, outcome, &config.enabled_models);
 
         if decision.should_retry {
-            if let Some(next_model) = decision.next_model {
+            let next_model = pick_next_model_with_health(
+                &task,
+                outcome.model,
+                &config.enabled_models,
+                &daemon_state.model_health,
+                now,
+            )
+            .or(decision.next_model);
+
+            if let Some(next_model) = next_model {
                 actions.push(DaemonAction::ScheduleRetry {
                     task_id: outcome.task_id.clone(),
                     next_model,
-                    reason: decision.reason,
+                    reason: format!(
+                        "retrying (attempt {}/{}) with {}",
+                        task.retry_count + 1,
+                        task.max_retries,
+                        next_model.as_str()
+                    ),
                 });
             } else {
                 actions.push(DaemonAction::TaskFailed {
@@ -489,6 +647,7 @@ fn apply_retry_transition(
     let Some(mut task) = service.task(task_id).map_err(|e| e.to_string())? else {
         return Err(format!("task not found for retry: {}", task_id.0));
     };
+    let previous_model = task.preferred_model;
 
     if task.retry_count >= task.max_retries {
         let failed_event = Event {
@@ -521,7 +680,7 @@ fn apply_retry_transition(
     }
 
     task.retry_count += 1;
-    if let Some(prev_model) = task.preferred_model {
+    if let Some(prev_model) = previous_model {
         if prev_model != next_model && !task.failed_models.contains(&prev_model) {
             task.failed_models.push(prev_model);
         }
@@ -553,7 +712,7 @@ fn apply_retry_transition(
             at.timestamp_nanos_opt().unwrap_or_default()
         )),
         task_id: Some(task_id.clone()),
-        repo_id: Some(task.repo_id),
+        repo_id: Some(task.repo_id.clone()),
         at,
         kind: EventKind::RetryScheduled {
             attempt: task.retry_count,
@@ -562,6 +721,28 @@ fn apply_retry_transition(
         },
     };
     let _ = service.record_event(&retry_event);
+
+    if let Some(prev_model) = previous_model {
+        if prev_model != next_model {
+            let fallback_event = Event {
+                id: EventId(format!(
+                    "E-MODEL-FALLBACK-{}-{}",
+                    task_id.0,
+                    at.timestamp_nanos_opt().unwrap_or_default()
+                )),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at,
+                kind: EventKind::ModelFallback {
+                    from_model: prev_model.as_str().to_string(),
+                    to_model: next_model.as_str().to_string(),
+                    reason: reason.to_string(),
+                },
+            };
+            let _ = service.record_event(&fallback_event);
+        }
+    }
+
     Ok(true)
 }
 
@@ -582,7 +763,7 @@ pub fn execute_actions(
         match action {
             DaemonAction::SpawnAgent {
                 task_id,
-                model: _,
+                model,
                 prompt,
                 worktree_path,
             } => {
@@ -595,6 +776,26 @@ pub fn execute_actions(
                         task.preferred_model,
                     ) {
                         eprintln!("[daemon] Failed to spawn agent for {}: {}", task_id.0, e);
+                    } else {
+                        let event = Event {
+                            id: EventId(format!(
+                                "E-AGENT-SPAWNED-{}-{}",
+                                task_id.0,
+                                now.timestamp_nanos_opt().unwrap_or_default()
+                            )),
+                            task_id: Some(task_id.clone()),
+                            repo_id: Some(task.repo_id.clone()),
+                            at: now,
+                            kind: EventKind::AgentSpawned {
+                                model: model.as_str().to_string(),
+                            },
+                        };
+                        if let Err(e) = service.record_event(&event) {
+                            eprintln!(
+                                "[daemon] Failed to record agent_spawned for {}: {}",
+                                task_id.0, e
+                            );
+                        }
                     }
                 }
             }
@@ -629,10 +830,12 @@ pub fn execute_actions(
             } => match apply_retry_transition(service, task_id, *next_model, reason, now) {
                 Ok(true) => {
                     daemon_state.pipelines.remove(&task_id.0);
+                    daemon_state.restack_retries.remove(&task_id.0);
                     eprintln!("[daemon] {} scheduled retry with {}", task_id.0, next_model);
                 }
                 Ok(false) => {
                     daemon_state.pipelines.remove(&task_id.0);
+                    daemon_state.restack_retries.remove(&task_id.0);
                     eprintln!(
                         "[daemon] {} reached max retries; task moved to STOPPED",
                         task_id.0
@@ -643,28 +846,8 @@ pub fn execute_actions(
                 }
             },
             DaemonAction::TaskFailed { task_id, reason } => {
-                let event = Event {
-                    id: EventId(format!(
-                        "E-FAILED-{}-{}",
-                        task_id.0,
-                        now.timestamp_nanos_opt().unwrap_or_default()
-                    )),
-                    task_id: Some(task_id.clone()),
-                    repo_id: None,
-                    at: now,
-                    kind: EventKind::TaskFailed {
-                        reason: reason.clone(),
-                        is_final: true,
-                    },
-                };
-                let _ = service.record_event(&event);
-
-                // Transition the task to Stopped so it's no longer active.
-                if let Ok(Some(mut task)) = service.task(task_id) {
-                    task.state = TaskState::Stopped;
-                    task.updated_at = now;
-                    let _ = service.store.upsert_task(&task);
-                }
+                stop_task_with_failure_reason(service, task_id, reason, now);
+                daemon_state.restack_retries.remove(&task_id.0);
 
                 eprintln!("[daemon] {} failed → stopped: {}", task_id.0, reason);
             }
@@ -747,6 +930,7 @@ pub fn execute_actions(
                                 }
                             }
                             daemon_state.pipelines.remove(&task_id.0);
+                            daemon_state.restack_retries.remove(&task_id.0);
                         }
                     }
                 }
@@ -773,51 +957,91 @@ pub fn execute_actions(
                             if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
                                 pipeline.advance();
                             }
+                            daemon_state.restack_retries.remove(&task_id.0);
                         }
                         Err(error) => {
-                            let _ = service.record_event(&Event {
-                                id: EventId(format!(
-                                    "E-RESTACK-CONFLICT-{}-{}",
-                                    task_id.0, event_seed
-                                )),
-                                task_id: Some(task_id.clone()),
-                                repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
-                                at: now,
-                                kind: EventKind::RestackConflict,
-                            });
                             let err_msg = format!("restack onto `{parent_branch}` failed: {error}");
-                            let retry_model = service
-                                .task(task_id)
-                                .ok()
-                                .flatten()
-                                .and_then(|t| t.preferred_model)
-                                .or_else(|| config.enabled_models.first().copied())
-                                .unwrap_or(ModelKind::Claude);
-                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
-                                pipeline.fail(err_msg.clone());
-                            }
-                            match apply_retry_transition(
-                                service,
-                                task_id,
-                                retry_model,
-                                &err_msg,
-                                now,
-                            ) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    eprintln!(
-                                        "[daemon] Restack failed for {}; retries exhausted",
-                                        task_id.0
+
+                            if error.is_restack_conflict() {
+                                let _ = service.record_event(&Event {
+                                    id: EventId(format!(
+                                        "E-RESTACK-CONFLICT-{}-{}",
+                                        task_id.0, event_seed
+                                    )),
+                                    task_id: Some(task_id.clone()),
+                                    repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                                    at: now,
+                                    kind: EventKind::RestackConflict,
+                                });
+
+                                if let Some(retry_state) =
+                                    schedule_restack_retry(daemon_state, task_id, now)
+                                {
+                                    let _ = service.transition_task_state(
+                                        task_id,
+                                        TaskState::Ready,
+                                        EventId(format!(
+                                            "E-RESTACK-RETRY-WAIT-{}-{}",
+                                            task_id.0, event_seed
+                                        )),
+                                        now,
                                     );
-                                }
-                                Err(e) => {
                                     eprintln!(
-                                        "[daemon] Restack failure retry handling failed for {}: {}",
-                                        task_id.0, e
+                                        "[daemon] Restack conflict for {}; retry {}/{} in {}s",
+                                        task_id.0,
+                                        retry_state.attempts,
+                                        retry_state.max_retries,
+                                        retry_state.backoff_secs
                                     );
+                                } else {
+                                    let final_msg = format!(
+                                        "restack conflict retries exhausted for {} (max retries: {})",
+                                        task_id.0, RESTACK_RETRY_MAX_RETRIES
+                                    );
+                                    if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0)
+                                    {
+                                        pipeline.fail(final_msg.clone());
+                                    }
+                                    daemon_state.restack_retries.remove(&task_id.0);
+                                    daemon_state.pipelines.remove(&task_id.0);
+                                    stop_task_with_failure_reason(service, task_id, &final_msg, now);
+                                    eprintln!("[daemon] {}", final_msg);
                                 }
+                            } else {
+                                let retry_model = service
+                                    .task(task_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|t| t.preferred_model)
+                                    .or_else(|| config.enabled_models.first().copied())
+                                    .unwrap_or(ModelKind::Claude);
+                                if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                    pipeline.fail(err_msg.clone());
+                                }
+                                match apply_retry_transition(
+                                    service,
+                                    task_id,
+                                    retry_model,
+                                    &err_msg,
+                                    now,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        eprintln!(
+                                            "[daemon] Restack failed for {}; retries exhausted",
+                                            task_id.0
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[daemon] Restack failure retry handling failed for {}: {}",
+                                            task_id.0, e
+                                        );
+                                    }
+                                }
+                                daemon_state.pipelines.remove(&task_id.0);
+                                daemon_state.restack_retries.remove(&task_id.0);
                             }
-                            daemon_state.pipelines.remove(&task_id.0);
                         }
                     }
                 }
@@ -891,6 +1115,7 @@ pub fn execute_actions(
                                 }
                             }
                             daemon_state.pipelines.remove(&task_id.0);
+                            daemon_state.restack_retries.remove(&task_id.0);
                         }
                     }
                 }
@@ -924,8 +1149,32 @@ pub fn execute_actions(
                         eprintln!("[daemon] Failed to spawn context gen: {e}");
                     } else {
                         eprintln!("[daemon] Background context regeneration started");
+                        let event = Event {
+                            id: EventId(format!(
+                                "E-CTX-REGEN-START-{}",
+                                now.timestamp_nanos_opt().unwrap_or_default()
+                            )),
+                            task_id: None,
+                            repo_id: None,
+                            at: now,
+                            kind: EventKind::ContextRegenStarted,
+                        };
+                        let _ = service.record_event(&event);
                     }
                 }
+            }
+            DaemonAction::ContextRegenCompleted { success } => {
+                let event = Event {
+                    id: EventId(format!(
+                        "E-CTX-REGEN-DONE-{}",
+                        now.timestamp_nanos_opt().unwrap_or_default()
+                    )),
+                    task_id: None,
+                    repo_id: None,
+                    at: now,
+                    kind: EventKind::ContextRegenCompleted { success: *success },
+                };
+                let _ = service.record_event(&event);
             }
             DaemonAction::SpawnQA { task_id, qa_type } => {
                 // Load baseline spec and build QA prompt.
@@ -1070,7 +1319,8 @@ mod tests {
     use crate::persistence::SqliteStore;
     use crate::scheduler::{Scheduler, SchedulerConfig};
     use orch_core::events::{Event, EventKind};
-    use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
+    use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
+    use chrono::Duration;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1194,9 +1444,12 @@ mod tests {
             patch_ready: true,
             needs_human: false,
             success: true,
+            duration_secs: 5,
         };
 
-        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+        let mut daemon_state = DaemonState::new();
+        let actions =
+            handle_agent_completion(&service, &outcome, &config, &mut daemon_state, Utc::now());
         assert!(actions
             .iter()
             .any(|a| matches!(a, DaemonAction::MarkReady { .. })));
@@ -1220,9 +1473,12 @@ mod tests {
             patch_ready: false,
             needs_human: false,
             success: false,
+            duration_secs: 5,
         };
 
-        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+        let mut daemon_state = DaemonState::new();
+        let actions =
+            handle_agent_completion(&service, &outcome, &config, &mut daemon_state, Utc::now());
         // Should produce a retry or failure action.
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -1234,6 +1490,109 @@ mod tests {
     fn daemon_state_default() {
         let state = DaemonState::default();
         assert!(state.pipelines.is_empty());
+        assert!(state.restack_retries.is_empty());
+    }
+
+    #[test]
+    fn restack_retry_state_uses_exponential_backoff_and_max_retries() {
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-RS-1");
+        let t0 = Utc::now();
+
+        let first = schedule_restack_retry(&mut daemon_state, &task_id, t0).expect("first retry");
+        assert_eq!(first.attempts, 1);
+        assert_eq!(first.max_retries, 3);
+        assert_eq!(first.backoff_secs, 5);
+
+        let second = schedule_restack_retry(&mut daemon_state, &task_id, t0 + Duration::seconds(1))
+            .expect("second retry");
+        assert_eq!(second.attempts, 2);
+        assert_eq!(second.backoff_secs, 10);
+
+        let third = schedule_restack_retry(&mut daemon_state, &task_id, t0 + Duration::seconds(2))
+            .expect("third retry");
+        assert_eq!(third.attempts, 3);
+        assert_eq!(third.backoff_secs, 20);
+
+        let exhausted = schedule_restack_retry(&mut daemon_state, &task_id, t0 + Duration::seconds(3));
+        assert!(exhausted.is_none());
+        assert!(!daemon_state.restack_retries.contains_key(&task_id.0));
+    }
+
+    #[test]
+    fn daemon_tick_defers_stack_action_while_restack_backoff_is_pending() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-RS-2");
+
+        let mut pipeline = PipelineState::new(
+            task_id.clone(),
+            "task/T-RS-2".to_string(),
+            PathBuf::from(".orch/wt/T-RS-2"),
+            SubmitMode::Single,
+            Some("task/T-parent".to_string()),
+        );
+        pipeline.stage = PipelineStage::StackOnParent;
+        daemon_state.pipelines.insert(task_id.0.clone(), pipeline);
+        daemon_state.restack_retries.insert(
+            task_id.0.clone(),
+            RestackRetryState {
+                attempts: 1,
+                max_retries: 3,
+                last_attempt: Utc::now(),
+                backoff_secs: 60,
+            },
+        );
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+        assert!(!actions.iter().any(|action| {
+            matches!(
+                action,
+                DaemonAction::ExecutePipeline {
+                    action: PipelineAction::StackOnParent { task_id: id, .. }
+                } if id.0 == task_id.0
+            )
+        }));
+    }
+
+    #[test]
+    fn daemon_tick_releases_stack_action_when_restack_backoff_elapsed() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-RS-3");
+
+        let mut pipeline = PipelineState::new(
+            task_id.clone(),
+            "task/T-RS-3".to_string(),
+            PathBuf::from(".orch/wt/T-RS-3"),
+            SubmitMode::Single,
+            Some("task/T-parent".to_string()),
+        );
+        pipeline.stage = PipelineStage::StackOnParent;
+        daemon_state.pipelines.insert(task_id.0.clone(), pipeline);
+        daemon_state.restack_retries.insert(
+            task_id.0.clone(),
+            RestackRetryState {
+                attempts: 1,
+                max_retries: 3,
+                last_attempt: Utc::now() - Duration::seconds(10),
+                backoff_secs: 5,
+            },
+        );
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                DaemonAction::ExecutePipeline {
+                    action: PipelineAction::StackOnParent { task_id: id, .. }
+                } if id.0 == task_id.0
+            )
+        }));
     }
 
     /// Helper: create a DaemonConfig whose repo_root has a `.othala/qa/baseline.md`.
@@ -1383,9 +1742,12 @@ mod tests {
             patch_ready: true,
             needs_human: false,
             success: true,
+            duration_secs: 5,
         };
 
-        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+        let mut daemon_state = DaemonState::new();
+        let actions =
+            handle_agent_completion(&service, &outcome, &config, &mut daemon_state, Utc::now());
 
         // Should spawn QA Validation, NOT MarkReady.
         assert!(actions.iter().any(|a| matches!(
@@ -1560,9 +1922,12 @@ mod tests {
             patch_ready: false,
             needs_human: true,
             success: false,
+            duration_secs: 5,
         };
 
-        let actions = handle_agent_completion(&service, &outcome, &config, Utc::now());
+        let mut daemon_state = DaemonState::new();
+        let actions =
+            handle_agent_completion(&service, &outcome, &config, &mut daemon_state, Utc::now());
         assert!(actions
             .iter()
             .any(|a| matches!(a, DaemonAction::RecordNeedsHuman { .. })));

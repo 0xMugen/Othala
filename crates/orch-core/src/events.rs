@@ -41,6 +41,28 @@ pub enum EventKind {
         model: String,
         reason: String,
     },
+    /// AI agent process started.
+    AgentSpawned {
+        model: String,
+    },
+    /// AI agent process finished.
+    AgentCompleted {
+        model: String,
+        success: bool,
+        duration_secs: u64,
+    },
+    /// Retry switched to a different model.
+    ModelFallback {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
+    /// Context regeneration started.
+    ContextRegenStarted,
+    /// Context regeneration finished.
+    ContextRegenCompleted {
+        success: bool,
+    },
     /// Task failed (final or non-final).
     TaskFailed {
         reason: String,
@@ -146,6 +168,21 @@ mod tests {
                 model: "claude".to_string(),
                 reason: "timeout".to_string(),
             },
+            EventKind::AgentSpawned {
+                model: "claude".to_string(),
+            },
+            EventKind::AgentCompleted {
+                model: "claude".to_string(),
+                success: false,
+                duration_secs: 42,
+            },
+            EventKind::ModelFallback {
+                from_model: "claude".to_string(),
+                to_model: "codex".to_string(),
+                reason: "timeout".to_string(),
+            },
+            EventKind::ContextRegenStarted,
+            EventKind::ContextRegenCompleted { success: true },
             EventKind::TaskFailed {
                 reason: "max retries".to_string(),
                 is_final: true,

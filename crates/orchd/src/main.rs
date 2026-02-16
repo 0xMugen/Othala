@@ -92,6 +92,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show event log for a task (or all tasks)
+    Logs {
+        /// Task/chat ID (omit for global events)
+        id: Option<String>,
+        /// Maximum number of events to show
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -927,7 +938,124 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("  - Model health: \x1b[33msome selected models have warnings\x1b[0m");
             }
         }
+        Commands::Logs { id, limit, json } => {
+            let events = if let Some(ref task_id_str) = id {
+                service.task_events(&TaskId::new(task_id_str))?
+            } else {
+                service.global_events()?
+            };
+
+            let display_events: Vec<_> = if events.len() > limit {
+                events[events.len() - limit..].to_vec()
+            } else {
+                events
+            };
+
+            if json {
+                let out = serde_json::to_string_pretty(&display_events)
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+            } else {
+                if display_events.is_empty() {
+                    println!("No events found.");
+                } else {
+                    for event in &display_events {
+                        let ts = event.at.format("%Y-%m-%d %H:%M:%S");
+                        let task_label = event
+                            .task_id
+                            .as_ref()
+                            .map(|t| t.0.as_str())
+                            .unwrap_or("-");
+                        let kind_str = format_event_kind(&event.kind);
+                        println!("{ts}  {task_label:<24} {kind_str}");
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn format_event_kind(kind: &EventKind) -> String {
+    match kind {
+        EventKind::TaskCreated => "task_created".to_string(),
+        EventKind::TaskStateChanged { from, to } => format!("state: {from} -> {to}"),
+        EventKind::ParentHeadUpdated { parent_task_id } => {
+            format!("parent_head_updated: {}", parent_task_id.0)
+        }
+        EventKind::RestackStarted => "restack_started".to_string(),
+        EventKind::RestackCompleted => "restack_completed".to_string(),
+        EventKind::RestackConflict => "\x1b[31mrestack_conflict\x1b[0m".to_string(),
+        EventKind::VerifyStarted => "verify_started".to_string(),
+        EventKind::VerifyCompleted { success } => {
+            if *success {
+                "\x1b[32mverify_passed\x1b[0m".to_string()
+            } else {
+                "\x1b[31mverify_failed\x1b[0m".to_string()
+            }
+        }
+        EventKind::ReadyReached => "\x1b[32mready\x1b[0m".to_string(),
+        EventKind::SubmitStarted { mode } => format!("submit_started ({mode:?})"),
+        EventKind::SubmitCompleted => "submit_completed".to_string(),
+        EventKind::NeedsHuman { reason } => format!("\x1b[33mneeds_human\x1b[0m: {reason}"),
+        EventKind::Error { code, message } => format!("\x1b[31merror\x1b[0m [{code}]: {message}"),
+        EventKind::RetryScheduled {
+            attempt,
+            model,
+            reason,
+        } => format!("retry #{attempt} ({model}): {reason}"),
+        EventKind::AgentSpawned { model } => format!("agent_spawned ({model})"),
+        EventKind::AgentCompleted {
+            model,
+            success,
+            duration_secs,
+        } => {
+            if *success {
+                format!("\x1b[32magent_completed\x1b[0m ({model}, {duration_secs}s)")
+            } else {
+                format!("\x1b[31magent_failed\x1b[0m ({model}, {duration_secs}s)")
+            }
+        }
+        EventKind::ModelFallback {
+            from_model,
+            to_model,
+            reason,
+        } => format!("model_fallback ({from_model} -> {to_model}): {reason}"),
+        EventKind::ContextRegenStarted => "context_regen_started".to_string(),
+        EventKind::ContextRegenCompleted { success } => {
+            if *success {
+                "\x1b[32mcontext_regen_completed\x1b[0m".to_string()
+            } else {
+                "\x1b[31mcontext_regen_failed\x1b[0m".to_string()
+            }
+        }
+        EventKind::TaskFailed { reason, is_final } => {
+            let label = if *is_final { "FINAL_FAILURE" } else { "failed" };
+            format!("\x1b[31m{label}\x1b[0m: {reason}")
+        }
+        EventKind::TestSpecValidated { passed, details } => {
+            let status = if *passed { "passed" } else { "failed" };
+            format!("test_spec_{status}: {details}")
+        }
+        EventKind::OrchestratorDecomposed { sub_task_ids } => {
+            format!("decomposed -> [{}]", sub_task_ids.join(", "))
+        }
+        EventKind::QAStarted { qa_type } => format!("qa_started ({qa_type})"),
+        EventKind::QACompleted {
+            passed,
+            failed,
+            total,
+        } => {
+            if *failed == 0 {
+                format!("\x1b[32mqa_passed\x1b[0m ({passed}/{total})")
+            } else {
+                format!("\x1b[31mqa_completed\x1b[0m ({passed}/{total}, {failed} failed)")
+            }
+        }
+        EventKind::QAFailed { failures } => {
+            format!("\x1b[31mqa_failed\x1b[0m: {}", failures.join("; "))
+        }
+        _ => "event".to_string(),
+    }
 }
