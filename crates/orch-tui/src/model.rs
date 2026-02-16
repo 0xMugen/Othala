@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::state::{TaskState, VerifyStatus};
 use orch_core::types::{ModelKind, RepoId, Task, TaskId};
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -78,8 +79,9 @@ pub struct TimelineEvent {
     pub event_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SortMode {
+    #[default]
     ByState,
     ByPriority,
     ByLastActivity,
@@ -106,9 +108,128 @@ impl SortMode {
     }
 }
 
-impl Default for SortMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiTheme {
+    pub accent: Color,
+    pub header_fg: Color,
+    pub header_title: Color,
+    pub dim: Color,
+    pub muted: Color,
+    pub border_normal: Color,
+    pub border_focused: Color,
+    pub selected_bg: Color,
+    pub state_chatting: Color,
+    pub state_ready: Color,
+    pub state_submitting: Color,
+    pub state_merged: Color,
+    pub state_stopped: Color,
+    pub state_restacking: Color,
+    pub state_awaiting: Color,
+}
+
+impl Default for TuiTheme {
     fn default() -> Self {
-        Self::ByState
+        default_theme()
+    }
+}
+
+pub const THEME_COUNT: usize = 4;
+
+pub fn default_theme() -> TuiTheme {
+    TuiTheme {
+        accent: Color::Cyan,
+        header_fg: Color::White,
+        header_title: Color::Cyan,
+        dim: Color::DarkGray,
+        muted: Color::Gray,
+        border_normal: Color::DarkGray,
+        border_focused: Color::Cyan,
+        selected_bg: Color::Indexed(236),
+        state_chatting: Color::Yellow,
+        state_ready: Color::Blue,
+        state_submitting: Color::Cyan,
+        state_merged: Color::Green,
+        state_stopped: Color::Red,
+        state_restacking: Color::Magenta,
+        state_awaiting: Color::LightBlue,
+    }
+}
+
+pub fn dark_theme() -> TuiTheme {
+    TuiTheme {
+        accent: Color::LightCyan,
+        header_fg: Color::White,
+        header_title: Color::LightCyan,
+        dim: Color::DarkGray,
+        muted: Color::Gray,
+        border_normal: Color::Gray,
+        border_focused: Color::LightCyan,
+        selected_bg: Color::Indexed(238),
+        state_chatting: Color::LightYellow,
+        state_ready: Color::LightBlue,
+        state_submitting: Color::Cyan,
+        state_merged: Color::LightGreen,
+        state_stopped: Color::LightRed,
+        state_restacking: Color::LightMagenta,
+        state_awaiting: Color::Blue,
+    }
+}
+
+pub fn light_theme() -> TuiTheme {
+    TuiTheme {
+        accent: Color::Blue,
+        header_fg: Color::Black,
+        header_title: Color::Blue,
+        dim: Color::Gray,
+        muted: Color::DarkGray,
+        border_normal: Color::Gray,
+        border_focused: Color::Blue,
+        selected_bg: Color::Indexed(252),
+        state_chatting: Color::Yellow,
+        state_ready: Color::Blue,
+        state_submitting: Color::LightBlue,
+        state_merged: Color::Green,
+        state_stopped: Color::Red,
+        state_restacking: Color::Magenta,
+        state_awaiting: Color::Cyan,
+    }
+}
+
+pub fn solarized_theme() -> TuiTheme {
+    TuiTheme {
+        accent: Color::Rgb(42, 161, 152),
+        header_fg: Color::Rgb(238, 232, 213),
+        header_title: Color::Rgb(181, 137, 0),
+        dim: Color::Rgb(88, 110, 117),
+        muted: Color::Rgb(101, 123, 131),
+        border_normal: Color::Rgb(88, 110, 117),
+        border_focused: Color::Rgb(38, 139, 210),
+        selected_bg: Color::Rgb(7, 54, 66),
+        state_chatting: Color::Rgb(203, 75, 22),
+        state_ready: Color::Rgb(38, 139, 210),
+        state_submitting: Color::Rgb(42, 161, 152),
+        state_merged: Color::Rgb(133, 153, 0),
+        state_stopped: Color::Rgb(220, 50, 47),
+        state_restacking: Color::Rgb(211, 54, 130),
+        state_awaiting: Color::Rgb(108, 113, 196),
+    }
+}
+
+pub fn theme_for_index(index: usize) -> TuiTheme {
+    match index % THEME_COUNT {
+        0 => default_theme(),
+        1 => dark_theme(),
+        2 => light_theme(),
+        _ => solarized_theme(),
+    }
+}
+
+pub fn theme_name(index: usize) -> &'static str {
+    match index % THEME_COUNT {
+        0 => "default",
+        1 => "dark",
+        2 => "light",
+        _ => "solarized",
     }
 }
 
@@ -397,6 +518,10 @@ pub struct DashboardState {
     pub scroll_back: usize,
     /// Which pane category (Agent / QA) is currently selected.
     pub selected_pane_category: PaneCategory,
+    #[serde(skip)]
+    pub current_theme: TuiTheme,
+    #[serde(default)]
+    pub theme_index: usize,
 }
 
 impl Default for DashboardState {
@@ -421,6 +546,8 @@ impl Default for DashboardState {
             status_line: "ready".to_string(),
             scroll_back: 0,
             selected_pane_category: PaneCategory::Agent,
+            current_theme: default_theme(),
+            theme_index: 0,
         }
     }
 }
@@ -432,6 +559,12 @@ impl DashboardState {
             tasks: rows,
             ..Self::default()
         }
+    }
+
+    pub fn cycle_theme(&mut self) -> &'static str {
+        self.theme_index = (self.theme_index + 1) % THEME_COUNT;
+        self.current_theme = theme_for_index(self.theme_index);
+        theme_name(self.theme_index)
     }
 
     pub fn state_summary(&self) -> String {
@@ -861,6 +994,7 @@ fn summarize(value: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
     use std::path::PathBuf;
 
     fn mk_task(id: &str) -> Task {
@@ -885,6 +1019,56 @@ mod tests {
         assert_eq!(SortMode::ByPriority.next(), SortMode::ByLastActivity);
         assert_eq!(SortMode::ByLastActivity.next(), SortMode::ByName);
         assert_eq!(SortMode::ByName.next(), SortMode::ByState);
+    }
+
+    #[test]
+    fn default_theme_uses_expected_palette() {
+        let theme = default_theme();
+        assert_eq!(theme.accent, Color::Cyan);
+        assert_eq!(theme.header_fg, Color::White);
+        assert_eq!(theme.border_focused, Color::Cyan);
+        assert_eq!(theme.selected_bg, Color::Indexed(236));
+        assert_eq!(theme.state_restacking, Color::Magenta);
+        assert_eq!(theme.state_awaiting, Color::LightBlue);
+    }
+
+    #[test]
+    fn named_themes_have_distinct_core_colors() {
+        let dark = dark_theme();
+        let light = light_theme();
+        let solarized = solarized_theme();
+
+        assert_eq!(dark.accent, Color::LightCyan);
+        assert_eq!(light.header_fg, Color::Black);
+        assert_eq!(solarized.selected_bg, Color::Rgb(7, 54, 66));
+        assert_ne!(dark.selected_bg, light.selected_bg);
+    }
+
+    #[test]
+    fn theme_for_index_wraps_across_all_builtins() {
+        assert_eq!(theme_for_index(0), default_theme());
+        assert_eq!(theme_for_index(1), dark_theme());
+        assert_eq!(theme_for_index(2), light_theme());
+        assert_eq!(theme_for_index(3), solarized_theme());
+        assert_eq!(theme_for_index(4), default_theme());
+    }
+
+    #[test]
+    fn dashboard_state_cycles_theme_index_and_theme() {
+        let mut state = DashboardState::default();
+        assert_eq!(state.theme_index, 0);
+        assert_eq!(state.current_theme, default_theme());
+
+        let label = state.cycle_theme();
+        assert_eq!(label, "dark");
+        assert_eq!(state.theme_index, 1);
+        assert_eq!(state.current_theme, dark_theme());
+
+        state.cycle_theme();
+        state.cycle_theme();
+        state.cycle_theme();
+        assert_eq!(state.theme_index, 0);
+        assert_eq!(state.current_theme, default_theme());
     }
 
     #[test]

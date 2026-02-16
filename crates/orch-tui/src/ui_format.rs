@@ -4,34 +4,30 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::TuiApp;
-use crate::model::{AgentPane, AgentPaneStatus, PaneCategory, QATestDisplay, TaskOverviewRow};
+use crate::model::{
+    AgentPane, AgentPaneStatus, PaneCategory, QATestDisplay, TaskOverviewRow, TuiTheme,
+};
 
-const ACCENT: Color = Color::Cyan;
-const HEADER_FG: Color = Color::White;
-const DIM: Color = Color::DarkGray;
-const MUTED: Color = Color::Gray;
-const SELECTED_BG: Color = Color::Indexed(236);
-
-pub fn state_color(state: TaskState) -> Color {
+pub fn state_color(state: TaskState, theme: &TuiTheme) -> Color {
     match state {
-        TaskState::Chatting => Color::Yellow,
-        TaskState::Ready => Color::Blue,
-        TaskState::Submitting => Color::Cyan,
-        TaskState::Restacking => Color::Magenta,
-        TaskState::AwaitingMerge => Color::LightBlue,
-        TaskState::Merged => Color::Green,
-        TaskState::Stopped => Color::Red,
+        TaskState::Chatting => theme.state_chatting,
+        TaskState::Ready => theme.state_ready,
+        TaskState::Submitting => theme.state_submitting,
+        TaskState::Restacking => theme.state_restacking,
+        TaskState::AwaitingMerge => theme.state_awaiting,
+        TaskState::Merged => theme.state_merged,
+        TaskState::Stopped => theme.state_stopped,
     }
 }
 
 /// Pick a color for the composite display state label. Falls back to `state_color`
 /// for states that are not overridden by verify status.
-pub(crate) fn display_state_color(state: TaskState, display_state: &str) -> Color {
+pub(crate) fn display_state_color(state: TaskState, display_state: &str, theme: &TuiTheme) -> Color {
     match display_state {
         "VerifyFail" | "SubmitFail" | "QAFail" => Color::Red,
         "Verified" | "QAPassed" => Color::Cyan,
         "Verifying" | "QARunning" => Color::Yellow,
-        _ => state_color(state),
+        _ => state_color(state, theme),
     }
 }
 
@@ -53,13 +49,13 @@ pub(crate) fn status_line_color(message: &str) -> Color {
     } else if lower.contains("[patch_ready]") || lower.contains("patch ready") {
         Color::Green
     } else if lower.contains("[qa_complete]") || lower.contains("qa_complete") {
-        ACCENT
+        Color::Cyan
     } else if lower.contains("error") || lower.contains("failed") || lower.contains("not found") {
         Color::Red
     } else if lower.contains("ready") || lower.contains("updated") || lower.contains("queued") {
-        ACCENT
+        Color::Cyan
     } else {
-        MUTED
+        Color::Gray
     }
 }
 
@@ -68,19 +64,20 @@ pub(crate) fn format_task_row<'a>(
     task: &'a TaskOverviewRow,
     cost_display: String,
     state_style: Style,
+    theme: &TuiTheme,
 ) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
 
     let base_style = if is_selected {
-        Style::default().bg(SELECTED_BG).fg(Color::White)
+        Style::default().bg(theme.selected_bg).fg(Color::White)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(theme.muted)
     };
 
     let prefix = if is_selected { "\u{25B6} " } else { "  " };
     let mut state_cell_style = state_style.add_modifier(Modifier::BOLD);
     if is_selected {
-        state_cell_style = state_cell_style.bg(SELECTED_BG);
+        state_cell_style = state_cell_style.bg(theme.selected_bg);
     }
     let state_label = format!("{:?}", task.state);
 
@@ -88,41 +85,42 @@ pub(crate) fn format_task_row<'a>(
         Span::styled(
             prefix,
             if is_selected {
-                Style::default().fg(ACCENT)
+                Style::default().fg(theme.accent)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(theme.dim)
             },
         ),
         Span::styled(&task.repo_id.0, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
         Span::styled(
             &task.task_id.0,
             if is_selected {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
-                    .bg(SELECTED_BG)
+                    .bg(theme.selected_bg)
             } else {
                 Style::default().fg(Color::White)
             },
         ),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
         Span::styled(&task.title, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
         Span::styled(state_label, state_cell_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
         Span::styled(&task.verify_summary, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
         Span::styled(cost_display, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(ts, Style::default().fg(DIM)),
+        Span::styled(" | ", Style::default().fg(theme.dim)),
+        Span::styled(ts, Style::default().fg(theme.dim)),
     ])
 }
 
 #[allow(dead_code)] // Used in ui.rs tests
 pub(crate) fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
+    let theme = &app.state.current_theme;
     if app.state.panes.is_empty() {
-        return Line::from(Span::styled(" none", Style::default().fg(DIM)));
+        return Line::from(Span::styled(" none", Style::default().fg(theme.dim)));
     }
 
     let mut spans = Vec::new();
@@ -137,20 +135,20 @@ pub(crate) fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
         let base_style = if is_selected {
             Style::default()
                 .fg(Color::White)
-                .bg(SELECTED_BG)
+                .bg(theme.selected_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(MUTED)
+            Style::default().fg(theme.muted)
         };
         let meta_style = if is_selected {
-            Style::default().fg(DIM).bg(SELECTED_BG)
+            Style::default().fg(theme.dim).bg(theme.selected_bg)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(theme.dim)
         };
         let status_style = if is_selected {
             Style::default()
                 .fg(sc)
-                .bg(SELECTED_BG)
+                .bg(theme.selected_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(sc).add_modifier(Modifier::BOLD)
@@ -167,6 +165,7 @@ pub(crate) fn format_pane_tabs(app: &TuiApp) -> Line<'static> {
 }
 
 pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
+    let theme = &app.state.current_theme;
     let selected = app.state.selected_pane_category;
     let task_id = app.state.selected_task().map(|t| &t.task_id);
 
@@ -177,10 +176,10 @@ pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
 
     let sel_style = Style::default()
         .fg(Color::White)
-        .bg(SELECTED_BG)
+        .bg(theme.selected_bg)
         .add_modifier(Modifier::BOLD);
-    let active_style = Style::default().fg(MUTED);
-    let dim_style = Style::default().fg(DIM);
+    let active_style = Style::default().fg(theme.muted);
+    let dim_style = Style::default().fg(theme.dim);
 
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
@@ -188,7 +187,7 @@ pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
     // Agent tab
     let agent_sel = selected == PaneCategory::Agent;
     if agent_sel {
-        spans.push(Span::styled("\u{25B8} ", Style::default().fg(ACCENT)));
+        spans.push(Span::styled("\u{25B8} ", Style::default().fg(theme.accent)));
         spans.push(Span::styled(" Agent ", sel_style));
     } else if has_agent {
         spans.push(Span::styled("  Agent ", active_style));
@@ -196,12 +195,12 @@ pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
         spans.push(Span::styled("  Agent ", dim_style));
     }
 
-    spans.push(Span::styled(" \u{2502} ", Style::default().fg(DIM)));
+    spans.push(Span::styled(" \u{2502} ", Style::default().fg(theme.dim)));
 
     // QA tab
     let qa_sel = selected == PaneCategory::QA;
     if qa_sel {
-        spans.push(Span::styled("\u{25B8} ", Style::default().fg(ACCENT)));
+        spans.push(Span::styled("\u{25B8} ", Style::default().fg(theme.accent)));
         spans.push(Span::styled(" QA ", sel_style));
     } else if has_qa {
         spans.push(Span::styled("  QA ", active_style));
@@ -210,39 +209,49 @@ pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
     }
 
     // Hint
-    spans.push(Span::styled("  \u{2190}\u{2192} switch", Style::default().fg(DIM)));
+    spans.push(Span::styled(
+        "  \u{2190}\u{2192} switch",
+        Style::default().fg(theme.dim),
+    ));
 
     Line::from(spans)
 }
 
-pub(crate) fn pane_meta_lines(pane: &AgentPane, scroll_back: Option<usize>) -> Vec<Line<'static>> {
+pub(crate) fn pane_meta_lines(
+    pane: &AgentPane,
+    scroll_back: Option<usize>,
+    theme: &TuiTheme,
+) -> Vec<Line<'static>> {
     let status = pane_status_tag(pane);
     let updated = pane.updated_at.with_timezone(&Local).format("%H:%M:%S");
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(" status ", Style::default().fg(DIM)),
+            Span::styled(" status ", Style::default().fg(theme.dim)),
             Span::styled(
                 status.to_string(),
                 Style::default()
                     .fg(pane_status_color(pane.status))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  model ", Style::default().fg(DIM)),
-            Span::styled(format!("{:?}", pane.model), Style::default().fg(HEADER_FG)),
+            Span::styled("  model ", Style::default().fg(theme.dim)),
+            Span::styled(format!("{:?}", pane.model), Style::default().fg(theme.header_fg)),
         ]),
         Line::from(vec![
-            Span::styled(" task ", Style::default().fg(DIM)),
-            Span::styled(pane.task_id.0.clone(), Style::default().fg(ACCENT)),
-            Span::styled("  lines ", Style::default().fg(DIM)),
-            Span::styled(pane.lines.len().to_string(), Style::default().fg(HEADER_FG)),
-            Span::styled("  updated ", Style::default().fg(DIM)),
-            Span::styled(updated.to_string(), Style::default().fg(MUTED)),
+            Span::styled(" task ", Style::default().fg(theme.dim)),
+            Span::styled(pane.task_id.0.clone(), Style::default().fg(theme.accent)),
+            Span::styled("  lines ", Style::default().fg(theme.dim)),
+            Span::styled(
+                pane.lines.len().to_string(),
+                Style::default().fg(theme.header_fg),
+            ),
+            Span::styled("  updated ", Style::default().fg(theme.dim)),
+            Span::styled(updated.to_string(), Style::default().fg(theme.muted)),
         ]),
     ];
     if let Some(scroll_back) = scroll_back {
         if scroll_back > 0 {
             lines.push(Line::from(vec![
-                Span::styled(" scroll ", Style::default().fg(DIM)),
+                Span::styled(" scroll ", Style::default().fg(theme.dim)),
                 Span::styled(
                     format!("+{scroll_back} lines from live tail"),
                     Style::default()
@@ -255,9 +264,9 @@ pub(crate) fn pane_meta_lines(pane: &AgentPane, scroll_back: Option<usize>) -> V
     lines
 }
 
-pub(crate) fn divider_line(width: u16) -> Line<'static> {
+pub(crate) fn divider_line(width: u16, theme: &TuiTheme) -> Line<'static> {
     let len = width.saturating_sub(4).max(8) as usize;
-    Line::from(Span::styled("-".repeat(len), Style::default().fg(DIM)))
+    Line::from(Span::styled("-".repeat(len), Style::default().fg(theme.dim)))
 }
 
 pub(crate) fn pane_status_tag(pane: &AgentPane) -> &'static str {
@@ -280,11 +289,11 @@ enum ChecklistState {
     Blocked,
 }
 
-fn checklist_line(label: &str, state: ChecklistState) -> Line<'static> {
+fn checklist_line(label: &str, state: ChecklistState, theme: &TuiTheme) -> Line<'static> {
     let (marker, marker_color, label_color) = match state {
         ChecklistState::Done => ("x", Color::Green, Color::White),
-        ChecklistState::Pending => (" ", DIM, MUTED),
-        ChecklistState::Skipped => ("-", Color::Yellow, DIM),
+        ChecklistState::Pending => (" ", theme.dim, theme.muted),
+        ChecklistState::Skipped => ("-", Color::Yellow, theme.dim),
         ChecklistState::Active => ("~", Color::Cyan, Color::White),
         ChecklistState::Blocked => ("!", Color::Red, Color::White),
     };
@@ -302,11 +311,12 @@ fn checklist_line(label: &str, state: ChecklistState) -> Line<'static> {
 pub(crate) fn status_sidebar_lines(
     task: Option<&TaskOverviewRow>,
     activity: &[String],
+    theme: &TuiTheme,
 ) -> Vec<Line<'static>> {
     let Some(task) = task else {
         return vec![Line::from(Span::styled(
             "no task selected",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ))];
     };
 
@@ -369,37 +379,37 @@ pub(crate) fn status_sidebar_lines(
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(plan_label, Style::default().fg(DIM)),
+            Span::styled(plan_label, Style::default().fg(theme.dim)),
             Span::styled(
                 plan_value.to_string(),
                 Style::default().fg(plan_color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("status: ", Style::default().fg(DIM)),
+            Span::styled("status: ", Style::default().fg(theme.dim)),
             Span::styled(
                 task.display_state.clone(),
                 Style::default()
-                    .fg(display_state_color(task.state, &task.display_state))
+                    .fg(display_state_color(task.state, &task.display_state, theme))
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "checklist",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         )),
-        checklist_line("chatting", chatting),
-        checklist_line("verifying", verifying),
-        checklist_line("restacking (if needed)", restacking),
-        checklist_line("pushing", pushing),
-        checklist_line("merging", merging),
+        checklist_line("chatting", chatting, theme),
+        checklist_line("verifying", verifying, theme),
+        checklist_line("restacking (if needed)", restacking, theme),
+        checklist_line("pushing", pushing, theme),
+        checklist_line("merging", merging, theme),
     ];
 
     if task.verify_summary != "not_run" {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("verify: ", Style::default().fg(DIM)),
+            Span::styled("verify: ", Style::default().fg(theme.dim)),
             Span::styled(
                 task.verify_summary.clone(),
                 Style::default().fg(Color::White),
@@ -415,7 +425,7 @@ pub(crate) fn status_sidebar_lines(
     };
     if let Some(detail) = push_detail {
         lines.push(Line::from(vec![
-            Span::styled("push: ", Style::default().fg(DIM)),
+            Span::styled("push: ", Style::default().fg(theme.dim)),
             Span::styled(detail.to_string(), Style::default().fg(Color::White)),
         ]));
     }
@@ -425,12 +435,12 @@ pub(crate) fn status_sidebar_lines(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "qa",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         )));
 
         // QA status line
         if let Some(ref status) = task.qa_status {
-            let (qa_marker, qa_color) = qa_status_style(status);
+            let (qa_marker, qa_color) = qa_status_style(status, theme);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("[{qa_marker}] "),
@@ -445,9 +455,9 @@ pub(crate) fn status_sidebar_lines(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "qa tests",
-                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
             )));
-            lines.extend(qa_test_lines(&task.qa_tests));
+            lines.extend(qa_test_lines(&task.qa_tests, theme));
         }
 
         // Task-specific acceptance targets
@@ -455,11 +465,11 @@ pub(crate) fn status_sidebar_lines(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "qa targets",
-                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
             )));
             for target in &task.qa_targets {
                 lines.push(Line::from(vec![
-                    Span::styled("  - ", Style::default().fg(DIM)),
+                    Span::styled("  - ", Style::default().fg(theme.dim)),
                     Span::styled(target.clone(), Style::default().fg(Color::White)),
                 ]));
             }
@@ -469,10 +479,13 @@ pub(crate) fn status_sidebar_lines(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Retry History:",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
     )));
     if task.retry_history.is_empty() {
-        lines.push(Line::from(Span::styled("No retries", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(
+            "No retries",
+            Style::default().fg(theme.dim),
+        )));
     } else {
         for entry in &task.retry_history {
             let reason = entry
@@ -496,7 +509,7 @@ pub(crate) fn status_sidebar_lines(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "activity",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         )));
         let tail = if activity.len() > 10 {
             &activity[activity.len() - 10..]
@@ -512,7 +525,7 @@ pub(crate) fn status_sidebar_lines(
             } else if lower.contains("restack") {
                 Color::Cyan
             } else {
-                DIM
+                theme.dim
             };
             lines.push(Line::from(Span::styled(
                 entry.clone(),
@@ -525,7 +538,7 @@ pub(crate) fn status_sidebar_lines(
 }
 
 /// Pick marker and color for QA status display.
-fn qa_status_style(status: &str) -> (&'static str, Color) {
+fn qa_status_style(status: &str, theme: &TuiTheme) -> (&'static str, Color) {
     let lower = status.to_ascii_lowercase();
     if lower.contains("running") {
         ("~", Color::Cyan)
@@ -534,12 +547,12 @@ fn qa_status_style(status: &str) -> (&'static str, Color) {
     } else if lower.contains("failed") {
         ("!", Color::Red)
     } else {
-        (" ", MUTED)
+        (" ", theme.muted)
     }
 }
 
 /// Render QA test results grouped by suite.
-fn qa_test_lines(tests: &[QATestDisplay]) -> Vec<Line<'static>> {
+fn qa_test_lines(tests: &[QATestDisplay], theme: &TuiTheme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut current_suite = String::new();
 
@@ -548,7 +561,7 @@ fn qa_test_lines(tests: &[QATestDisplay]) -> Vec<Line<'static>> {
             current_suite = test.suite.clone();
             lines.push(Line::from(Span::styled(
                 format!("  {}", current_suite),
-                Style::default().fg(MUTED),
+                Style::default().fg(theme.muted),
             )));
         }
 
@@ -595,17 +608,19 @@ pub(crate) fn to_local_time(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::state_color;
+    use crate::model::default_theme;
     use orch_core::state::TaskState;
     use ratatui::style::Color;
 
     #[test]
     fn state_color_returns_correct_colors() {
-        assert_eq!(state_color(TaskState::Chatting), Color::Yellow);
-        assert_eq!(state_color(TaskState::Ready), Color::Blue);
-        assert_eq!(state_color(TaskState::Submitting), Color::Cyan);
-        assert_eq!(state_color(TaskState::Restacking), Color::Magenta);
-        assert_eq!(state_color(TaskState::AwaitingMerge), Color::LightBlue);
-        assert_eq!(state_color(TaskState::Merged), Color::Green);
-        assert_eq!(state_color(TaskState::Stopped), Color::Red);
+        let theme = default_theme();
+        assert_eq!(state_color(TaskState::Chatting, &theme), Color::Yellow);
+        assert_eq!(state_color(TaskState::Ready, &theme), Color::Blue);
+        assert_eq!(state_color(TaskState::Submitting, &theme), Color::Cyan);
+        assert_eq!(state_color(TaskState::Restacking, &theme), Color::Magenta);
+        assert_eq!(state_color(TaskState::AwaitingMerge, &theme), Color::LightBlue);
+        assert_eq!(state_color(TaskState::Merged, &theme), Color::Green);
+        assert_eq!(state_color(TaskState::Stopped, &theme), Color::Red);
     }
 }

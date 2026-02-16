@@ -6,6 +6,20 @@ use std::path::{Path, PathBuf};
 const MAX_LOG_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ROTATED_FILES: usize = 5;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Added(String),
+    Removed(String),
+    Unchanged(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub added: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
 pub fn agent_log_dir(repo_root: &Path, task_id: &TaskId) -> PathBuf {
     repo_root.join(".othala/agent-output").join(&task_id.0)
 }
@@ -88,6 +102,80 @@ pub fn tail_agent_log(
     let lines: Vec<String> = content.lines().map(String::from).collect();
     let start = lines.len().saturating_sub(n);
     Ok(lines[start..].to_vec())
+}
+
+pub fn diff_agent_outputs(lines_a: &[String], lines_b: &[String]) -> Vec<DiffLine> {
+    let n = lines_a.len();
+    let m = lines_b.len();
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            if lines_a[i] == lines_b[j] {
+                lcs[i][j] = lcs[i + 1][j + 1] + 1;
+            } else {
+                lcs[i][j] = lcs[i + 1][j].max(lcs[i][j + 1]);
+            }
+        }
+    }
+
+    let mut diff = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+
+    while i < n && j < m {
+        if lines_a[i] == lines_b[j] {
+            diff.push(DiffLine::Unchanged(lines_a[i].clone()));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            diff.push(DiffLine::Removed(lines_a[i].clone()));
+            i += 1;
+        } else {
+            diff.push(DiffLine::Added(lines_b[j].clone()));
+            j += 1;
+        }
+    }
+
+    while i < n {
+        diff.push(DiffLine::Removed(lines_a[i].clone()));
+        i += 1;
+    }
+
+    while j < m {
+        diff.push(DiffLine::Added(lines_b[j].clone()));
+        j += 1;
+    }
+
+    diff
+}
+
+pub fn format_diff(diff: &[DiffLine]) -> String {
+    diff.iter()
+        .map(|line| match line {
+            DiffLine::Added(text) => format!("+ {text}"),
+            DiffLine::Removed(text) => format!("- {text}"),
+            DiffLine::Unchanged(text) => format!("  {text}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn diff_summary(diff: &[DiffLine]) -> DiffSummary {
+    let mut summary = DiffSummary {
+        added: 0,
+        removed: 0,
+        unchanged: 0,
+    };
+
+    for line in diff {
+        match line {
+            DiffLine::Added(_) => summary.added += 1,
+            DiffLine::Removed(_) => summary.removed += 1,
+            DiffLine::Unchanged(_) => summary.unchanged += 1,
+        }
+    }
+
+    summary
 }
 
 #[cfg(test)]
@@ -269,5 +357,94 @@ mod tests {
         assert!(log_dir.join("latest.log.1").exists());
 
         let _ = fs::remove_dir_all(&repo_root);
+    }
+
+    #[test]
+    fn diff_agent_outputs_computes_line_changes() {
+        let old_lines = vec![
+            "line-a".to_string(),
+            "line-b".to_string(),
+            "line-c".to_string(),
+        ];
+        let new_lines = vec![
+            "line-a".to_string(),
+            "line-c".to_string(),
+            "line-d".to_string(),
+        ];
+
+        let diff = diff_agent_outputs(&old_lines, &new_lines);
+        assert_eq!(
+            diff,
+            vec![
+                DiffLine::Unchanged("line-a".to_string()),
+                DiffLine::Removed("line-b".to_string()),
+                DiffLine::Unchanged("line-c".to_string()),
+                DiffLine::Added("line-d".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_diff_renders_expected_markers() {
+        let diff = vec![
+            DiffLine::Unchanged("same".to_string()),
+            DiffLine::Removed("old".to_string()),
+            DiffLine::Added("new".to_string()),
+        ];
+
+        assert_eq!(format_diff(&diff), "  same\n- old\n+ new");
+    }
+
+    #[test]
+    fn diff_summary_counts_all_variants() {
+        let diff = vec![
+            DiffLine::Added("a".to_string()),
+            DiffLine::Added("b".to_string()),
+            DiffLine::Removed("c".to_string()),
+            DiffLine::Unchanged("d".to_string()),
+            DiffLine::Unchanged("e".to_string()),
+        ];
+
+        assert_eq!(
+            diff_summary(&diff),
+            DiffSummary {
+                added: 2,
+                removed: 1,
+                unchanged: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn diff_agent_outputs_handles_empty_inputs() {
+        let old_lines = Vec::<String>::new();
+        let new_lines = Vec::<String>::new();
+
+        let diff = diff_agent_outputs(&old_lines, &new_lines);
+        assert!(diff.is_empty());
+        assert_eq!(
+            diff_summary(&diff),
+            DiffSummary {
+                added: 0,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(format_diff(&diff), "");
+    }
+
+    #[test]
+    fn diff_agent_outputs_handles_identical_inputs() {
+        let old_lines = vec!["same-1".to_string(), "same-2".to_string()];
+        let new_lines = vec!["same-1".to_string(), "same-2".to_string()];
+
+        let diff = diff_agent_outputs(&old_lines, &new_lines);
+        assert_eq!(
+            diff,
+            vec![
+                DiffLine::Unchanged("same-1".to_string()),
+                DiffLine::Unchanged("same-2".to_string()),
+            ]
+        );
     }
 }
