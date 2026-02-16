@@ -78,6 +78,8 @@ pub struct DaemonState {
     pub budget_last_reset_day: Option<u32>,
     pub budget_last_reset_month: Option<u32>,
     pub budget_output_chars_by_task: HashMap<String, u64>,
+    pub token_trackers: HashMap<String, crate::auto_compact::TokenTracker>,
+    pub auto_compact_config: crate::auto_compact::AutoCompactConfig,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -141,6 +143,8 @@ impl DaemonState {
             budget_last_reset_day: None,
             budget_last_reset_month: None,
             budget_output_chars_by_task: HashMap::new(),
+            token_trackers: HashMap::new(),
+            auto_compact_config: crate::auto_compact::AutoCompactConfig::default(),
         }
     }
 
@@ -386,6 +390,11 @@ pub fn daemon_tick(
 
         for chunk in &poll_result.output {
             track_output_chars(daemon_state, &chunk.task_id, &chunk.lines);
+            let output = chunk.lines.join("\n");
+            if let Some(tracker) = daemon_state.token_trackers.get_mut(&chunk.task_id.0) {
+                let estimated = crate::auto_compact::estimate_tokens(&output);
+                tracker.record_usage(estimated, 0);
+            }
             if let Err(err) =
                 agent_log::append_agent_output(&config.repo_root, &chunk.task_id, &chunk.lines)
             {
@@ -498,6 +507,11 @@ pub fn daemon_tick(
 
     for chunk in &poll_result.output {
         track_output_chars(daemon_state, &chunk.task_id, &chunk.lines);
+        let output = chunk.lines.join("\n");
+        if let Some(tracker) = daemon_state.token_trackers.get_mut(&chunk.task_id.0) {
+            let estimated = crate::auto_compact::estimate_tokens(&output);
+            tracker.record_usage(estimated, 0);
+        }
         if let Err(err) =
             agent_log::append_agent_output(&config.repo_root, &chunk.task_id, &chunk.lines)
         {
