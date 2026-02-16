@@ -414,6 +414,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List available models with pricing and capabilities
+    Models {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List provider information
+    Providers {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show .othalaignore rules
+    Ignore {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3685,6 +3703,47 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 println!("{}", orchd::upgrade::display_version_check(&info));
+            }
+        }
+        Commands::Models { json } => {
+            let registry = orchd::provider_registry::ModelRegistry::new();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&registry).unwrap_or_default());
+            } else {
+                println!("{}", registry.display_table());
+            }
+        }
+        Commands::Providers { json } => {
+            let registry = orchd::provider_registry::ModelRegistry::new();
+            if json {
+                let providers = registry.list_providers();
+                println!("{}", serde_json::to_string_pretty(&providers).unwrap_or_default());
+            } else {
+                for p in registry.list_providers() {
+                    println!("{} ({})", p.display_name, p.name);
+                    println!("  API: {}", p.api_base);
+                    println!("  Auth: ${}", p.auth_env_var);
+                    let models = registry.models_for_provider(&p.name);
+                    if !models.is_empty() {
+                        println!("  Models:");
+                        for m in models {
+                            println!("    - {} ({}K ctx)", m.display_name, m.context_window / 1000);
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+        Commands::Ignore { json } => {
+            let rules = orchd::ignore::load_ignore_rules(Path::new("."));
+            if json {
+                let patterns: Vec<String> = rules.patterns().iter().map(|p| match p {
+                    orchd::ignore::IgnorePattern::Include(s) => s.clone(),
+                    orchd::ignore::IgnorePattern::Exclude(s) => format!("!{s}"),
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&patterns).unwrap_or_default());
+            } else {
+                println!("{}", orchd::ignore::display_ignore_rules(&rules));
             }
         }
     }
