@@ -525,6 +525,44 @@ enum Commands {
         #[arg(long, default_value = "9898")]
         port: u16,
     },
+    /// Manage conversation history
+    Conversations {
+        #[command(subcommand)]
+        action: ConversationAction,
+    },
+    /// Show or configure shell settings
+    Shell {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConversationAction {
+    /// List conversations for a task
+    List {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a specific conversation
+    Show {
+        id: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export conversation as JSON
+    Export { id: String },
+    /// Search across conversations
+    Search {
+        query: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4022,6 +4060,82 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => eprintln!("Failed to start MCP HTTP transport: {e}"),
+            }
+        }
+        Commands::Conversations { action } => match action {
+            ConversationAction::List { task_id, json } => {
+                let store = orchd::conversation::ConversationStore::new();
+                if let Some(tid) = &task_id {
+                    let convos = store.get_task_conversations(tid);
+                    if json {
+                        let info: Vec<_> = convos.iter().map(|c| serde_json::json!({
+                            "id": c.id, "task_id": c.task_id, "messages": c.messages.len(),
+                            "total_tokens": c.total_tokens
+                        })).collect();
+                        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+                    } else if convos.is_empty() {
+                        println!("No conversations for task {tid}");
+                    } else {
+                        for c in &convos {
+                            println!("{} ({} messages, {} tokens)", c.id, c.messages.len(), c.total_tokens);
+                        }
+                    }
+                } else {
+                    println!("Use --task-id to filter conversations");
+                }
+            }
+            ConversationAction::Show { id, limit, json } => {
+                let store = orchd::conversation::ConversationStore::new();
+                if let Some(convo) = store.get_conversation(&id) {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(convo).unwrap_or_default());
+                    } else {
+                        let msgs = store.get_messages(&id, limit, None);
+                        for m in msgs {
+                            println!("[{}] {:?}: {}", m.timestamp.format("%H:%M:%S"), m.role, &m.content[..m.content.len().min(200)]);
+                        }
+                    }
+                } else {
+                    eprintln!("Conversation not found: {id}");
+                }
+            }
+            ConversationAction::Export { id } => {
+                let store = orchd::conversation::ConversationStore::new();
+                match store.export_conversation(&id) {
+                    Ok(json_str) => println!("{json_str}"),
+                    Err(e) => eprintln!("Export failed: {e}"),
+                }
+            }
+            ConversationAction::Search { query, json } => {
+                let store = orchd::conversation::ConversationStore::new();
+                let results = store.search_messages(&query);
+                if json {
+                    let info: Vec<_> = results.iter().map(|(c, m)| serde_json::json!({
+                        "conversation_id": c.id, "message_id": m.id, "role": format!("{:?}", m.role),
+                        "content": &m.content[..m.content.len().min(200)]
+                    })).collect();
+                    println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+                } else if results.is_empty() {
+                    println!("No messages matching: {query}");
+                } else {
+                    for (c, m) in &results {
+                        println!("[{}] {:?}: {}...", c.id, m.role, &m.content[..m.content.len().min(100)]);
+                    }
+                }
+            }
+        },
+        Commands::Shell { json } => {
+            let config = orchd::shell_config::ShellConfig::default();
+            let detected = orchd::shell_config::ShellRunner::detect_shell();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap_or_default());
+            } else {
+                println!("Shell Config:");
+                println!("  Path:      {}", config.path);
+                println!("  Args:      {:?}", config.args);
+                println!("  Timeout:   {}s", config.timeout_secs);
+                println!("  Inherit:   {}", config.inherit_env);
+                println!("  Detected:  {detected:?}");
             }
         }
     }
