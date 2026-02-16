@@ -436,6 +436,7 @@ fn main() -> anyhow::Result<()> {
             let start = Instant::now();
             let mut idle_grace_ticks: u32 = 0;
             const IDLE_GRACE_MAX: u32 = 3;
+            let mut prev_states: HashMap<String, TaskState> = HashMap::new();
 
             loop {
                 orchd::daemon_loop::run_tick(
@@ -446,6 +447,15 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 let tasks = service.list_tasks()?;
+                for task in &tasks {
+                    let prev = prev_states.get(&task.id.0);
+                    if prev != Some(&task.state) {
+                        if let Some(old) = prev {
+                            eprintln!("[daemon] {} -> {} ({})", task.id.0, task.state, old);
+                        }
+                        prev_states.insert(task.id.0.clone(), task.state.clone());
+                    }
+                }
                 if !tasks.is_empty() {
                     let chatting = tasks.iter().filter(|t| t.state == TaskState::Chatting).count();
                     let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
