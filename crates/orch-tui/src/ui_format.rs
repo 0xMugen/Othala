@@ -65,57 +65,84 @@ pub(crate) fn status_line_color(message: &str) -> Color {
 
 pub(crate) fn format_task_row<'a>(
     is_selected: bool,
+    is_marked: bool,
     task: &'a TaskOverviewRow,
     cost_display: String,
     state_style: Style,
 ) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
+    let row_bg = if is_marked {
+        Some(Color::DarkGray)
+    } else {
+        None
+    };
 
-    let base_style = if is_selected {
-        Style::default().bg(SELECTED_BG).fg(Color::White)
+    let base_style = if let Some(bg) = row_bg {
+        Style::default().bg(bg).fg(Color::White)
     } else {
         Style::default().fg(MUTED)
     };
+    let separator_style = if let Some(bg) = row_bg {
+        Style::default().fg(DIM).bg(bg)
+    } else {
+        Style::default().fg(DIM)
+    };
 
-    let prefix = if is_selected { "\u{25B6} " } else { "  " };
+    let marker_style = if let Some(bg) = row_bg {
+        Style::default()
+            .fg(Color::Green)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+
     let mut state_cell_style = state_style.add_modifier(Modifier::BOLD);
-    if is_selected {
-        state_cell_style = state_cell_style.bg(SELECTED_BG);
+    if let Some(bg) = row_bg {
+        state_cell_style = state_cell_style.bg(bg);
     }
     let state_label = format!("{:?}", task.state);
 
+    let mut selected_task_style = if is_selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    if let Some(bg) = row_bg {
+        selected_task_style = selected_task_style.bg(bg);
+    }
+
+    let mut ts_style = Style::default().fg(DIM);
+    if let Some(bg) = row_bg {
+        ts_style = ts_style.bg(bg);
+    }
+
     Line::from(vec![
         Span::styled(
-            prefix,
-            if is_selected {
-                Style::default().fg(ACCENT)
-            } else {
-                Style::default().fg(DIM)
-            },
+            format!(" {} ", if is_marked { "✓" } else { " " }),
+            marker_style,
         ),
-        Span::styled(&task.repo_id.0, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
         Span::styled(
-            &task.task_id.0,
+            &task.repo_id.0,
             if is_selected {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(SELECTED_BG)
+                base_style.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                base_style
             },
         ),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
+        Span::styled(&task.task_id.0, selected_task_style),
+        Span::styled(" | ", separator_style),
         Span::styled(&task.title, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
         Span::styled(state_label, state_cell_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
         Span::styled(&task.verify_summary, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
         Span::styled(cost_display, base_style),
-        Span::styled(" | ", Style::default().fg(DIM)),
-        Span::styled(ts, Style::default().fg(DIM)),
+        Span::styled(" | ", separator_style),
+        Span::styled(ts, ts_style),
     ])
 }
 

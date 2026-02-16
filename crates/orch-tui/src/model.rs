@@ -78,8 +78,9 @@ pub struct TimelineEvent {
     pub event_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SortMode {
+    #[default]
     ByState,
     ByPriority,
     ByLastActivity,
@@ -103,12 +104,6 @@ impl SortMode {
             SortMode::ByLastActivity => SortMode::ByName,
             SortMode::ByName => SortMode::ByState,
         }
-    }
-}
-
-impl Default for SortMode {
-    fn default() -> Self {
-        Self::ByState
     }
 }
 
@@ -371,6 +366,8 @@ pub struct ModelHealthDisplay {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
+    #[serde(default)]
+    pub selected_task_ids: std::collections::HashSet<String>,
     pub panes: Vec<AgentPane>,
     #[serde(default)]
     pub recent_errors: Vec<ErrorEntry>,
@@ -403,6 +400,7 @@ impl Default for DashboardState {
     fn default() -> Self {
         Self {
             tasks: Vec::new(),
+            selected_task_ids: std::collections::HashSet::new(),
             panes: Vec::new(),
             recent_errors: Vec::new(),
             log_root: None,
@@ -477,6 +475,26 @@ impl DashboardState {
 
     pub fn selected_task(&self) -> Option<&TaskOverviewRow> {
         self.tasks.get(self.selected_task_idx)
+    }
+
+    pub fn toggle_selection(&mut self, task_id: &str) {
+        if !self.selected_task_ids.remove(task_id) {
+            self.selected_task_ids.insert(task_id.to_string());
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        for task in &self.tasks {
+            self.selected_task_ids.insert(task.task_id.0.clone());
+        }
+    }
+
+    pub fn deselect_all(&mut self) {
+        self.selected_task_ids.clear();
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected_task_ids.len()
     }
 
     pub fn selected_pane(&self) -> Option<&AgentPane> {
@@ -1032,6 +1050,20 @@ mod tests {
     fn completion_percentage_empty_tasks() {
         let state = DashboardState::default();
         assert_eq!(state.completion_percentage(), 0.0);
+    }
+
+    #[test]
+    fn selected_count_tracks_correctly() {
+        let mut state = DashboardState::default();
+        state.toggle_selection("T1");
+        state.toggle_selection("T2");
+        assert_eq!(state.selected_count(), 2);
+
+        state.toggle_selection("T1");
+        assert_eq!(state.selected_count(), 1);
+
+        state.deselect_all();
+        assert_eq!(state.selected_count(), 0);
     }
 
     #[test]

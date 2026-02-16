@@ -1,6 +1,181 @@
 use crate::error::NotifyError;
 use crate::types::{NotificationMessage, NotificationPolicy, NotificationSinkKind};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub initial_delay_ms: u64,
+    pub backoff_multiplier: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEntry {
+    pub notification_id: String,
+    pub sink_kind: String,
+    pub payload: String,
+    pub last_error: String,
+    pub attempts: u32,
+    pub created_at: String,
+    pub last_attempt_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeadLetterQueue {
+    entries: Vec<DeadLetterEntry>,
+    max_size: usize,
+}
+
+impl DeadLetterQueue {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_size,
+        }
+    }
+
+    pub fn push(&mut self, entry: DeadLetterEntry) {
+        if self.max_size == 0 {
+            return;
+        }
+
+        if self.entries.len() >= self.max_size {
+            self.entries.remove(0);
+        }
+        self.entries.push(entry);
+    }
+
+    pub fn entries(&self) -> &[DeadLetterEntry] {
+        &self.entries
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for DeadLetterQueue {
+    fn default() -> Self {
+        Self::new(1000)
+    }
+}
+
+pub fn exponential_backoff_delay_ms(config: &RetryConfig, attempt: u32) -> u64 {
+    if attempt <= 1 {
+        return config.initial_delay_ms;
+    }
+
+    let mut delay = config.initial_delay_ms;
+    for _ in 1..attempt {
+        delay = delay.saturating_mul(config.backoff_multiplier);
+    }
+    delay
+}
+
+fn should_retry(err: &NotifyError) -> bool {
+    matches!(err, NotifyError::SinkFailed { .. })
+}
+
+fn build_dead_letter_entry(
+    sink: &dyn NotificationSink,
+    message: &NotificationMessage,
+    attempts: u32,
+    last_error: NotifyError,
+) -> DeadLetterEntry {
+    let now = Utc::now().to_rfc3339();
+    let payload = serde_json::to_string(message).unwrap_or_else(|e| {
+        format!(
+            "{{\"error\":\"failed to serialize notification\",\"detail\":\"{}\"}}",
+            e
+        )
+    });
+
+    DeadLetterEntry {
+        notification_id: format!(
+            "{:?}-{}-{}",
+            message.topic,
+            message.at.timestamp_millis(),
+            message.title
+        ),
+        sink_kind: format!("{:?}", sink.kind()),
+        payload,
+        last_error: last_error.to_string(),
+        attempts,
+        created_at: now.clone(),
+        last_attempt_at: now,
+    }
+}
+
+fn delivery_with_retry_sync(
+    sink: &dyn NotificationSink,
+    message: &NotificationMessage,
+    config: &RetryConfig,
+) -> Result<(), Box<DeadLetterEntry>> {
+    let max_attempts = config.max_attempts.max(1);
+    for attempt in 1..=max_attempts {
+        match sink.send(message) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt >= max_attempts || !should_retry(&err) {
+                    return Err(Box::new(build_dead_letter_entry(sink, message, attempt, err)));
+                }
+
+                let delay_ms = exponential_backoff_delay_ms(config, attempt);
+                eprintln!(
+                    "[notify] retry attempt {}/{} for {:?} in {}ms",
+                    attempt + 1,
+                    max_attempts,
+                    sink.kind(),
+                    delay_ms
+                );
+
+                if delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+        }
+    }
+
+    Err(Box::new(build_dead_letter_entry(
+        sink,
+        message,
+        max_attempts,
+        NotifyError::SinkFailed {
+            message: "retry loop exhausted without terminal result".to_string(),
+        },
+    )))
+}
+
+pub async fn delivery_with_retry(
+    sink: &dyn NotificationSink,
+    notification: &NotificationMessage,
+    config: &RetryConfig,
+) -> Result<(), Box<DeadLetterEntry>> {
+    delivery_with_retry_sync(sink, notification, config)
+}
 
 pub trait NotificationSink: Send + Sync {
     fn kind(&self) -> NotificationSinkKind;
@@ -222,11 +397,37 @@ impl NotificationSink for SlackSink {
 
 pub struct NotificationDispatcher {
     sinks: Vec<Box<dyn NotificationSink>>,
+    retry_config: RetryConfig,
+    dead_letters: Mutex<DeadLetterQueue>,
 }
 
 impl NotificationDispatcher {
     pub fn new(sinks: Vec<Box<dyn NotificationSink>>) -> Self {
-        Self { sinks }
+        Self {
+            sinks,
+            retry_config: RetryConfig::default(),
+            dead_letters: Mutex::new(DeadLetterQueue::default()),
+        }
+    }
+
+    pub fn with_retry_config(sinks: Vec<Box<dyn NotificationSink>>, retry_config: RetryConfig) -> Self {
+        Self {
+            sinks,
+            retry_config,
+            dead_letters: Mutex::new(DeadLetterQueue::default()),
+        }
+    }
+
+    pub fn with_retry_and_dead_letter_config(
+        sinks: Vec<Box<dyn NotificationSink>>,
+        retry_config: RetryConfig,
+        dead_letter_max_size: usize,
+    ) -> Self {
+        Self {
+            sinks,
+            retry_config,
+            dead_letters: Mutex::new(DeadLetterQueue::new(dead_letter_max_size)),
+        }
     }
 
     pub fn from_policy(policy: &NotificationPolicy) -> Self {
@@ -239,7 +440,33 @@ impl NotificationDispatcher {
                 NotificationSinkKind::Slack => {}
             }
         }
-        Self { sinks }
+        Self {
+            sinks,
+            retry_config: RetryConfig::default(),
+            dead_letters: Mutex::new(DeadLetterQueue::default()),
+        }
+    }
+
+    pub fn failed_notifications(&self) -> Vec<DeadLetterEntry> {
+        self.dead_letters
+            .lock()
+            .expect("dead letter queue lock")
+            .entries()
+            .to_vec()
+    }
+
+    pub fn clear_failed_notifications(&self) {
+        self.dead_letters
+            .lock()
+            .expect("dead letter queue lock")
+            .clear();
+    }
+
+    pub fn failed_notifications_len(&self) -> usize {
+        self.dead_letters
+            .lock()
+            .expect("dead letter queue lock")
+            .len()
     }
 
     pub fn dispatch(
@@ -248,7 +475,25 @@ impl NotificationDispatcher {
     ) -> Vec<(NotificationSinkKind, Result<(), NotifyError>)> {
         let mut out = Vec::new();
         for sink in &self.sinks {
-            out.push((sink.kind(), sink.send(message)));
+            let result = match delivery_with_retry_sync(sink.as_ref(), message, &self.retry_config) {
+                Ok(()) => Ok(()),
+                Err(dead_letter_entry) => {
+                    let error_message = dead_letter_entry.last_error.clone();
+                    self.dead_letters
+                        .lock()
+                        .expect("dead letter queue lock")
+                        .push(*dead_letter_entry);
+
+                    Err(NotifyError::SinkFailed {
+                        message: format!(
+                            "delivery failed after retry attempts: {}",
+                            error_message
+                        ),
+                    })
+                }
+            };
+
+            out.push((sink.kind(), result));
         }
         out
     }
@@ -260,7 +505,10 @@ mod tests {
     use orch_core::types::{RepoId, TaskId};
     use std::sync::{Arc, Mutex};
 
-    use super::{NotificationDispatcher, NotificationSink};
+    use super::{
+        exponential_backoff_delay_ms, DeadLetterEntry, DeadLetterQueue, NotificationDispatcher,
+        NotificationSink, RetryConfig,
+    };
     use crate::error::NotifyError;
     use crate::types::{
         NotificationMessage, NotificationPolicy, NotificationSeverity, NotificationSinkKind,
@@ -299,6 +547,43 @@ mod tests {
             Err(NotifyError::SinkFailed {
                 message: "fail".to_string(),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FlakySink {
+        attempts: Arc<Mutex<u32>>,
+        succeed_on: u32,
+        kind: NotificationSinkKind,
+    }
+
+    impl NotificationSink for FlakySink {
+        fn kind(&self) -> NotificationSinkKind {
+            self.kind
+        }
+
+        fn send(&self, _message: &NotificationMessage) -> Result<(), NotifyError> {
+            let mut attempts = self.attempts.lock().expect("flaky sink attempts lock");
+            *attempts += 1;
+            if *attempts >= self.succeed_on {
+                Ok(())
+            } else {
+                Err(NotifyError::SinkFailed {
+                    message: "transient failure".to_string(),
+                })
+            }
+        }
+    }
+
+    fn mk_dead_letter(id: &str) -> DeadLetterEntry {
+        DeadLetterEntry {
+            notification_id: id.to_string(),
+            sink_kind: "webhook".to_string(),
+            payload: "{}".to_string(),
+            last_error: "boom".to_string(),
+            attempts: 3,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_attempt_at: "2026-01-01T00:00:01Z".to_string(),
         }
     }
 
@@ -450,5 +735,91 @@ mod tests {
         let payload = super::SlackSink::build_payload(&msg, None);
         let text = payload["text"].as_str().unwrap();
         assert!(text.contains("⚠️"));
+    }
+
+    #[test]
+    fn retry_succeeds_on_second_attempt() {
+        let attempts = Arc::new(Mutex::new(0));
+        let dispatcher = NotificationDispatcher::with_retry_config(
+            vec![Box::new(FlakySink {
+                attempts: attempts.clone(),
+                succeed_on: 2,
+                kind: NotificationSinkKind::Webhook,
+            })],
+            RetryConfig {
+                max_attempts: 3,
+                initial_delay_ms: 0,
+                backoff_multiplier: 2,
+            },
+        );
+
+        let results = dispatcher.dispatch(&mk_message());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+        assert_eq!(dispatcher.failed_notifications_len(), 0);
+    }
+
+    #[test]
+    fn retry_exhausts_attempts_to_dead_letter() {
+        let dispatcher = NotificationDispatcher::with_retry_and_dead_letter_config(
+            vec![Box::new(AlwaysFailSink)],
+            RetryConfig {
+                max_attempts: 3,
+                initial_delay_ms: 0,
+                backoff_multiplier: 2,
+            },
+            10,
+        );
+
+        let results = dispatcher.dispatch(&mk_message());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_err());
+        assert_eq!(dispatcher.failed_notifications_len(), 1);
+
+        let failed = dispatcher.failed_notifications();
+        assert_eq!(failed[0].attempts, 3);
+        assert_eq!(failed[0].sink_kind, "Telegram");
+    }
+
+    #[test]
+    fn dead_letter_queue_respects_max_size() {
+        let mut queue = DeadLetterQueue::new(2);
+        queue.push(mk_dead_letter("n1"));
+        queue.push(mk_dead_letter("n2"));
+        queue.push(mk_dead_letter("n3"));
+
+        let entries = queue.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].notification_id, "n2");
+        assert_eq!(entries[1].notification_id, "n3");
+    }
+
+    #[test]
+    fn dead_letter_queue_entries_returns_all() {
+        let mut queue = DeadLetterQueue::new(5);
+        queue.push(mk_dead_letter("a1"));
+        queue.push(mk_dead_letter("a2"));
+
+        let ids: Vec<&str> = queue
+            .entries()
+            .iter()
+            .map(|entry| entry.notification_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a1", "a2"]);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn exponential_backoff_calculation() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2,
+        };
+
+        assert_eq!(exponential_backoff_delay_ms(&config, 1), 1000);
+        assert_eq!(exponential_backoff_delay_ms(&config, 2), 2000);
+        assert_eq!(exponential_backoff_delay_ms(&config, 3), 4000);
     }
 }

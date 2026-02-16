@@ -2,7 +2,7 @@ use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use orch_core::state::TaskState;
 use orch_core::types::{ModelKind, Task, TaskId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::action::{action_label, map_key_to_command, UiAction, UiCommand};
 use crate::event::TuiEvent;
@@ -138,6 +138,15 @@ impl TuiApp {
                 row
             })
             .collect();
+        let valid_task_ids: HashSet<String> = self
+            .state
+            .tasks
+            .iter()
+            .map(|task| task.task_id.0.clone())
+            .collect();
+        self.state
+            .selected_task_ids
+            .retain(|task_id| valid_task_ids.contains(task_id));
         self.state.ensure_selected_task_visible();
     }
 
@@ -166,6 +175,36 @@ impl TuiApp {
         self.action_queue.drain(..).collect()
     }
 
+    fn selected_task_ids_in_task_order(&self) -> Vec<TaskId> {
+        self.state
+            .tasks
+            .iter()
+            .filter(|task| self.state.selected_task_ids.contains(&task.task_id.0))
+            .map(|task| task.task_id.clone())
+            .collect()
+    }
+
+    fn queue_batch_action(&mut self, action: UiAction, task_ids: Vec<TaskId>) {
+        if task_ids.is_empty() {
+            return;
+        }
+
+        for task_id in &task_ids {
+            self.action_queue.push_back(QueuedAction::Dispatch {
+                action,
+                task_id: Some(task_id.clone()),
+                prompt: None,
+                model: None,
+            });
+        }
+
+        self.state.status_line = format!(
+            "queued action={} tasks={}",
+            action_label(action),
+            task_ids.len()
+        );
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return;
@@ -177,6 +216,53 @@ impl TuiApp {
         }
 
         if self.handle_input_mode_key(key) {
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('a')
+        {
+            if self.state.selected_count() > 0 {
+                self.state.deselect_all();
+                self.state.status_line = "selection cleared".to_string();
+            } else {
+                for idx in self.state.filtered_tasks() {
+                    if let Some(task) = self.state.tasks.get(idx) {
+                        self.state.selected_task_ids.insert(task.task_id.0.clone());
+                    }
+                }
+                self.state.status_line =
+                    format!("selected {} task(s)", self.state.selected_count());
+            }
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char(' ') {
+            let Some(task_id) = self.state.selected_task().map(|task| task.task_id.0.clone()) else {
+                self.state.status_line = "no task selected".to_string();
+                return;
+            };
+            self.state.toggle_selection(&task_id);
+            self.state.status_line = format!("selected {} task(s)", self.state.selected_count());
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal)
+            && self.state.selected_count() > 0
+            && key.code == KeyCode::Char('d')
+        {
+            let task_ids = self.selected_task_ids_in_task_order();
+            self.queue_batch_action(UiAction::DeleteTask, task_ids);
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal)
+            && self.state.selected_count() > 0
+            && key.code == KeyCode::Char('s')
+        {
+            let task_ids = self.selected_task_ids_in_task_order();
+            self.queue_batch_action(UiAction::StopAgent, task_ids);
             return;
         }
 
@@ -3065,6 +3151,70 @@ mod tests {
             pr_url: None,
             model_display: None,
         }
+    }
+
+    #[test]
+    fn space_toggles_task_selection() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.state.selected_task_ids.contains("T1"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.state.selected_task_ids.contains("T1"));
+    }
+
+    #[test]
+    fn ctrl_a_selects_all() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1"), make_task_row("T2"), make_task_row("T3")];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.state.selected_count(), 3);
+        assert!(app.state.selected_task_ids.contains("T1"));
+        assert!(app.state.selected_task_ids.contains("T2"));
+        assert!(app.state.selected_task_ids.contains("T3"));
+    }
+
+    #[test]
+    fn ctrl_a_deselects_when_any_selected() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1"), make_task_row("T2")];
+        app.state.selected_task_ids.insert("T1".to_string());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.state.selected_count(), 0);
+        assert!(app.state.selected_task_ids.is_empty());
+    }
+
+    #[test]
+    fn batch_delete_emits_multiple_actions() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1"), make_task_row("T2"), make_task_row("T3")];
+        app.state.selected_task_ids.insert("T1".to_string());
+        app.state.selected_task_ids.insert("T3".to_string());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 2);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::DeleteTask,
+            Some(TaskId("T1".to_string())),
+            None,
+            None,
+        );
+        assert_dispatch_action(
+            &drained[1],
+            UiAction::DeleteTask,
+            Some(TaskId("T3".to_string())),
+            None,
+            None,
+        );
     }
 
     fn make_log_root(task_id: &str, content: &str) -> String {
