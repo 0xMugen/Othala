@@ -4,7 +4,7 @@ use std::fmt;
 
 const CLEANUP_IDLE_SECS: i64 = 7_200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateLimitConfig {
     pub requests_per_minute: u32,
     pub requests_per_hour: u32,
