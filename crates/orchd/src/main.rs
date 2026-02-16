@@ -4,13 +4,22 @@
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use orch_agents::setup::{
+    probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupProbeConfig,
+};
+use orch_core::config::{
+    apply_setup_selection_to_org_config, load_org_config, save_org_config, ConcurrencyConfig,
+    GraphiteOrgConfig, ModelsConfig, MovePolicy, OrgConfig, UiConfig,
+};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{provision_chat_workspace_on_base, OrchdService, Scheduler, SchedulerConfig};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -64,6 +73,21 @@ enum Commands {
         /// Skip all QA runs (baseline + validation)
         #[arg(long)]
         skip_qa: bool,
+    },
+    /// Interactive first-time setup wizard
+    Wizard {
+        /// Enable models non-interactively (comma-separated, e.g. claude,codex)
+        #[arg(long)]
+        enable: Option<String>,
+        /// Per-model concurrency to set in org config
+        #[arg(long)]
+        per_model_concurrency: Option<usize>,
+    },
+    /// Validate Othala installation and environment
+    SelfTest {
+        /// Output as JSON (for scripting)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -220,6 +244,82 @@ fn parse_model(s: &str) -> ModelKind {
     }
 }
 
+fn parse_model_name(s: &str) -> Option<ModelKind> {
+    match s.trim().to_lowercase().as_str() {
+        "claude" => Some(ModelKind::Claude),
+        "codex" => Some(ModelKind::Codex),
+        "gemini" => Some(ModelKind::Gemini),
+        _ => None,
+    }
+}
+
+fn model_name(model: ModelKind) -> &'static str {
+    match model {
+        ModelKind::Claude => "claude",
+        ModelKind::Codex => "codex",
+        ModelKind::Gemini => "gemini",
+    }
+}
+
+fn parse_enable_models_csv(raw: &str) -> anyhow::Result<Vec<ModelKind>> {
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(model) = parse_model_name(token) else {
+            anyhow::bail!(
+                "unknown model '{token}'. valid values: claude,codex,gemini"
+            );
+        };
+        out.push(model);
+    }
+    if out.is_empty() {
+        anyhow::bail!("no models provided. pass --enable claude,codex,gemini");
+    }
+    Ok(out)
+}
+
+fn default_org_config(enabled_models: Vec<ModelKind>) -> OrgConfig {
+    let default_model = enabled_models.first().copied();
+    OrgConfig {
+        models: ModelsConfig {
+            enabled: enabled_models,
+            default: default_model,
+        },
+        concurrency: ConcurrencyConfig {
+            per_repo: 10,
+            claude: 10,
+            codex: 10,
+            gemini: 10,
+        },
+        graphite: GraphiteOrgConfig {
+            auto_submit: true,
+            submit_mode_default: SubmitMode::Single,
+            allow_move: MovePolicy::Manual,
+        },
+        ui: UiConfig {
+            web_bind: "127.0.0.1:9842".to_string(),
+        },
+    }
+}
+
+fn prompt_enabled_models() -> anyhow::Result<Vec<ModelKind>> {
+    let mut line = String::new();
+    loop {
+        eprint!("Enable models (comma-separated: claude,codex,gemini): ");
+        std::io::stderr().flush()?;
+        line.clear();
+        std::io::stdin().read_line(&mut line)?;
+
+        match parse_enable_models_csv(&line) {
+            Ok(models) => return Ok(models),
+            Err(err) => eprintln!("\x1b[31mInvalid input: {err}\x1b[0m"),
+        }
+    }
+}
+
 fn all_tasks_idle(service: &OrchdService) -> bool {
     match service.list_tasks() {
         Ok(tasks) if tasks.is_empty() => false,
@@ -242,6 +342,185 @@ fn find_stack_parent(tasks: &[Task], repo_id: &RepoId) -> Option<(TaskId, String
         })
         .max_by(|a, b| a.2.cmp(&b.2))
         .map(|(task_id, branch, _)| (task_id, branch))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SelfTestCheck {
+    name: String,
+    ok: bool,
+    critical: bool,
+    detail: String,
+}
+
+fn command_available(executable: &str) -> bool {
+    Command::new(executable)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn run_self_test(json: bool) -> bool {
+    let mut checks = Vec::new();
+
+    let git_available = command_available("git");
+    checks.push(SelfTestCheck {
+        name: "git_available".to_string(),
+        ok: git_available,
+        critical: true,
+        detail: if git_available {
+            "git is available".to_string()
+        } else {
+            "git not found on PATH".to_string()
+        },
+    });
+
+    let in_git_repo = if git_available {
+        Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    checks.push(SelfTestCheck {
+        name: "in_git_repo".to_string(),
+        ok: in_git_repo,
+        critical: true,
+        detail: if in_git_repo {
+            "current directory is inside a git repository".to_string()
+        } else {
+            "current directory is not inside a git repository".to_string()
+        },
+    });
+
+    let gt_available = command_available("gt");
+    checks.push(SelfTestCheck {
+        name: "graphite_cli_available".to_string(),
+        ok: gt_available,
+        critical: true,
+        detail: if gt_available {
+            "gt is available".to_string()
+        } else {
+            "gt not found on PATH".to_string()
+        },
+    });
+
+    let model_report = probe_models(&SetupProbeConfig::default());
+    for probe in model_report.models {
+        let missing_env = probe
+            .env_status
+            .iter()
+            .filter(|status| !status.satisfied)
+            .map(|status| format!("({})", status.any_of.join(" or ")))
+            .collect::<Vec<_>>();
+
+        let detail = if probe.healthy {
+            probe
+                .version_output
+                .clone()
+                .unwrap_or_else(|| "healthy".to_string())
+        } else if !probe.installed {
+            format!("{} not installed", probe.executable)
+        } else if !probe.version_ok {
+            probe
+                .version_output
+                .clone()
+                .unwrap_or_else(|| "version check failed".to_string())
+        } else if !missing_env.is_empty() {
+            format!("missing env: {}", missing_env.join(", "))
+        } else {
+            "unhealthy".to_string()
+        };
+
+        checks.push(SelfTestCheck {
+            name: format!("model_{:?}", probe.model).to_lowercase(),
+            ok: probe.healthy,
+            critical: false,
+            detail,
+        });
+    }
+
+    let required_dirs = [
+        Path::new(".othala"),
+        Path::new(".othala/context"),
+        Path::new(".othala/qa"),
+        Path::new(".othala/events"),
+    ];
+    let missing_dirs = required_dirs
+        .iter()
+        .filter(|path| !path.is_dir())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let structure_ok = missing_dirs.is_empty();
+    checks.push(SelfTestCheck {
+        name: "othala_directory_structure".to_string(),
+        ok: structure_ok,
+        critical: true,
+        detail: if structure_ok {
+            ".othala/ structure is present".to_string()
+        } else {
+            format!("missing: {}", missing_dirs.join(", "))
+        },
+    });
+
+    let sqlite_open = rusqlite::Connection::open_with_flags(
+        ".othala/db.sqlite",
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    );
+    checks.push(SelfTestCheck {
+        name: "sqlite_open".to_string(),
+        ok: sqlite_open.is_ok(),
+        critical: true,
+        detail: match sqlite_open {
+            Ok(_) => "opened .othala/db.sqlite".to_string(),
+            Err(err) => format!("failed to open .othala/db.sqlite: {err}"),
+        },
+    });
+
+    let cargo_available = command_available("cargo");
+    checks.push(SelfTestCheck {
+        name: "cargo_available".to_string(),
+        ok: cargo_available,
+        critical: true,
+        detail: if cargo_available {
+            "cargo is available".to_string()
+        } else {
+            "cargo not found on PATH".to_string()
+        },
+    });
+
+    let critical_ok = checks.iter().all(|check| !check.critical || check.ok);
+
+    if json {
+        let out = serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".to_string());
+        println!("{out}");
+    } else {
+        println!("Othala Self-Test");
+        for check in &checks {
+            let (symbol, color) = if check.ok {
+                ("\u{2713}", "\x1b[32m")
+            } else {
+                ("\u{2717}", "\x1b[31m")
+            };
+            let suffix = if check.critical { "" } else { " (non-critical)" };
+            println!(
+                "  {color}{symbol}\x1b[0m {}{}: {}",
+                check.name, suffix, check.detail
+            );
+        }
+
+        if critical_ok {
+            println!("\n\x1b[32mAll critical checks passed\x1b[0m");
+        } else {
+            println!("\n\x1b[31mOne or more critical checks failed\x1b[0m");
+        }
+    }
+
+    critical_ok
 }
 
 fn main() -> anyhow::Result<()> {
@@ -500,6 +779,130 @@ fn main() -> anyhow::Result<()> {
             let json = serde_json::to_string_pretty(&final_tasks)
                 .unwrap_or_else(|_| "[]".to_string());
             println!("{json}");
+        }
+        Commands::SelfTest { json } => {
+            let critical_ok = run_self_test(json);
+            std::process::exit(if critical_ok { 0 } else { 1 });
+        }
+        Commands::Wizard {
+            enable,
+            per_model_concurrency,
+        } => {
+            print_banner();
+            eprintln!("\x1b[35mWelcome to Othala first-time setup\x1b[0m");
+            eprintln!();
+
+            eprintln!("\x1b[33mProbing model availability...\x1b[0m");
+            let report = probe_models(&SetupProbeConfig::default());
+            for probe in &report.models {
+                let detected_text = if probe.installed {
+                    "\x1b[32mdetected\x1b[0m"
+                } else {
+                    "\x1b[31mnot detected\x1b[0m"
+                };
+                let health_text = if probe.healthy {
+                    "\x1b[32mhealthy\x1b[0m"
+                } else {
+                    "\x1b[33munhealthy\x1b[0m"
+                };
+
+                eprintln!(
+                    "  - {:<7} : {} / {}",
+                    model_name(probe.model),
+                    detected_text,
+                    health_text
+                );
+            }
+            eprintln!();
+
+            let selected_models = if let Some(raw) = enable {
+                parse_enable_models_csv(&raw)?
+            } else {
+                prompt_enabled_models()?
+            };
+
+            let validated = validate_setup_selection(
+                &report,
+                &ModelSetupSelection {
+                    enabled_models: selected_models,
+                },
+            )
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+
+            let setup_summary = summarize_setup(&report, &validated);
+            eprintln!("\x1b[33mSetup summary\x1b[0m");
+            for item in &setup_summary.items {
+                if item.selected {
+                    let status = if item.healthy {
+                        "\x1b[32mready\x1b[0m"
+                    } else {
+                        "\x1b[33mselected with warnings\x1b[0m"
+                    };
+                    eprintln!("  - {:<7} : {}", model_name(item.model), status);
+                }
+            }
+            eprintln!();
+
+            let config_path = PathBuf::from(".othala/config.toml");
+            let mut org_config = if config_path.exists() {
+                load_org_config(&config_path)?
+            } else {
+                default_org_config(validated.enabled_models.clone())
+            };
+
+            let per_model = per_model_concurrency.unwrap_or(10);
+            apply_setup_selection_to_org_config(
+                &mut org_config,
+                &validated.enabled_models,
+                per_model,
+            )
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            if org_config.models.default.is_none() {
+                org_config.models.default = validated.enabled_models.first().copied();
+            }
+
+            save_org_config(&config_path, &org_config)?;
+
+            let context_main_path = PathBuf::from(".othala/context/MAIN.md");
+            let context_generated = if context_main_path.exists() {
+                false
+            } else {
+                let repo_root = std::env::current_dir()?;
+                let template_dir = PathBuf::from("templates/prompts");
+                run_context_gen_with_status(
+                    &repo_root,
+                    &template_dir,
+                    validated
+                        .enabled_models
+                        .first()
+                        .copied()
+                        .unwrap_or(ModelKind::Claude),
+                )?;
+                true
+            };
+
+            eprintln!("\x1b[32mSetup complete\x1b[0m");
+            eprintln!("  - Config: {}", config_path.display());
+            eprintln!(
+                "  - Enabled models: {}",
+                validated
+                    .enabled_models
+                    .iter()
+                    .map(|m| model_name(*m))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            eprintln!("  - Per-model concurrency: {per_model}");
+            if context_generated {
+                eprintln!("  - Context: \x1b[32mgenerated\x1b[0m");
+            } else {
+                eprintln!("  - Context: \x1b[33malready present\x1b[0m");
+            }
+            if setup_summary.all_selected_healthy {
+                eprintln!("  - Model health: \x1b[32mall selected models healthy\x1b[0m");
+            } else {
+                eprintln!("  - Model health: \x1b[33msome selected models have warnings\x1b[0m");
+            }
         }
     }
 
