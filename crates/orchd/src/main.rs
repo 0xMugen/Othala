@@ -794,7 +794,7 @@ fn main() -> anyhow::Result<()> {
                         if let Some(old) = prev {
                             eprintln!("[daemon] {} -> {} ({})", task.id.0, task.state, old);
                         }
-                        prev_states.insert(task.id.0.clone(), task.state.clone());
+                        prev_states.insert(task.id.0.clone(), task.state);
                     }
                 }
                 if !tasks.is_empty() {
@@ -995,20 +995,18 @@ fn main() -> anyhow::Result<()> {
                 let out = serde_json::to_string_pretty(&display_events)
                     .unwrap_or_else(|_| "[]".to_string());
                 println!("{out}");
+            } else if display_events.is_empty() {
+                println!("No events found.");
             } else {
-                if display_events.is_empty() {
-                    println!("No events found.");
-                } else {
-                    for event in &display_events {
-                        let ts = event.at.format("%Y-%m-%d %H:%M:%S");
-                        let task_label = event
-                            .task_id
-                            .as_ref()
-                            .map(|t| t.0.as_str())
-                            .unwrap_or("-");
-                        let kind_str = format_event_kind(&event.kind);
-                        println!("{ts}  {task_label:<24} {kind_str}");
-                    }
+                for event in &display_events {
+                    let ts = event.at.format("%Y-%m-%d %H:%M:%S");
+                    let task_label = event
+                        .task_id
+                        .as_ref()
+                        .map(|t| t.0.as_str())
+                        .unwrap_or("-");
+                    let kind_str = format_event_kind(&event.kind);
+                    println!("{ts}  {task_label:<24} {kind_str}");
                 }
             }
         }
@@ -1021,10 +1019,11 @@ fn main() -> anyhow::Result<()> {
             } else if runs.is_empty() {
                 println!("No runs found for task: {id}");
             } else {
-                println!(
+                let header = format!(
                     "{:<36} {:<8} {:<20} {:<20} {:<12} {}",
                     "RUN ID", "MODEL", "STARTED", "FINISHED", "EXIT CODE", "STOP REASON"
                 );
+                println!("{header}");
                 for run in &runs {
                     let started = run.started_at.format("%Y-%m-%d %H:%M:%S");
                     let finished = run
