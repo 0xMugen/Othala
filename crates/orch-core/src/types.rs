@@ -51,6 +51,46 @@ impl std::fmt::Display for TaskPriority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    #[default]
+    Active,
+    Completed,
+    Archived,
+}
+
+impl SessionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionStatus::Active => "active",
+            SessionStatus::Completed => "completed",
+            SessionStatus::Archived => "archived",
+        }
+    }
+}
+
+impl std::str::FromStr for SessionStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_lowercase().as_str() {
+            "active" => Ok(SessionStatus::Active),
+            "completed" => Ok(SessionStatus::Completed),
+            "archived" => Ok(SessionStatus::Archived),
+            other => Err(format!(
+                "invalid session status '{other}'. valid values: active, completed, archived"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
@@ -165,6 +205,18 @@ pub struct TaskSpec {
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
     pub submit_mode: Option<SubmitMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub task_ids: Vec<TaskId>,
+    pub parent_session_id: Option<String>,
+    pub status: SessionStatus,
 }
 
 /// A task (AI coding session) - simplified for MVP.
