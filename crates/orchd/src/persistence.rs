@@ -292,6 +292,31 @@ WHERE task_id = ?4 AND finished_at IS NULL
         Ok(runs)
     }
 
+    pub fn list_runs_for_task(&self, task_id: &TaskId) -> Result<Vec<TaskRunRecord>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json FROM runs WHERE task_id = ?1 ORDER BY started_at ASC, run_id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id.0], |row| row.get::<_, String>(0))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            let payload = row?;
+            runs.push(serde_json::from_str::<TaskRunRecord>(&payload)?);
+        }
+        Ok(runs)
+    }
+
+    pub fn count_runs_by_model(&self) -> Result<Vec<(String, i64)>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, COUNT(*) FROM runs GROUP BY model ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut counts = Vec::new();
+        for row in rows {
+            counts.push(row?);
+        }
+        Ok(counts)
+    }
+
     // --- Artifacts ---
 
     pub fn insert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), PersistenceError> {

@@ -103,6 +103,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show agent run history for a task
+    Runs {
+        /// Task/chat ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show aggregate task and agent statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -972,6 +982,73 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Runs { id, json } => {
+            let runs = service.task_runs(&TaskId::new(&id))?;
+            if json {
+                let out = serde_json::to_string_pretty(&runs)
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+            } else if runs.is_empty() {
+                println!("No runs found for task: {id}");
+            } else {
+                println!(
+                    "{:<36} {:<8} {:<20} {:<20} {:<12} {}",
+                    "RUN ID", "MODEL", "STARTED", "FINISHED", "EXIT CODE", "STOP REASON"
+                );
+                for run in &runs {
+                    let started = run.started_at.format("%Y-%m-%d %H:%M:%S");
+                    let finished = run
+                        .finished_at
+                        .map(|f| f.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "\x1b[33mrunning\x1b[0m".to_string());
+                    let exit_code = run
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let stop_reason = run.stop_reason.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<36} {:<8} {:<20} {:<20} {:<12} {}",
+                        run.run_id,
+                        run.model.as_str(),
+                        started,
+                        finished,
+                        exit_code,
+                        stop_reason
+                    );
+                }
+            }
+        }
+        Commands::Stats => {
+            let tasks = service.list_tasks()?;
+            let total = tasks.len();
+            let by_state = |s: TaskState| tasks.iter().filter(|t| t.state == s).count();
+
+            println!("Othala Statistics");
+            println!("=================");
+            println!();
+            println!("Tasks:");
+            println!("  Total:          {total}");
+            println!("  Chatting:       {}", by_state(TaskState::Chatting));
+            println!("  Ready:          {}", by_state(TaskState::Ready));
+            println!("  Submitting:     {}", by_state(TaskState::Submitting));
+            println!("  Restacking:     {}", by_state(TaskState::Restacking));
+            println!("  Awaiting Merge: {}", by_state(TaskState::AwaitingMerge));
+            println!("  Merged:         {}", by_state(TaskState::Merged));
+            println!("  Stopped:        {}", by_state(TaskState::Stopped));
+            println!();
+
+            let model_counts = service.runs_by_model()?;
+            if !model_counts.is_empty() {
+                println!("Agent Runs by Model:");
+                for (model, count) in &model_counts {
+                    println!("  {model:<10} {count}");
+                }
+                println!();
+            }
+
+            let events = service.global_events()?;
+            println!("Events:           {}", events.len());
+        }
     }
 
     Ok(())
@@ -1056,6 +1133,5 @@ fn format_event_kind(kind: &EventKind) -> String {
         EventKind::QAFailed { failures } => {
             format!("\x1b[31mqa_failed\x1b[0m: {}", failures.join("; "))
         }
-        _ => "event".to_string(),
     }
 }

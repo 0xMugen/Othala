@@ -125,6 +125,14 @@ impl OrchdService {
         Ok(self.store.list_events_global()?)
     }
 
+    pub fn task_runs(&self, task_id: &TaskId) -> Result<Vec<crate::types::TaskRunRecord>, ServiceError> {
+        Ok(self.store.list_runs_for_task(task_id)?)
+    }
+
+    pub fn runs_by_model(&self) -> Result<Vec<(String, i64)>, ServiceError> {
+        Ok(self.store.count_runs_by_model()?)
+    }
+
     // --- State Transitions ---
 
     pub fn transition_task_state(
