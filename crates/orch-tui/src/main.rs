@@ -62,8 +62,11 @@ fn spawn_pipeline_cmd(cmd: &str, args: &[String], cwd: &Path) -> PipelineProc {
         let tx_out = tx.clone();
         let h1 = std::thread::spawn(move || {
             if let Some(out) = stdout {
-                for line in std::io::BufReader::new(out).lines().flatten() {
-                    let _ = tx_out.send(PipelineProcMsg::Output(line));
+                for line in std::io::BufReader::new(out).lines() {
+                    match line {
+                        Ok(l) => { let _ = tx_out.send(PipelineProcMsg::Output(l)); }
+                        Err(_) => break,
+                    }
                 }
             }
         });
@@ -71,8 +74,11 @@ fn spawn_pipeline_cmd(cmd: &str, args: &[String], cwd: &Path) -> PipelineProc {
         let tx_err = tx.clone();
         let h2 = std::thread::spawn(move || {
             if let Some(err) = stderr {
-                for line in std::io::BufReader::new(err).lines().flatten() {
-                    let _ = tx_err.send(PipelineProcMsg::Output(line));
+                for line in std::io::BufReader::new(err).lines() {
+                    match line {
+                        Ok(l) => { let _ = tx_err.send(PipelineProcMsg::Output(l)); }
+                        Err(_) => break,
+                    }
                 }
             }
         });
@@ -176,9 +182,7 @@ fn discover_qa_stack_head(repo_root: &Path, tasks: &[Task]) -> Option<(TaskId, S
         .filter(|task| stack_head_candidate_state(task.state))
         .filter_map(|task| {
             let branch = task.branch_name.as_deref()?;
-            if qa_agent::load_latest_result(repo_root, branch).is_none() {
-                return None;
-            }
+            qa_agent::load_latest_result(repo_root, branch)?;
             Some((
                 task.updated_at.timestamp_millis(),
                 task.id.clone(),
@@ -268,6 +272,7 @@ fn update_stack_head_from_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_validation_qa(
     app: &mut TuiApp,
     service: &OrchdService,
@@ -895,7 +900,7 @@ fn run() -> Result<(), MainError> {
                                     next_agent_restart_at.remove(&task_id.0);
                                     // Echo user message into the pane and log.
                                     let user_line = format!("> {message}");
-                                    append_chat_log(&chat_log_dir, task_id, &[user_line.clone()]);
+                                    append_chat_log(&chat_log_dir, task_id, std::slice::from_ref(&user_line));
                                     let instance_id = format!("agent-{}", task_id.0);
                                     app.apply_event(TuiEvent::AgentPaneOutput {
                                         instance_id: instance_id.clone(),
@@ -920,7 +925,7 @@ fn run() -> Result<(), MainError> {
                             match supervisor.send_input(task_id, message) {
                                 Ok(()) => {
                                     let user_line = format!("> {message}");
-                                    append_chat_log(&chat_log_dir, task_id, &[user_line.clone()]);
+                                    append_chat_log(&chat_log_dir, task_id, std::slice::from_ref(&user_line));
                                     let instance_id = format!("agent-{}", task_id.0);
                                     let model = service
                                         .task(task_id)

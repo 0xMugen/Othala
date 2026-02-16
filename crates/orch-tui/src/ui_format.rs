@@ -161,9 +161,9 @@ pub(crate) fn format_category_tabs(app: &TuiApp) -> Line<'static> {
     let task_id = app.state.selected_task().map(|t| &t.task_id);
 
     let has_agent = task_id
-        .map_or(false, |tid| app.state.has_pane_in_category(tid, PaneCategory::Agent));
+        .is_some_and(|tid| app.state.has_pane_in_category(tid, PaneCategory::Agent));
     let has_qa = task_id
-        .map_or(false, |tid| app.state.has_pane_in_category(tid, PaneCategory::QA));
+        .is_some_and(|tid| app.state.has_pane_in_category(tid, PaneCategory::QA));
 
     let sel_style = Style::default()
         .fg(Color::White)
