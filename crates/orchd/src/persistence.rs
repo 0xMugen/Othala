@@ -5,7 +5,7 @@ use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{ModelKind, Session, SessionStatus, Task, TaskId, TaskPriority};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::state_machine::task_state_tag;
 use crate::types::{ArtifactRecord, TaskRunRecord};
@@ -66,14 +66,67 @@ pub trait SessionStore {
 }
 
 impl SqliteStore {
+    /// Open a SQLite database at the given path.
+    ///
+    /// The path is canonicalized to an absolute path before opening so that
+    /// later working-directory changes (e.g. from git worktree operations)
+    /// do not trigger SQLite's `SQLITE_READONLY_DBMOVED` (error 1032).
+    ///
+    /// WAL journal mode and a 5-second busy timeout are enabled for better
+    /// concurrent access and resilience.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
-        let conn = Connection::open(path)?;
+        let abs_path = Self::resolve_absolute(path.as_ref())?;
+        let conn = Connection::open(&abs_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, PersistenceError> {
         let conn = Connection::open_in_memory()?;
         Ok(Self { conn })
+    }
+
+    /// Resolve a path to absolute, creating parent directories if needed.
+    ///
+    /// We cannot use `std::fs::canonicalize` on a path whose file does not
+    /// yet exist (first run), so we canonicalize the *parent* directory and
+    /// append the file name.
+    fn resolve_absolute(path: &Path) -> Result<PathBuf, PersistenceError> {
+        if path.is_absolute() && path.exists() {
+            return std::fs::canonicalize(path).map_err(|e| PersistenceError::Sql {
+                source: rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("cannot canonicalize db path: {e}")),
+                ),
+            });
+        }
+
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| PersistenceError::Sql {
+                source: rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("cannot create db parent dir: {e}")),
+                ),
+            })?;
+        }
+
+        let canonical_parent =
+            std::fs::canonicalize(parent).map_err(|e| PersistenceError::Sql {
+                source: rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("cannot canonicalize db parent dir: {e}")),
+                ),
+            })?;
+
+        let file_name = path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("state.sqlite"));
+
+        Ok(canonical_parent.join(file_name))
     }
 
     pub fn migrate(&self) -> Result<(), PersistenceError> {
@@ -1508,5 +1561,53 @@ mod tests {
             )
             .expect_err("missing source should fail");
         assert!(matches!(err, PersistenceError::TaskNotFound { .. }));
+    }
+
+    #[test]
+    fn open_with_relative_path_works() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = dir.path().join("test.sqlite");
+        let store = SqliteStore::open(&db_file).expect("open with relative path");
+        store.migrate().expect("migrate");
+        let task = mk_task("T-REL-1", TaskState::Chatting);
+        store.upsert_task(&task).expect("upsert");
+        let loaded = store.load_task(&task.id).expect("load").expect("exists");
+        assert_eq!(loaded.id, task.id);
+    }
+
+    #[test]
+    fn open_with_absolute_path_works() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let abs = std::fs::canonicalize(dir.path())
+            .expect("canonicalize")
+            .join("abs_test.sqlite");
+        let store = SqliteStore::open(&abs).expect("open with absolute path");
+        store.migrate().expect("migrate");
+        let task = mk_task("T-ABS-1", TaskState::Chatting);
+        store.upsert_task(&task).expect("upsert");
+        let loaded = store.load_task(&task.id).expect("load").expect("exists");
+        assert_eq!(loaded.id, task.id);
+    }
+
+    #[test]
+    fn resolve_absolute_creates_parent_dirs() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let nested = dir.path().join("a/b/c/state.sqlite");
+        let resolved = SqliteStore::resolve_absolute(&nested).expect("resolve");
+        assert!(resolved.is_absolute());
+        assert!(dir.path().join("a/b/c").exists());
+    }
+
+    #[test]
+    fn wal_mode_is_set_on_open() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_file = dir.path().join("wal_test.sqlite");
+        let store = SqliteStore::open(&db_file).expect("open");
+        store.migrate().expect("migrate");
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("query journal_mode");
+        assert_eq!(mode, "wal");
     }
 }

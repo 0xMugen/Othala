@@ -2432,10 +2432,10 @@ fn gc_logs(repo_root: &Path, older_than_days: u64, dry_run: bool) -> anyhow::Res
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let db_path = PathBuf::from(".orch/state.sqlite");
-    let event_log_path = PathBuf::from(".orch/events");
+    let cwd = std::env::current_dir()?;
+    let db_path = cwd.join(".orch/state.sqlite");
+    let event_log_path = cwd.join(".orch/events");
 
-    // Ensure directories exist
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
