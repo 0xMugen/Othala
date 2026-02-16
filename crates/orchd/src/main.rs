@@ -432,6 +432,37 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show usage metrics and telemetry summary
+    Metrics {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate CI workflow files
+    CiGen {
+        /// Output directory (default: .github/workflows)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Workflow type: full, verify, nix, basic
+        #[arg(long, default_value = "full")]
+        workflow: String,
+        /// Print to stdout instead of writing file
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Open $EDITOR to compose a prompt
+    Edit {
+        /// Task ID to edit prompt for
+        task_id: Option<String>,
+    },
+    /// Show delegation plan for a task
+    Delegate {
+        /// Parent task ID
+        task_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3744,6 +3775,58 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&patterns).unwrap_or_default());
             } else {
                 println!("{}", orchd::ignore::display_ignore_rules(&rules));
+            }
+        }
+        Commands::Metrics { json } => {
+            let collector = orchd::metrics::MetricsCollector::new(
+                orchd::metrics::MetricsConfig::default(),
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&collector.summary()).unwrap_or_default());
+            } else {
+                println!("{}", collector.display_summary());
+            }
+        }
+        Commands::CiGen { output, workflow, dry_run } => {
+            let config = orchd::ci_gen::CiConfig::default();
+            let content = match workflow.as_str() {
+                "verify" => orchd::ci_gen::generate_verify_workflow(&config),
+                "nix" => orchd::ci_gen::generate_nix_ci(&config),
+                "basic" => orchd::ci_gen::generate_basic_ci(&config),
+                _ => orchd::ci_gen::generate_github_actions(&config),
+            };
+            if dry_run {
+                println!("{content}");
+            } else {
+                let out_dir = output.unwrap_or_else(|| PathBuf::from(".github/workflows"));
+                fs::create_dir_all(&out_dir).ok();
+                let file_path = out_dir.join("othala.yml");
+                match fs::write(&file_path, &content) {
+                    Ok(()) => println!("Written: {}", file_path.display()),
+                    Err(e) => eprintln!("Failed to write {}: {e}", file_path.display()),
+                }
+            }
+        }
+        Commands::Edit { task_id } => {
+            let config = orchd::editor::EditorConfig::default();
+            let title = task_id.as_deref().unwrap_or("new prompt");
+            match orchd::editor::open_editor_for_prompt(&config, title) {
+                Ok(content) => {
+                    if content.trim().is_empty() {
+                        eprintln!("Empty prompt, aborting.");
+                    } else {
+                        println!("{content}");
+                    }
+                }
+                Err(e) => eprintln!("Editor error: {e}"),
+            }
+        }
+        Commands::Delegate { task_id, json } => {
+            let plan = orchd::delegation::DelegationPlan::new(&task_id);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
+            } else {
+                println!("{}", plan.summary());
             }
         }
     }
