@@ -60,6 +60,36 @@ pub struct OrgConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub daemon: DaemonOrgConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_daily_token_limit")]
+    pub daily_token_limit: u64,
+    #[serde(default = "default_monthly_token_limit")]
+    pub monthly_token_limit: u64,
+}
+
+fn default_daily_token_limit() -> u64 {
+    10_000_000
+}
+
+fn default_monthly_token_limit() -> u64 {
+    100_000_000
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            daily_token_limit: default_daily_token_limit(),
+            monthly_token_limit: default_monthly_token_limit(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +482,14 @@ tick_interval_secs = 11
 
         assert_eq!(config.daemon.tick_interval_secs, 11);
         assert_eq!(config.daemon.agent_timeout_secs, 1_800);
+    }
+
+    #[test]
+    fn budget_config_defaults() {
+        let config = sample_org();
+        assert!(!config.budget.enabled);
+        assert_eq!(config.budget.daily_token_limit, 10_000_000);
+        assert_eq!(config.budget.monthly_token_limit, 100_000_000);
     }
 
     #[test]

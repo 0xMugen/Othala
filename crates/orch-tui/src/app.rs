@@ -201,6 +201,16 @@ impl TuiApp {
             return;
         }
 
+        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('t') {
+            self.state.show_timeline = !self.state.show_timeline;
+            self.state.status_line = if self.state.show_timeline {
+                "timeline shown".to_string()
+            } else {
+                "timeline hidden".to_string()
+            };
+            return;
+        }
+
         if matches!(self.input_mode, InputMode::Normal)
             && self.state.focused_task
             && key.code == KeyCode::Char('l')
@@ -1398,6 +1408,18 @@ mod tests {
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
         assert!(!app.state.sort_reversed);
+    }
+
+    #[test]
+    fn t_key_toggles_timeline() {
+        let mut app = TuiApp::default();
+        assert!(!app.state.show_timeline);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.state.show_timeline);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(!app.state.show_timeline);
     }
 
     #[test]

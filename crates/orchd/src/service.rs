@@ -127,7 +127,7 @@ impl OrchdService {
     }
 
     pub fn task_events(&self, task_id: &TaskId) -> Result<Vec<Event>, ServiceError> {
-        Ok(self.store.list_events_for_task(task_id)?)
+        Ok(self.store.list_events_for_task(&task_id.0)?)
     }
 
     pub fn global_events(&self) -> Result<Vec<Event>, ServiceError> {

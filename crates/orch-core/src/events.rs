@@ -97,6 +97,7 @@ pub enum EventKind {
     QAFailed {
         failures: Vec<String>,
     },
+    BudgetExceeded,
 }
 
 /// An event in the orchestrator.
@@ -217,6 +218,7 @@ mod tests {
             EventKind::QAFailed {
                 failures: vec!["test_a failed".to_string(), "test_b failed".to_string()],
             },
+            EventKind::BudgetExceeded,
         ];
 
         for kind in kinds {

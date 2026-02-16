@@ -3,8 +3,8 @@
 //! Replaces the inline loop in `main.rs` with a testable `daemon_tick()` that
 //! returns actions for the caller to execute.
 
-use chrono::{DateTime, Duration, Utc};
-use orch_core::config::{load_org_config, OrgConfig};
+use chrono::{DateTime, Datelike, Duration, Utc};
+use orch_core::config::{load_org_config, BudgetConfig, OrgConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
@@ -73,6 +73,11 @@ pub struct DaemonState {
     pub config_last_modified: Option<std::time::SystemTime>,
     pub shutdown_requested: bool,
     pub shutdown_deadline: Option<std::time::Instant>,
+    pub budget_used_today: u64,
+    pub budget_used_month: u64,
+    pub budget_last_reset_day: Option<u32>,
+    pub budget_last_reset_month: Option<u32>,
+    pub budget_output_chars_by_task: HashMap<String, u64>,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -131,6 +136,11 @@ impl DaemonState {
             config_last_modified: None,
             shutdown_requested: false,
             shutdown_deadline: None,
+            budget_used_today: 0,
+            budget_used_month: 0,
+            budget_last_reset_day: None,
+            budget_last_reset_month: None,
+            budget_output_chars_by_task: HashMap::new(),
         }
     }
 
@@ -251,6 +261,43 @@ fn record_event_with_notification(
     Ok(())
 }
 
+fn load_budget_config_for_tick(repo_root: &Path) -> BudgetConfig {
+    let config_path = repo_root.join(".othala/config.toml");
+    load_org_config(config_path)
+        .map(|org| org.budget)
+        .unwrap_or_default()
+}
+
+fn check_budget(state: &DaemonState, config: &BudgetConfig) -> bool {
+    if !config.enabled {
+        return true;
+    }
+    state.budget_used_today < config.daily_token_limit
+        && state.budget_used_month < config.monthly_token_limit
+}
+
+fn maybe_reset_budget(state: &mut DaemonState) {
+    let now = chrono::Utc::now();
+    let today = now.day();
+    let month = now.month();
+    if state.budget_last_reset_day != Some(today) {
+        state.budget_used_today = 0;
+        state.budget_last_reset_day = Some(today);
+    }
+    if state.budget_last_reset_month != Some(month) {
+        state.budget_used_month = 0;
+        state.budget_last_reset_month = Some(month);
+    }
+}
+
+fn track_output_chars(state: &mut DaemonState, task_id: &TaskId, lines: &[String]) {
+    let chars = lines.iter().map(|line| line.chars().count() as u64).sum::<u64>();
+    *state
+        .budget_output_chars_by_task
+        .entry(task_id.0.clone())
+        .or_insert(0) += chars;
+}
+
 /// Actions that the daemon loop produces for the caller to handle.
 #[derive(Debug)]
 pub enum DaemonAction {
@@ -312,6 +359,11 @@ pub enum DaemonAction {
     Log {
         message: String,
     },
+    EmitEvent {
+        task_id: Option<TaskId>,
+        repo_id: Option<orch_core::types::RepoId>,
+        kind: EventKind,
+    },
     ShutdownComplete,
 }
 
@@ -327,11 +379,13 @@ pub fn daemon_tick(
 ) -> Vec<DaemonAction> {
     let mut actions = Vec::new();
     let now = Utc::now();
+    maybe_reset_budget(daemon_state);
 
     if daemon_state.shutdown_requested {
         let poll_result = supervisor.poll();
 
         for chunk in &poll_result.output {
+            track_output_chars(daemon_state, &chunk.task_id, &chunk.lines);
             if let Err(err) =
                 agent_log::append_agent_output(&config.repo_root, &chunk.task_id, &chunk.lines)
             {
@@ -386,9 +440,18 @@ pub fn daemon_tick(
     }
 
     // --- Phase 1: Spawn agents for Chatting tasks without sessions ---
+    let budget_config = load_budget_config_for_tick(&config.repo_root);
     if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
         for task in &chatting {
             if !supervisor.has_session(&task.id) {
+                if !check_budget(daemon_state, &budget_config) {
+                    actions.push(DaemonAction::EmitEvent {
+                        task_id: Some(task.id.clone()),
+                        repo_id: Some(task.repo_id.clone()),
+                        kind: EventKind::BudgetExceeded,
+                    });
+                    continue;
+                }
                 if let Some(action) = build_spawn_action(task, config) {
                     actions.push(action);
                 }
@@ -434,6 +497,7 @@ pub fn daemon_tick(
     let poll_result = supervisor.poll();
 
     for chunk in &poll_result.output {
+        track_output_chars(daemon_state, &chunk.task_id, &chunk.lines);
         if let Err(err) =
             agent_log::append_agent_output(&config.repo_root, &chunk.task_id, &chunk.lines)
         {
@@ -700,6 +764,13 @@ fn handle_agent_completion(
 ) -> Vec<DaemonAction> {
     let mut actions = Vec::new();
     daemon_state.verify_cache.remove(&outcome.task_id.0);
+    let output_chars = daemon_state
+        .budget_output_chars_by_task
+        .remove(&outcome.task_id.0)
+        .unwrap_or_default();
+    let output_tokens = estimate_tokens_from_char_count(output_chars);
+    daemon_state.budget_used_today = daemon_state.budget_used_today.saturating_add(output_tokens);
+    daemon_state.budget_used_month = daemon_state.budget_used_month.saturating_add(output_tokens);
 
     let completion_event = Event {
         id: EventId(format!(
@@ -833,6 +904,10 @@ fn find_parent_branch(service: &OrchdService, task: &Task) -> Option<String> {
 
 fn estimate_tokens_from_prompt(prompt: &str) -> u64 {
     let chars = prompt.chars().count() as u64;
+    estimate_tokens_from_char_count(chars)
+}
+
+fn estimate_tokens_from_char_count(chars: u64) -> u64 {
     chars.div_ceil(4)
 }
 
@@ -1738,6 +1813,29 @@ pub fn execute_actions(
             DaemonAction::Log { message } => {
                 println!("{}", message);
             }
+            DaemonAction::EmitEvent {
+                task_id,
+                repo_id,
+                kind,
+            } => {
+                let event = Event {
+                    id: EventId(format!(
+                        "E-EVENT-{}",
+                        now.timestamp_nanos_opt().unwrap_or_default()
+                    )),
+                    task_id: task_id.clone(),
+                    repo_id: repo_id.clone(),
+                    at: now,
+                    kind: kind.clone(),
+                };
+                if let Err(e) = record_event_with_notification(
+                    service,
+                    daemon_state.notification_dispatcher.as_ref(),
+                    &event,
+                ) {
+                    eprintln!("[daemon] Failed to record emitted event: {}", e);
+                }
+            }
             DaemonAction::ShutdownComplete => {
                 eprintln!("[daemon] Daemon shutdown complete");
                 if !config.dry_run {
@@ -1932,6 +2030,47 @@ agent_timeout_secs = {agent_timeout_secs}
         )
     }
 
+    fn sample_org_config_with_budget_toml(
+        tick_interval_secs: u64,
+        agent_timeout_secs: u64,
+        daily_token_limit: u64,
+        monthly_token_limit: u64,
+    ) -> String {
+        format!(
+            r#"
+[models]
+enabled = ["claude", "codex", "gemini"]
+
+[concurrency]
+per_repo = 10
+claude = 10
+codex = 10
+gemini = 10
+
+[graphite]
+auto_submit = true
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+
+[daemon]
+tick_interval_secs = {tick_interval_secs}
+agent_timeout_secs = {agent_timeout_secs}
+
+[budget]
+enabled = true
+daily_token_limit = {daily_token_limit}
+monthly_token_limit = {monthly_token_limit}
+"#
+        )
+    }
+
     fn init_git_repo_with_commit() -> (PathBuf, String) {
         let repo = std::env::temp_dir().join(format!(
             "othala-daemon-git-{}",
@@ -2095,6 +2234,146 @@ agent_timeout_secs = {agent_timeout_secs}
         assert!(state.pipelines.is_empty());
         assert!(state.restack_retries.is_empty());
         assert!(state.config_last_modified.is_none());
+    }
+
+    #[test]
+    fn check_budget_passes_when_disabled() {
+        let mut state = DaemonState::new();
+        state.budget_used_today = u64::MAX;
+        state.budget_used_month = u64::MAX;
+        let config = BudgetConfig {
+            enabled: false,
+            daily_token_limit: 1,
+            monthly_token_limit: 1,
+        };
+
+        assert!(check_budget(&state, &config));
+    }
+
+    #[test]
+    fn check_budget_fails_when_daily_exceeded() {
+        let mut state = DaemonState::new();
+        state.budget_used_today = 100;
+        state.budget_used_month = 10;
+        let config = BudgetConfig {
+            enabled: true,
+            daily_token_limit: 100,
+            monthly_token_limit: 1_000,
+        };
+
+        assert!(!check_budget(&state, &config));
+    }
+
+    #[test]
+    fn check_budget_fails_when_monthly_exceeded() {
+        let mut state = DaemonState::new();
+        state.budget_used_today = 10;
+        state.budget_used_month = 200;
+        let config = BudgetConfig {
+            enabled: true,
+            daily_token_limit: 1_000,
+            monthly_token_limit: 200,
+        };
+
+        assert!(!check_budget(&state, &config));
+    }
+
+    #[test]
+    fn maybe_reset_budget_resets_on_new_day() {
+        let now = Utc::now();
+        let mut state = DaemonState::new();
+        state.budget_used_today = 123;
+        state.budget_last_reset_day = Some(if now.day() == 1 { 2 } else { now.day() - 1 });
+
+        maybe_reset_budget(&mut state);
+
+        assert_eq!(state.budget_used_today, 0);
+        assert_eq!(state.budget_last_reset_day, Some(now.day()));
+    }
+
+    #[test]
+    fn daemon_tick_refuses_spawn_when_budget_exceeded() {
+        let service = mk_service();
+        let repo_root = std::env::temp_dir().join(format!(
+            "othala-budget-exceeded-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(repo_root.join(".othala")).expect("create .othala dir");
+        fs::write(
+            repo_root.join(".othala/config.toml"),
+            sample_org_config_with_budget_toml(2, 1_800, 1, 1),
+        )
+        .expect("write org config");
+
+        let mut config = mk_config();
+        config.repo_root = repo_root.clone();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        daemon_state.budget_used_today = 1;
+        daemon_state.budget_used_month = 1;
+        daemon_state.budget_last_reset_day = Some(Utc::now().day());
+        daemon_state.budget_last_reset_month = Some(Utc::now().month());
+
+        let task = mk_task("T-BUDGET-1");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::SpawnAgent { .. })));
+        assert!(actions.iter().any(|a| {
+            matches!(
+                a,
+                DaemonAction::EmitEvent {
+                    kind: EventKind::BudgetExceeded,
+                    ..
+                }
+            )
+        }));
+
+        fs::remove_dir_all(repo_root).ok();
+    }
+
+    #[test]
+    fn handle_agent_completion_updates_budget_usage_from_output() {
+        let service = mk_service();
+        let config = mk_config();
+        let task = mk_task("T-BUDGET-2");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let mut daemon_state = DaemonState::new();
+        daemon_state
+            .budget_output_chars_by_task
+            .insert(task.id.0.clone(), 80);
+
+        let outcome = AgentOutcome {
+            task_id: task.id.clone(),
+            model: ModelKind::Claude,
+            exit_code: Some(0),
+            patch_ready: true,
+            needs_human: false,
+            success: true,
+            duration_secs: 1,
+        };
+
+        let _ = handle_agent_completion(
+            &service,
+            None,
+            &outcome,
+            &config,
+            &mut daemon_state,
+            Utc::now(),
+        );
+
+        assert_eq!(daemon_state.budget_used_today, 20);
+        assert_eq!(daemon_state.budget_used_month, 20);
+        assert!(!daemon_state
+            .budget_output_chars_by_task
+            .contains_key(&task.id.0));
     }
 
     #[test]
