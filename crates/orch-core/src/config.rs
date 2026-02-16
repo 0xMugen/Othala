@@ -109,6 +109,8 @@ pub struct OrgConfig {
     pub budget: BudgetConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    #[serde(default)]
+    pub context_paths: ContextPathsConfig,
 }
 
 impl Default for OrgConfig {
@@ -137,8 +139,24 @@ impl Default for OrgConfig {
             daemon: DaemonOrgConfig::default(),
             budget: BudgetConfig::default(),
             permissions: PermissionsConfig::default(),
+            context_paths: ContextPathsConfig {
+                paths: Vec::new(),
+                auto_detect: default_context_auto_detect(),
+            },
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPathsConfig {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default = "default_context_auto_detect")]
+    pub auto_detect: bool,
+}
+
+fn default_context_auto_detect() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
