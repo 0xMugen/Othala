@@ -14,14 +14,17 @@ use orch_core::config::{
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, Session, Task, TaskId, TaskPriority};
+use orch_core::types::{
+    load_task_specs_from_dir, parse_yaml_task_spec, yaml_spec_to_task, EventId, ModelKind, RepoId,
+    Session, Task, TaskId, TaskPriority,
+};
 #[cfg(test)]
 use orch_core::types::SubmitMode;
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{
     provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
-    TaskCloneOverrides,
+    SkillRegistry, TaskCloneOverrides,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -62,6 +65,13 @@ enum Commands {
         /// Output as JSON (for scripting/E2E tests)
         #[arg(long)]
         json: bool,
+    },
+    LoadTasks {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    ValidateSpec {
+        path: PathBuf,
     },
     SetPriority {
         /// Chat/task ID
@@ -326,6 +336,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    Skills,
+    Skill {
+        name: String,
     },
 }
 
@@ -896,6 +910,14 @@ fn parse_model_name(s: &str) -> Option<ModelKind> {
         "gemini" => Some(ModelKind::Gemini),
         _ => None,
     }
+}
+
+fn default_repo_id_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("default")
+        .to_string()
 }
 
 fn profile_label(profile: &ConfigProfile) -> String {
@@ -2222,6 +2244,36 @@ fn main() -> anyhow::Result<()> {
                 json,
             )?;
         }
+        Commands::LoadTasks { dir } => {
+            let repo_root = std::env::current_dir()?;
+            let specs_dir = dir.unwrap_or_else(|| repo_root.join(".othala/tasks"));
+            let repo_id = default_repo_id_from_path(&repo_root);
+            let specs = load_task_specs_from_dir(&specs_dir);
+
+            for spec in &specs {
+                let task = yaml_spec_to_task(spec, &repo_id);
+                let event = Event {
+                    id: EventId(format!("E-CREATE-{}", task.id.0)),
+                    task_id: Some(task.id.clone()),
+                    repo_id: Some(task.repo_id.clone()),
+                    at: Utc::now(),
+                    kind: EventKind::TaskCreated,
+                };
+                service.create_task(&task, &event)?;
+            }
+
+            println!(
+                "Loaded {} task spec(s) from {}",
+                specs.len(),
+                specs_dir.display()
+            );
+        }
+        Commands::ValidateSpec { path } => {
+            let content = std::fs::read_to_string(&path)?;
+            let spec = parse_yaml_task_spec(&content)
+                .map_err(|err| anyhow::anyhow!("invalid YAML task spec: {err}"))?;
+            println!("Valid YAML task spec: {}", spec.title);
+        }
         Commands::SetPriority { id, priority } => {
             let task_id = TaskId::new(&id);
             let parsed = parse_task_priority(&priority)?;
@@ -3383,6 +3435,35 @@ fn main() -> anyhow::Result<()> {
                 println!("Archived {} tasks", archived);
             }
         }
+        Commands::Skills => {
+            let repo_root = std::env::current_dir()?;
+            let registry = SkillRegistry::discover(&repo_root);
+            let skills = registry.list_skills();
+            if skills.is_empty() {
+                println!("No skills found.");
+            } else {
+                println!("{:<20} {:<40} TAGS", "NAME", "DESCRIPTION");
+                println!("{}", "-".repeat(96));
+                for skill in skills {
+                    let tags = if skill.tags.is_empty() {
+                        "-".to_string()
+                    } else {
+                        skill.tags.join(",")
+                    };
+                    println!("{:<20} {:<40} {}", skill.name, skill.description, tags);
+                }
+            }
+        }
+        Commands::Skill { name } => {
+            let repo_root = std::env::current_dir()?;
+            let registry = SkillRegistry::discover(&repo_root);
+            if let Some(skill) = registry.load_skill(&name) {
+                print!("{}", skill.content);
+            } else {
+                eprintln!("Skill not found: {name}");
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
@@ -3636,6 +3717,32 @@ mod tests {
         match cli.command {
             Commands::CreateTask { priority, .. } => assert_eq!(priority, "high"),
             _ => panic!("expected create-task command"),
+        }
+    }
+
+    #[test]
+    fn load_tasks_cli_parses_optional_dir() {
+        let cli = Cli::try_parse_from(["othala", "load-tasks", "--dir", ".othala/tasks"])
+            .expect("parse load-tasks");
+
+        match cli.command {
+            Commands::LoadTasks { dir } => {
+                assert_eq!(dir, Some(PathBuf::from(".othala/tasks")));
+            }
+            _ => panic!("expected load-tasks command"),
+        }
+    }
+
+    #[test]
+    fn validate_spec_cli_parses_path() {
+        let cli = Cli::try_parse_from(["othala", "validate-spec", "specs/task.yaml"])
+            .expect("parse validate-spec");
+
+        match cli.command {
+            Commands::ValidateSpec { path } => {
+                assert_eq!(path, PathBuf::from("specs/task.yaml"));
+            }
+            _ => panic!("expected validate-spec command"),
         }
     }
 
@@ -4890,6 +4997,21 @@ mod tests {
         match cancel.command {
             Commands::Cancel { id } => assert_eq!(id, "task-2"),
             _ => panic!("expected cancel command"),
+        }
+    }
+
+    #[test]
+    fn skills_command_parses() {
+        let cli = Cli::try_parse_from(["othala", "skills"]).expect("parse skills");
+        assert!(matches!(cli.command, Commands::Skills));
+    }
+
+    #[test]
+    fn skill_command_parses_name() {
+        let cli = Cli::try_parse_from(["othala", "skill", "playwright"]).expect("parse skill");
+        match cli.command {
+            Commands::Skill { name } => assert_eq!(name, "playwright"),
+            _ => panic!("expected skill command"),
         }
     }
 }

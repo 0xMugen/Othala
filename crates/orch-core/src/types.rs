@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::PathBuf;
 
 use crate::state::{TaskState, VerifyStatus};
@@ -205,6 +206,235 @@ pub struct TaskSpec {
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
     pub submit_mode: Option<SubmitMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YamlTaskSpec {
+    pub title: String,
+    pub model: Option<String>,
+    pub priority: Option<String>,
+    pub depends_on: Option<Vec<String>>,
+    pub labels: Option<Vec<String>>,
+    pub verify_command: Option<String>,
+    pub context_files: Option<Vec<String>>,
+}
+
+fn parse_yaml_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn parse_yaml_task_spec(content: &str) -> Result<YamlTaskSpec, String> {
+    let mut title: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut priority: Option<String> = None;
+    let mut depends_on: Vec<String> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut verify_command: Option<String> = None;
+    let mut context_files: Vec<String> = Vec::new();
+
+    let mut current_list_key: Option<&str> = None;
+    let mut depends_seen = false;
+    let mut labels_seen = false;
+    let mut context_files_seen = false;
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("- ") {
+            let key = current_list_key
+                .ok_or_else(|| format!("line {line_no}: list item found without list key"))?;
+            let value = parse_yaml_scalar(value);
+            if value.is_empty() {
+                return Err(format!("line {line_no}: list item cannot be empty"));
+            }
+
+            match key {
+                "depends_on" => depends_on.push(value),
+                "labels" => labels.push(value),
+                "context_files" => context_files.push(value),
+                _ => return Err(format!("line {line_no}: unsupported list key '{key}'")),
+            }
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once(':') else {
+            return Err(format!("line {line_no}: expected 'key: value'"));
+        };
+
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        current_list_key = None;
+
+        match key {
+            "title" => {
+                if title.is_some() {
+                    return Err(format!("line {line_no}: duplicate key 'title'"));
+                }
+                let parsed = parse_yaml_scalar(value);
+                if parsed.is_empty() {
+                    return Err(format!("line {line_no}: title cannot be empty"));
+                }
+                title = Some(parsed);
+            }
+            "model" => {
+                if model.is_some() {
+                    return Err(format!("line {line_no}: duplicate key 'model'"));
+                }
+                let parsed = parse_yaml_scalar(value);
+                if !parsed.is_empty() {
+                    model = Some(parsed);
+                }
+            }
+            "priority" => {
+                if priority.is_some() {
+                    return Err(format!("line {line_no}: duplicate key 'priority'"));
+                }
+                let parsed = parse_yaml_scalar(value);
+                if !parsed.is_empty() {
+                    priority = Some(parsed);
+                }
+            }
+            "verify_command" => {
+                if verify_command.is_some() {
+                    return Err(format!("line {line_no}: duplicate key 'verify_command'"));
+                }
+                let parsed = parse_yaml_scalar(value);
+                if !parsed.is_empty() {
+                    verify_command = Some(parsed);
+                }
+            }
+            "depends_on" => {
+                if depends_seen {
+                    return Err(format!("line {line_no}: duplicate key 'depends_on'"));
+                }
+                depends_seen = true;
+                if value.is_empty() {
+                    current_list_key = Some("depends_on");
+                } else {
+                    depends_on.push(parse_yaml_scalar(value));
+                }
+            }
+            "labels" => {
+                if labels_seen {
+                    return Err(format!("line {line_no}: duplicate key 'labels'"));
+                }
+                labels_seen = true;
+                if value.is_empty() {
+                    current_list_key = Some("labels");
+                } else {
+                    labels.push(parse_yaml_scalar(value));
+                }
+            }
+            "context_files" => {
+                if context_files_seen {
+                    return Err(format!("line {line_no}: duplicate key 'context_files'"));
+                }
+                context_files_seen = true;
+                if value.is_empty() {
+                    current_list_key = Some("context_files");
+                } else {
+                    context_files.push(parse_yaml_scalar(value));
+                }
+            }
+            other => return Err(format!("line {line_no}: unknown key '{other}'")),
+        }
+    }
+
+    let title = title.ok_or_else(|| "missing required key 'title'".to_string())?;
+    Ok(YamlTaskSpec {
+        title,
+        model,
+        priority,
+        depends_on: if depends_seen { Some(depends_on) } else { None },
+        labels: if labels_seen { Some(labels) } else { None },
+        verify_command,
+        context_files: if context_files_seen {
+            Some(context_files)
+        } else {
+            None
+        },
+    })
+}
+
+pub fn load_task_specs_from_dir(dir: &std::path::Path) -> Vec<YamlTaskSpec> {
+    let mut specs = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return specs;
+    };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+
+    for path in files {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(spec) = parse_yaml_task_spec(&content) {
+            specs.push(spec);
+        }
+    }
+
+    specs
+}
+
+pub fn yaml_spec_to_task(spec: &YamlTaskSpec, repo_id: &str) -> Task {
+    let task_id = TaskId::new(format!(
+        "chat-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let worktree_path = PathBuf::from(format!(".orch/wt/{}", task_id.0));
+    let mut task = Task::new(
+        task_id,
+        RepoId(repo_id.to_string()),
+        spec.title.clone(),
+        worktree_path,
+    );
+
+    task.preferred_model = spec.model.as_deref().and_then(|name| match name.trim().to_lowercase().as_str() {
+        "claude" => Some(ModelKind::Claude),
+        "codex" => Some(ModelKind::Codex),
+        "gemini" => Some(ModelKind::Gemini),
+        _ => None,
+    });
+
+    task.priority = spec
+        .priority
+        .as_deref()
+        .and_then(|value| value.parse::<TaskPriority>().ok())
+        .unwrap_or_default();
+
+    task.depends_on = spec
+        .depends_on
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(TaskId::new)
+        .collect();
+
+    task.labels = spec.labels.clone().unwrap_or_default();
+    task
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,5 +690,124 @@ preferred_model = "codex"
                 TaskPriority::Low
             ]
         );
+    }
+
+    #[test]
+    fn parse_yaml_task_spec_parses_scalars_and_lists() {
+        let spec = parse_yaml_task_spec(
+            r#"
+title: Add authentication middleware
+model: claude
+priority: high
+depends_on:
+  - T-001
+labels:
+  - auth
+  - security
+verify_command: cargo test -p auth
+context_files:
+  - src/auth.rs
+"#,
+        )
+        .expect("parse yaml spec");
+
+        assert_eq!(spec.title, "Add authentication middleware");
+        assert_eq!(spec.model.as_deref(), Some("claude"));
+        assert_eq!(spec.priority.as_deref(), Some("high"));
+        assert_eq!(spec.depends_on, Some(vec!["T-001".to_string()]));
+        assert_eq!(
+            spec.labels,
+            Some(vec!["auth".to_string(), "security".to_string()])
+        );
+        assert_eq!(
+            spec.verify_command.as_deref(),
+            Some("cargo test -p auth")
+        );
+        assert_eq!(
+            spec.context_files,
+            Some(vec!["src/auth.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_yaml_task_spec_requires_title() {
+        let err = parse_yaml_task_spec("model: codex").expect_err("missing title should fail");
+        assert!(err.contains("missing required key 'title'"));
+    }
+
+    #[test]
+    fn parse_yaml_task_spec_rejects_unknown_key() {
+        let err = parse_yaml_task_spec(
+            r#"
+title: Hello
+unknown: nope
+"#,
+        )
+        .expect_err("unknown key should fail");
+        assert!(err.contains("unknown key"));
+    }
+
+    #[test]
+    fn load_task_specs_from_dir_reads_only_valid_yaml() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-yaml-load-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).expect("create test dir");
+
+        std::fs::write(root.join("a.yaml"), "title: A\nmodel: codex\n").expect("write a");
+        std::fs::write(root.join("b.yml"), "title: B\n").expect("write b");
+        std::fs::write(root.join("c.yaml"), "model: missing-title\n").expect("write c");
+        std::fs::write(root.join("ignore.txt"), "title: ignored\n").expect("write ignore");
+
+        let specs = load_task_specs_from_dir(&root);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].title, "A");
+        assert_eq!(specs[1].title, "B");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn yaml_spec_to_task_maps_fields() {
+        let spec = YamlTaskSpec {
+            title: "Do thing".to_string(),
+            model: Some("gemini".to_string()),
+            priority: Some("critical".to_string()),
+            depends_on: Some(vec!["T-1".to_string(), "T-2".to_string()]),
+            labels: Some(vec!["backend".to_string()]),
+            verify_command: Some("cargo test".to_string()),
+            context_files: Some(vec!["src/lib.rs".to_string()]),
+        };
+
+        let task = yaml_spec_to_task(&spec, "repo-xyz");
+        assert_eq!(task.repo_id.0, "repo-xyz");
+        assert_eq!(task.title, "Do thing");
+        assert_eq!(task.preferred_model, Some(ModelKind::Gemini));
+        assert_eq!(task.priority, TaskPriority::Critical);
+        assert_eq!(
+            task.depends_on,
+            vec![TaskId::new("T-1"), TaskId::new("T-2")]
+        );
+        assert_eq!(task.labels, vec!["backend".to_string()]);
+    }
+
+    #[test]
+    fn yaml_spec_to_task_defaults_on_invalid_model_and_priority() {
+        let spec = YamlTaskSpec {
+            title: "Fallback".to_string(),
+            model: Some("unknown".to_string()),
+            priority: Some("urgent".to_string()),
+            depends_on: None,
+            labels: None,
+            verify_command: None,
+            context_files: None,
+        };
+
+        let task = yaml_spec_to_task(&spec, "repo");
+        assert_eq!(task.preferred_model, None);
+        assert_eq!(task.priority, TaskPriority::Normal);
+        assert!(task.depends_on.is_empty());
+        assert!(task.labels.is_empty());
     }
 }

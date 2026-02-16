@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use orch_core::state::{TaskState, VerifyStatus};
-use orch_core::types::{ModelKind, RepoId, Task, TaskId};
+use orch_core::types::{ModelKind, RepoId, Session, SessionStatus, Task, TaskId};
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -77,6 +77,27 @@ pub struct TimelineEvent {
     pub task_id: String,
     pub description: String,
     pub event_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDisplay {
+    pub id: String,
+    pub title: String,
+    pub status: SessionStatus,
+    pub task_count: usize,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SessionDisplay {
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            title: session.title.clone(),
+            status: session.status,
+            task_count: session.task_ids.len(),
+            updated_at: session.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -501,6 +522,12 @@ pub struct DashboardState {
     pub timeline_events: Vec<TimelineEvent>,
     #[serde(default)]
     pub show_timeline: bool,
+    #[serde(default)]
+    pub show_sessions: bool,
+    #[serde(default)]
+    pub sessions: Vec<SessionDisplay>,
+    #[serde(default)]
+    pub session_list_index: usize,
     pub model_health: Vec<ModelHealthDisplay>,
     pub filter_text: Option<String>,
     pub filter_state: Option<TaskState>,
@@ -533,6 +560,9 @@ impl Default for DashboardState {
             log_root: None,
             timeline_events: Vec::new(),
             show_timeline: false,
+            show_sessions: false,
+            sessions: Vec::new(),
+            session_list_index: 0,
             model_health: Vec::new(),
             filter_text: None,
             filter_state: None,
@@ -610,6 +640,10 @@ impl DashboardState {
 
     pub fn selected_task(&self) -> Option<&TaskOverviewRow> {
         self.tasks.get(self.selected_task_idx)
+    }
+
+    pub fn selected_session(&self) -> Option<&SessionDisplay> {
+        self.sessions.get(self.session_list_index)
     }
 
     pub fn selected_pane(&self) -> Option<&AgentPane> {
@@ -713,6 +747,37 @@ impl DashboardState {
         }
 
         self.snap_pane_to_task();
+    }
+
+    pub fn ensure_selected_session_visible(&mut self) {
+        if self.sessions.is_empty() {
+            self.session_list_index = 0;
+            return;
+        }
+
+        if self.session_list_index >= self.sessions.len() {
+            self.session_list_index = self.sessions.len().saturating_sub(1);
+        }
+    }
+
+    pub fn move_session_selection_next(&mut self) {
+        if self.sessions.is_empty() {
+            self.session_list_index = 0;
+            return;
+        }
+        self.session_list_index = (self.session_list_index + 1) % self.sessions.len();
+    }
+
+    pub fn move_session_selection_previous(&mut self) {
+        if self.sessions.is_empty() {
+            self.session_list_index = 0;
+            return;
+        }
+        if self.session_list_index == 0 {
+            self.session_list_index = self.sessions.len() - 1;
+        } else {
+            self.session_list_index -= 1;
+        }
     }
 
     pub fn move_task_selection_next(&mut self) {
@@ -1160,6 +1225,63 @@ mod tests {
         let parsed: TimelineEvent =
             serde_json::from_str(&json).expect("deserialize timeline event");
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn session_display_from_session_maps_fields() {
+        let now = Utc::now();
+        let session = Session {
+            id: "S1".to_string(),
+            title: "Release Readiness".to_string(),
+            created_at: now,
+            updated_at: now,
+            task_ids: vec![TaskId("T1".to_string()), TaskId("T2".to_string())],
+            parent_session_id: None,
+            status: SessionStatus::Completed,
+        };
+
+        let display = SessionDisplay::from_session(&session);
+        assert_eq!(display.id, "S1");
+        assert_eq!(display.title, "Release Readiness");
+        assert_eq!(display.status, SessionStatus::Completed);
+        assert_eq!(display.task_count, 2);
+        assert_eq!(display.updated_at, now);
+    }
+
+    #[test]
+    fn session_selection_wraps_and_handles_empty() {
+        let now = Utc::now();
+        let mut state = DashboardState {
+            sessions: vec![
+                SessionDisplay {
+                    id: "S1".to_string(),
+                    title: "Alpha".to_string(),
+                    status: SessionStatus::Active,
+                    task_count: 1,
+                    updated_at: now,
+                },
+                SessionDisplay {
+                    id: "S2".to_string(),
+                    title: "Beta".to_string(),
+                    status: SessionStatus::Archived,
+                    task_count: 0,
+                    updated_at: now,
+                },
+            ],
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.session_list_index, 0);
+        state.move_session_selection_previous();
+        assert_eq!(state.session_list_index, 1);
+
+        state.move_session_selection_next();
+        assert_eq!(state.session_list_index, 0);
+
+        state.sessions.clear();
+        state.session_list_index = 99;
+        state.ensure_selected_session_visible();
+        assert_eq!(state.session_list_index, 0);
     }
 
     #[test]
