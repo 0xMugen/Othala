@@ -66,6 +66,24 @@ enum Commands {
         id: String,
         priority: String,
     },
+    Tag {
+        task_id: String,
+        label: String,
+    },
+    Untag {
+        task_id: String,
+        label: String,
+    },
+    Search {
+        query: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     Bulk {
         #[command(subcommand)]
         action: BulkAction,
@@ -755,6 +773,68 @@ fn set_priority(service: &OrchdService, task_id: &TaskId, priority: TaskPriority
     task.updated_at = Utc::now();
     service.store.upsert_task(&task)?;
     Ok(())
+}
+
+fn add_task_label(service: &OrchdService, task_id: &TaskId, label: &str) -> anyhow::Result<()> {
+    let normalized = label.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("label cannot be empty");
+    }
+    let Some(mut task) = service.task(task_id)? else {
+        anyhow::bail!("task not found: {}", task_id.0);
+    };
+    if !task.labels.iter().any(|existing| existing == normalized) {
+        task.labels.push(normalized.to_string());
+    }
+    task.updated_at = Utc::now();
+    service.store.upsert_task(&task)?;
+    Ok(())
+}
+
+fn remove_task_label(service: &OrchdService, task_id: &TaskId, label: &str) -> anyhow::Result<()> {
+    let normalized = label.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("label cannot be empty");
+    }
+    let Some(mut task) = service.task(task_id)? else {
+        anyhow::bail!("task not found: {}", task_id.0);
+    };
+    task.labels.retain(|existing| existing != normalized);
+    task.updated_at = Utc::now();
+    service.store.upsert_task(&task)?;
+    Ok(())
+}
+
+fn print_search_results(tasks: &[Task], json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(tasks).unwrap_or_else(|_| "[]".to_string())
+        );
+        return;
+    }
+
+    if tasks.is_empty() {
+        println!("No matching tasks.");
+        return;
+    }
+
+    println!("{:<20} {:<16} {:<24} TITLE", "ID", "STATE", "LABELS");
+    println!("{}", "-".repeat(110));
+    for task in tasks {
+        let labels = if task.labels.is_empty() {
+            "-".to_string()
+        } else {
+            task.labels.join(",")
+        };
+        println!(
+            "{:<20} {:<16} {:<24} {}",
+            task.id.0,
+            format!("{}", task.state),
+            labels,
+            task.title
+        );
+    }
 }
 
 fn init_project(repo_root: &Path, force: bool) -> anyhow::Result<Vec<String>> {
@@ -1998,6 +2078,27 @@ fn main() -> anyhow::Result<()> {
             set_priority(&service, &task_id, parsed)?;
             println!("Updated priority: {} -> {}", task_id.0, parsed);
         }
+        Commands::Tag { task_id, label } => {
+            let task_id = TaskId::new(&task_id);
+            add_task_label(&service, &task_id, &label)?;
+            println!("Tagged {} with '{}'", task_id.0, label);
+        }
+        Commands::Untag { task_id, label } => {
+            let task_id = TaskId::new(&task_id);
+            remove_task_label(&service, &task_id, &label)?;
+            println!("Removed tag '{}' from {}", label, task_id.0);
+        }
+        Commands::Search {
+            query,
+            label,
+            state,
+            json,
+        } => {
+            let matches = service
+                .store
+                .search_tasks(&query, label.as_deref(), state.as_deref())?;
+            print_search_results(&matches, json);
+        }
         Commands::Bulk { action } => {
             let summary = match action {
                 BulkAction::Retry { state, ids } => bulk_retry(&service, state.as_deref(), &ids)?,
@@ -2232,6 +2333,7 @@ fn main() -> anyhow::Result<()> {
                 skip_context_regen: skip_context_gen,
                 dry_run: false,
                 agent_timeout_secs: daemon_org_config.agent_timeout_secs,
+                drain_timeout_secs: 30,
             };
             let mut tick_interval_secs = daemon_org_config.tick_interval_secs;
 
@@ -3737,6 +3839,120 @@ mod tests {
                 .priority,
             TaskPriority::Low
         );
+    }
+
+    #[test]
+    fn tag_adds_label_to_task() {
+        let service = mk_test_service();
+        let task = mk_task("T-TAG-1", TaskState::Chatting);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        add_task_label(&service, &task.id, "bug").expect("tag task");
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(updated.labels, vec!["bug".to_string()]);
+    }
+
+    #[test]
+    fn tag_deduplicates_labels() {
+        let service = mk_test_service();
+        let task = mk_task("T-TAG-2", TaskState::Chatting);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        add_task_label(&service, &task.id, "urgent").expect("first tag");
+        add_task_label(&service, &task.id, "urgent").expect("second tag");
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(updated.labels, vec!["urgent".to_string()]);
+    }
+
+    #[test]
+    fn untag_removes_label() {
+        let service = mk_test_service();
+        let task = mk_task("T-TAG-3", TaskState::Chatting);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        add_task_label(&service, &task.id, "feature").expect("tag task");
+        remove_task_label(&service, &task.id, "feature").expect("untag task");
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert!(updated.labels.is_empty());
+    }
+
+    #[test]
+    fn search_by_title() {
+        let service = mk_test_service();
+        let task_a = mk_task("T-SEARCH-TITLE-A", TaskState::Chatting);
+        let mut task_b = mk_task("T-SEARCH-TITLE-B", TaskState::Chatting);
+        task_b.title = "Fix urgent regression".to_string();
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+
+        let result = service
+            .store
+            .search_tasks("regression", None, None)
+            .expect("search tasks");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.0, task_b.id.0);
+    }
+
+    #[test]
+    fn search_by_label() {
+        let service = mk_test_service();
+        let task_a = mk_task("T-SEARCH-LABEL-A", TaskState::Chatting);
+        let task_b = mk_task("T-SEARCH-LABEL-B", TaskState::Chatting);
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+
+        add_task_label(&service, &task_a.id, "bug").expect("tag task a");
+        add_task_label(&service, &task_b.id, "feature").expect("tag task b");
+
+        let result = service
+            .store
+            .search_tasks("bug", Some("bug"), None)
+            .expect("search tasks");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.0, task_a.id.0);
+    }
+
+    #[test]
+    fn search_by_state() {
+        let service = mk_test_service();
+        let task_a = mk_task("T-SEARCH-STATE-A", TaskState::Ready);
+        let task_b = mk_task("T-SEARCH-STATE-B", TaskState::Stopped);
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+
+        let result = service
+            .store
+            .search_tasks("T-SEARCH-STATE", None, Some("ready"))
+            .expect("search tasks");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.0, task_a.id.0);
     }
 
     #[test]

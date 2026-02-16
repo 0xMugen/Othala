@@ -228,6 +228,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .selected_pane()
         .map(|pane| pane.instance_id.as_str())
         .unwrap_or("-");
+    let sort_direction = if app.state.sort_reversed {
+        "\u{2191}"
+    } else {
+        "\u{2193}"
+    };
+    let sort_label = app.state.sort_mode.label();
 
     let line = Line::from(vec![
         Span::styled(
@@ -250,6 +256,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::styled(selected_task, Style::default().fg(ACCENT)),
         Span::styled("  pane:", Style::default().fg(DIM)),
         Span::styled(selected_pane, Style::default().fg(ACCENT)),
+        Span::styled("  sort:", Style::default().fg(DIM)),
+        Span::styled(format!("{sort_direction} {sort_label}"), Style::default().fg(ACCENT)),
     ]);
 
     let widget = Paragraph::new(line)
@@ -262,7 +270,14 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
-    let filtered_task_indices = app.state.filtered_tasks();
+    let selected_task_id = app.state.selected_task().map(|task| task.task_id.clone());
+    let text_filter = app
+        .state
+        .filter_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
 
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
@@ -276,9 +291,28 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Style::default().fg(DIM),
     )));
 
-    for idx in &filtered_task_indices {
-        let task = &app.state.tasks[*idx];
-        let is_selected = *idx == app.state.selected_task_idx;
+    let mut filtered_task_count = 0usize;
+    for task in app.state.sorted_tasks() {
+        let state_matches = match app.state.filter_state {
+            Some(state) => task.state == state,
+            None => true,
+        };
+        if !state_matches {
+            continue;
+        }
+        let text_matches = match &text_filter {
+            Some(query) => {
+                task.title.to_lowercase().contains(query)
+                    || task.task_id.0.to_lowercase().contains(query)
+            }
+            None => true,
+        };
+        if !text_matches {
+            continue;
+        }
+        filtered_task_count += 1;
+
+        let is_selected = selected_task_id.as_ref() == Some(&task.task_id);
         let task_model = app
             .state
             .panes
@@ -296,16 +330,18 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             " no tasks",
             Style::default().fg(DIM),
         )));
-    } else if filtered_task_indices.is_empty() {
+    } else if filtered_task_count == 0 {
         lines.push(Line::from(Span::styled(
             " no matching tasks",
             Style::default().fg(DIM),
         )));
     }
 
+    let direction = if app.state.sort_reversed { "\u{2191}" } else { "\u{2193}" };
+    let sort_label = app.state.sort_mode.label();
     let title = match app.state.active_filter_label() {
-        Some(label) => format!("Tasks [Filter: {label}]"),
-        None => "Tasks".to_string(),
+        Some(label) => format!("Tasks [{direction} {sort_label}] [Filter: {label}]"),
+        None => format!("Tasks [{direction} {sort_label}]"),
     };
 
     let widget = Paragraph::new(lines)

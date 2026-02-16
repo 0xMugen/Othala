@@ -70,6 +70,40 @@ pub struct ErrorEntry {
     pub level: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortMode {
+    ByState,
+    ByPriority,
+    ByLastActivity,
+    ByName,
+}
+
+impl SortMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::ByState => "State",
+            SortMode::ByPriority => "Priority",
+            SortMode::ByLastActivity => "Activity",
+            SortMode::ByName => "Name",
+        }
+    }
+
+    pub fn next(&self) -> SortMode {
+        match self {
+            SortMode::ByState => SortMode::ByPriority,
+            SortMode::ByPriority => SortMode::ByLastActivity,
+            SortMode::ByLastActivity => SortMode::ByName,
+            SortMode::ByName => SortMode::ByState,
+        }
+    }
+}
+
+impl Default for SortMode {
+    fn default() -> Self {
+        Self::ByState
+    }
+}
+
 impl TaskOverviewRow {
     pub fn from_task(task: &Task) -> Self {
         let verify_summary = match &task.verify_status {
@@ -337,6 +371,10 @@ pub struct DashboardState {
     pub model_health: Vec<ModelHealthDisplay>,
     pub filter_text: Option<String>,
     pub filter_state: Option<TaskState>,
+    #[serde(default)]
+    pub sort_mode: SortMode,
+    #[serde(default)]
+    pub sort_reversed: bool,
     pub selected_task_activity: Vec<String>,
     pub selected_task_idx: usize,
     pub selected_pane_idx: usize,
@@ -359,6 +397,8 @@ impl Default for DashboardState {
             model_health: Vec::new(),
             filter_text: None,
             filter_state: None,
+            sort_mode: SortMode::ByState,
+            sort_reversed: false,
             selected_task_activity: Vec::new(),
             selected_task_idx: 0,
             selected_pane_idx: 0,
@@ -431,6 +471,26 @@ impl DashboardState {
 
     pub fn selected_pane_mut(&mut self) -> Option<&mut AgentPane> {
         self.panes.get_mut(self.selected_pane_idx)
+    }
+
+    pub fn sorted_tasks(&self) -> Vec<&TaskOverviewRow> {
+        let mut tasks: Vec<&TaskOverviewRow> = self.tasks.iter().collect();
+        match self.sort_mode {
+            SortMode::ByState => tasks.sort_by_key(|task| task_state_sort_key(task.state)),
+            SortMode::ByPriority => tasks.sort_by(|a, b| {
+                inferred_priority_rank(b)
+                    .cmp(&inferred_priority_rank(a))
+                    .then_with(|| b.last_activity.cmp(&a.last_activity))
+            }),
+            SortMode::ByLastActivity => {
+                tasks.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+            }
+            SortMode::ByName => tasks.sort_by(|a, b| a.title.cmp(&b.title)),
+        }
+        if self.sort_reversed {
+            tasks.reverse();
+        }
+        tasks
     }
 
     pub fn filtered_tasks(&self) -> Vec<usize> {
@@ -699,6 +759,32 @@ fn task_state_label(state: TaskState) -> &'static str {
     }
 }
 
+fn task_state_sort_key(state: TaskState) -> u8 {
+    match state {
+        TaskState::Chatting => 0,
+        TaskState::Ready => 1,
+        TaskState::Submitting => 2,
+        TaskState::Restacking => 3,
+        TaskState::AwaitingMerge => 4,
+        TaskState::Merged => 5,
+        TaskState::Stopped => 6,
+    }
+}
+
+fn inferred_priority_rank(task: &TaskOverviewRow) -> u8 {
+    let display = task.display_state.to_ascii_lowercase();
+    let title = task.title.to_ascii_lowercase();
+    if display.contains("critical") || title.contains("critical") {
+        3
+    } else if display.contains("high") || title.contains("high") {
+        2
+    } else if display.contains("low") || title.contains("low") {
+        0
+    } else {
+        1
+    }
+}
+
 /// Produce a user-facing state label.
 pub fn effective_display_state(state: TaskState, verify: &VerifyStatus) -> String {
     match state {
@@ -777,6 +863,14 @@ mod tests {
         task.state = state;
         task.title = title.to_string();
         TaskOverviewRow::from_task(&task)
+    }
+
+    #[test]
+    fn sort_mode_cycles_correctly() {
+        assert_eq!(SortMode::ByState.next(), SortMode::ByPriority);
+        assert_eq!(SortMode::ByPriority.next(), SortMode::ByLastActivity);
+        assert_eq!(SortMode::ByLastActivity.next(), SortMode::ByName);
+        assert_eq!(SortMode::ByName.next(), SortMode::ByState);
     }
 
     #[test]
@@ -990,6 +1084,52 @@ mod tests {
         };
 
         assert_eq!(state.filtered_tasks(), vec![0]);
+    }
+
+    #[test]
+    fn sorted_tasks_by_name() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Zulu", TaskState::Chatting),
+                mk_row("T2", "Alpha", TaskState::Ready),
+                mk_row("T3", "Bravo", TaskState::Submitting),
+            ],
+            sort_mode: SortMode::ByName,
+            sort_reversed: false,
+            recent_errors: vec![],
+            log_root: None,
+            ..DashboardState::default()
+        };
+
+        let ordered: Vec<&str> = state
+            .sorted_tasks()
+            .into_iter()
+            .map(|task| task.title.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["Alpha", "Bravo", "Zulu"]);
+    }
+
+    #[test]
+    fn sorted_tasks_reversed() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Alpha", TaskState::Chatting),
+                mk_row("T2", "Bravo", TaskState::Ready),
+                mk_row("T3", "Zulu", TaskState::Submitting),
+            ],
+            sort_mode: SortMode::ByName,
+            sort_reversed: true,
+            recent_errors: vec![],
+            log_root: None,
+            ..DashboardState::default()
+        };
+
+        let ordered: Vec<&str> = state
+            .sorted_tasks()
+            .into_iter()
+            .map(|task| task.title.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["Zulu", "Bravo", "Alpha"]);
     }
 
     #[test]

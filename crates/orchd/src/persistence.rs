@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     repo_id TEXT NOT NULL,
     state_tag TEXT NOT NULL,
     priority TEXT NOT NULL DEFAULT 'normal',
+    labels_json TEXT NOT NULL DEFAULT '[]',
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -146,6 +147,19 @@ CREATE INDEX IF NOT EXISTS idx_archived_tasks_archived_at ON archived_tasks(arch
         }
 
         if let Err(err) = self.conn.execute(
+            "ALTER TABLE tasks ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        ) {
+            if !matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name: labels_json")
+            ) {
+                return Err(err.into());
+            }
+        }
+
+        if let Err(err) = self.conn.execute(
             "ALTER TABLE runs ADD COLUMN estimated_tokens INTEGER DEFAULT NULL",
             [],
         ) {
@@ -179,12 +193,13 @@ CREATE INDEX IF NOT EXISTS idx_archived_tasks_archived_at ON archived_tasks(arch
         let payload = serde_json::to_string(task)?;
         self.conn.execute(
             r#"
-INSERT INTO tasks (task_id, repo_id, state_tag, priority, payload_json, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+INSERT INTO tasks (task_id, repo_id, state_tag, priority, labels_json, payload_json, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT(task_id) DO UPDATE SET
   repo_id = excluded.repo_id,
   state_tag = excluded.state_tag,
   priority = excluded.priority,
+  labels_json = excluded.labels_json,
   payload_json = excluded.payload_json,
   updated_at = excluded.updated_at
 "#,
@@ -193,6 +208,7 @@ ON CONFLICT(task_id) DO UPDATE SET
                 task.repo_id.0,
                 task_state_tag(task.state),
                 task.priority.as_str(),
+                serde_json::to_string(&task.labels)?,
                 payload,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
@@ -202,17 +218,18 @@ ON CONFLICT(task_id) DO UPDATE SET
     }
 
     pub fn load_task(&self, task_id: &TaskId) -> Result<Option<Task>, PersistenceError> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .conn
             .query_row(
-                "SELECT payload_json, priority FROM tasks WHERE task_id = ?1",
+                "SELECT payload_json, priority, labels_json FROM tasks WHERE task_id = ?1",
                 params![task_id.0],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        row.map(|(payload, priority)| {
+        row.map(|(payload, priority, labels_json)| {
             let mut task = serde_json::from_str::<Task>(&payload)?;
             task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            task.labels = serde_json::from_str::<Vec<String>>(&labels_json)?;
             Ok::<Task, serde_json::Error>(task)
         })
         .transpose()
@@ -255,17 +272,69 @@ ON CONFLICT(task_id) DO UPDATE SET
     pub fn list_tasks(&self) -> Result<Vec<Task>, PersistenceError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT payload_json, priority FROM tasks ORDER BY updated_at DESC, task_id ASC")?;
+            .prepare(
+                "SELECT payload_json, priority, labels_json FROM tasks ORDER BY updated_at DESC, task_id ASC",
+            )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let (payload, priority) = row?;
+            let (payload, priority, labels_json) = row?;
             let mut task = serde_json::from_str::<Task>(&payload)?;
             task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            task.labels = serde_json::from_str::<Vec<String>>(&labels_json)?;
             tasks.push(task);
         }
+        Ok(tasks)
+    }
+
+    pub fn search_tasks(
+        &self,
+        query: &str,
+        label: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Vec<Task>, PersistenceError> {
+        let query_lc = query.to_lowercase();
+        let label_lc = label.map(|value| value.to_lowercase());
+        let state_lc = state.map(|value| value.trim().to_lowercase().replace('-', "_"));
+
+        let mut tasks = self.list_tasks()?;
+        tasks.retain(|task| {
+            let title_match = task.title.to_lowercase().contains(&query_lc);
+            let id_match = task.id.0.to_lowercase().contains(&query_lc);
+            let label_match = task
+                .labels
+                .iter()
+                .any(|existing| existing.to_lowercase().contains(&query_lc));
+            if !(title_match || id_match || label_match) {
+                return false;
+            }
+
+            if let Some(ref expected_label) = label_lc {
+                let has_label = task
+                    .labels
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(expected_label));
+                if !has_label {
+                    return false;
+                }
+            }
+
+            if let Some(ref expected_state) = state_lc {
+                let task_state = task_state_tag(task.state).to_lowercase();
+                if task_state != *expected_state {
+                    return false;
+                }
+            }
+
+            true
+        });
+
         Ok(tasks)
     }
 
@@ -291,16 +360,21 @@ ON CONFLICT(task_id) DO UPDATE SET
 
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<Task>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT payload_json, priority FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
+            "SELECT payload_json, priority, labels_json FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
         )?;
         let rows = stmt.query_map(params![task_state_tag(state)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let (payload, priority) = row?;
+            let (payload, priority, labels_json) = row?;
             let mut task = serde_json::from_str::<Task>(&payload)?;
             task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            task.labels = serde_json::from_str::<Vec<String>>(&labels_json)?;
             tasks.push(task);
         }
         Ok(tasks)
