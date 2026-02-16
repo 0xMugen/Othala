@@ -463,6 +463,27 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List or instantiate task templates
+    Templates {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show daemon health and status
+    Health {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search tasks with fuzzy matching
+    #[command(name = "find")]
+    Find {
+        /// Search query (supports state:X label:Y syntax)
+        query: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3827,6 +3848,37 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_default());
             } else {
                 println!("{}", plan.summary());
+            }
+        }
+        Commands::Templates { json } => {
+            let templates = orchd::task_templates::discover_templates(Path::new("."));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&templates).unwrap_or_default());
+            } else if templates.is_empty() {
+                println!("No task templates found.");
+                println!("Add .yaml files to .othala/templates/ or ~/.config/othala/templates/");
+            } else {
+                println!("{}", orchd::task_templates::display_templates_table(&templates));
+            }
+        }
+        Commands::Health { json } => {
+            let health = orchd::daemon_status::DaemonHealth::new();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&health).unwrap_or_default());
+            } else {
+                println!("{}", health.display_full());
+            }
+        }
+        Commands::Find { query, json } => {
+            let search_query = orchd::search::parse_search_query(&query);
+            let index = orchd::search::SearchIndex::new();
+            let results = index.search(&search_query);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results).unwrap_or_default());
+            } else if results.is_empty() {
+                println!("No results for: {query}");
+            } else {
+                println!("{}", orchd::search::display_search_results(&results));
             }
         }
     }

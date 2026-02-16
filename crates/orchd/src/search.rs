@@ -42,7 +42,7 @@ impl Default for SearchQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub task_id: String,
     pub title: String,
