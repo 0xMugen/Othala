@@ -124,9 +124,7 @@ pub enum PipelineAction {
         mode: SubmitMode,
     },
     /// Pipeline is complete — mark task as submitted.
-    Complete {
-        task_id: TaskId,
-    },
+    Complete { task_id: TaskId },
     /// Pipeline failed — needs retry or human intervention.
     Failed {
         task_id: TaskId,
@@ -197,10 +195,7 @@ mod tests {
         let mut p = mk_pipeline(Some("task/T-0"));
 
         // VerifyBranch -> StackOnParent
-        assert!(matches!(
-            next_action(&p),
-            PipelineAction::RunVerify { .. }
-        ));
+        assert!(matches!(next_action(&p), PipelineAction::RunVerify { .. }));
         p.advance();
         assert_eq!(p.stage, PipelineStage::StackOnParent);
 
@@ -213,10 +208,7 @@ mod tests {
         assert_eq!(p.stage, PipelineStage::VerifyStack);
 
         // VerifyStack -> Submit
-        assert!(matches!(
-            next_action(&p),
-            PipelineAction::RunVerify { .. }
-        ));
+        assert!(matches!(next_action(&p), PipelineAction::RunVerify { .. }));
         p.advance();
         assert_eq!(p.stage, PipelineStage::Submit);
 

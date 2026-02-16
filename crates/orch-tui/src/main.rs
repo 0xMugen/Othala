@@ -817,6 +817,7 @@ fn run() -> Result<(), MainError> {
                                 &task.worktree_path,
                                 &task.title,
                                 Some(model),
+                                Duration::from_secs(1_800),
                             ) {
                                 Ok(()) => {
                                     manually_stopped_tasks.remove(task_id);
@@ -880,6 +881,7 @@ fn run() -> Result<(), MainError> {
                                         &task.worktree_path,
                                         message,
                                         Some(model),
+                                        Duration::from_secs(1_800),
                                     )
                                 } else {
                                     supervisor.spawn_interactive(
@@ -1313,6 +1315,7 @@ fn run() -> Result<(), MainError> {
                         &task.worktree_path,
                         &task.title,
                         Some(model),
+                        Duration::from_secs(1_800),
                     ) {
                         Ok(()) => {
                             // Create pane immediately so the UI shows "starting"
@@ -1569,6 +1572,7 @@ fn run() -> Result<(), MainError> {
                                 &task.worktree_path,
                                 &retry_prompt,
                                 Some(model),
+                                Duration::from_secs(1_800),
                             ) {
                                 Ok(()) => {
                                     next_agent_restart_at.remove(&task_id.0);

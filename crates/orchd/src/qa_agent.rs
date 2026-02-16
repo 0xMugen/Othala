@@ -161,7 +161,9 @@ pub fn load_baseline(repo_root: &Path) -> Option<QASpec> {
 
 /// Load a task-specific QA spec from `.othala/qa/specs/{task_id}.md`.
 pub fn load_task_spec(repo_root: &Path, task_id: &TaskId) -> Option<String> {
-    let path = qa_dir(repo_root).join("specs").join(format!("{}.md", task_id.0));
+    let path = qa_dir(repo_root)
+        .join("specs")
+        .join(format!("{}.md", task_id.0));
     std::fs::read_to_string(path).ok()
 }
 
@@ -210,8 +212,7 @@ pub fn save_qa_result(repo_root: &Path, result: &QAResult) -> std::io::Result<Pa
     let filename = format!("{}-{}.json", sanitized, short_commit);
     let path = results_dir.join(&filename);
 
-    let json = serde_json::to_string_pretty(result)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(result).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
 
     // Also save to history.
@@ -219,8 +220,7 @@ pub fn save_qa_result(repo_root: &Path, result: &QAResult) -> std::io::Result<Pa
     std::fs::create_dir_all(&history_dir)?;
     let ts = result.timestamp.format("%Y%m%dT%H%M%S").to_string();
     let history_path = history_dir.join(format!("{}.json", ts));
-    let json = serde_json::to_string_pretty(result)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(result).map_err(std::io::Error::other)?;
     std::fs::write(&history_path, json)?;
 
     Ok(path)
@@ -230,7 +230,13 @@ pub fn save_qa_result(repo_root: &Path, result: &QAResult) -> std::io::Result<Pa
 fn sanitize_branch_name(branch: &str) -> String {
     branch
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -452,7 +458,10 @@ pub fn build_qa_failure_context(result: &QAResult) -> String {
         } else {
             format!(" — {}", test.detail)
         };
-        ctx.push_str(&format!("- {}.{}: {}{}\n", test.suite, test.name, status, detail));
+        ctx.push_str(&format!(
+            "- {}.{}: {}{}\n",
+            test.suite, test.name, status, detail
+        ));
     }
 
     ctx.push_str("\nFix the failing tests before signaling [patch_ready].\n");
@@ -1054,10 +1063,7 @@ Running tests...
 
     #[test]
     fn build_qa_prompt_with_template() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qa-tmpl-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-qa-tmpl-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
             tmp.join("qa-validator.md"),

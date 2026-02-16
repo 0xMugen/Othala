@@ -192,7 +192,8 @@ mod tests {
     #[test]
     fn prompt_includes_test_spec() {
         let mut config = mk_config();
-        config.test_spec = Some("- [ ] Login returns 200\n- [ ] Bad password returns 401\n".to_string());
+        config.test_spec =
+            Some("- [ ] Login returns 200\n- [ ] Bad password returns 401\n".to_string());
 
         let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
         assert!(prompt.contains("Test Specification"));
@@ -250,11 +251,23 @@ mod tests {
     fn all_roles_select_correct_template_file() {
         let tmp = std::env::temp_dir().join(format!("othala-roles-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("implementer.md"), "# Implementer\nImplement things.\n").unwrap();
+        fs::write(
+            tmp.join("implementer.md"),
+            "# Implementer\nImplement things.\n",
+        )
+        .unwrap();
         fs::write(tmp.join("tests-specialist.md"), "# Tests\nWrite tests.\n").unwrap();
         fs::write(tmp.join("reviewer.md"), "# Reviewer\nReview code.\n").unwrap();
-        fs::write(tmp.join("stack-captain.md"), "# Stack Captain\nManage stacks.\n").unwrap();
-        fs::write(tmp.join("qa-validator.md"), "# QA Validator\nValidate quality.\n").unwrap();
+        fs::write(
+            tmp.join("stack-captain.md"),
+            "# Stack Captain\nManage stacks.\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("qa-validator.md"),
+            "# QA Validator\nValidate quality.\n",
+        )
+        .unwrap();
 
         for (role, expected) in [
             (PromptRole::Implement, "Implement things"),
@@ -301,7 +314,11 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("othala-src-inline-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("lib.rs"), "pub fn greet() -> &'static str { \"hello\" }\n").unwrap();
+        fs::write(
+            tmp.join("lib.rs"),
+            "pub fn greet() -> &'static str { \"hello\" }\n",
+        )
+        .unwrap();
 
         let mut config = mk_config();
         config.repo_root = Some(tmp.clone());

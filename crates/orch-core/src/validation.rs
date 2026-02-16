@@ -115,8 +115,8 @@ impl Validate for TaskSpec {
 mod tests {
     use super::{Validate, ValidationLevel};
     use crate::config::{
-        ConcurrencyConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy, NixConfig, OrgConfig,
-        RepoConfig, RepoGraphiteConfig, UiConfig, VerifyConfig,
+        ConcurrencyConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy, NixConfig,
+        NotificationConfig, OrgConfig, RepoConfig, RepoGraphiteConfig, UiConfig, VerifyConfig,
     };
     use crate::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskSpec};
     use std::path::PathBuf;
@@ -141,6 +141,7 @@ mod tests {
             ui: UiConfig {
                 web_bind: "127.0.0.1:9842".to_string(),
             },
+            notifications: NotificationConfig::default(),
         }
     }
 

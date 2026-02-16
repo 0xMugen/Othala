@@ -102,7 +102,10 @@ impl OrchdService {
     /// Sub-tasks created by orchestrator decomposition are filtered out.
     pub fn list_top_level_tasks(&self) -> Result<Vec<Task>, ServiceError> {
         let all = self.store.list_tasks()?;
-        Ok(all.into_iter().filter(|t| t.parent_task_id.is_none()).collect())
+        Ok(all
+            .into_iter()
+            .filter(|t| t.parent_task_id.is_none())
+            .collect())
     }
 
     pub fn delete_task(&self, task_id: &TaskId) -> Result<bool, ServiceError> {
@@ -125,7 +128,10 @@ impl OrchdService {
         Ok(self.store.list_events_global()?)
     }
 
-    pub fn task_runs(&self, task_id: &TaskId) -> Result<Vec<crate::types::TaskRunRecord>, ServiceError> {
+    pub fn task_runs(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<crate::types::TaskRunRecord>, ServiceError> {
         Ok(self.store.list_runs_for_task(task_id)?)
     }
 
@@ -166,11 +172,7 @@ impl OrchdService {
     }
 
     /// Increment the retry count for a task and store the failure reason.
-    pub fn increment_retry(
-        &self,
-        task_id: &TaskId,
-        reason: &str,
-    ) -> Result<(), ServiceError> {
+    pub fn increment_retry(&self, task_id: &TaskId, reason: &str) -> Result<(), ServiceError> {
         let mut task =
             self.store
                 .load_task(task_id)?

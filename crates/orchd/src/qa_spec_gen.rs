@@ -204,11 +204,8 @@ pub fn scan_test_infrastructure(repo_root: &Path) -> String {
                 let main_rs = crate_dir.join("src/main.rs");
                 if main_rs.exists() {
                     if let Ok(content) = std::fs::read_to_string(&main_rs) {
-                        let first_lines: String = content
-                            .lines()
-                            .take(50)
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let first_lines: String =
+                            content.lines().take(50).collect::<Vec<_>>().join("\n");
                         snapshot.push_str(&format!(
                             "### crates/{crate_name}/src/main.rs (first 50 lines)\n```rust\n{first_lines}\n```\n\n"
                         ));
@@ -221,11 +218,8 @@ pub fn scan_test_infrastructure(repo_root: &Path) -> String {
                         for bin in bins.flatten() {
                             let bin_name = bin.file_name().to_string_lossy().to_string();
                             if let Ok(content) = std::fs::read_to_string(bin.path()) {
-                                let first_lines: String = content
-                                    .lines()
-                                    .take(30)
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
+                                let first_lines: String =
+                                    content.lines().take(30).collect::<Vec<_>>().join("\n");
                                 snapshot.push_str(&format!(
                                     "### crates/{crate_name}/src/bin/{bin_name} (first 30 lines)\n```rust\n{first_lines}\n```\n\n"
                                 ));
@@ -286,11 +280,7 @@ pub fn scan_test_infrastructure(repo_root: &Path) -> String {
     let state_machine = repo_root.join("crates/orchd/src/state_machine.rs");
     if let Ok(content) = std::fs::read_to_string(&state_machine) {
         snapshot.push_str("## State Machine (state_machine.rs)\n```rust\n");
-        let truncated: String = content
-            .lines()
-            .take(100)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let truncated: String = content.lines().take(100).collect::<Vec<_>>().join("\n");
         snapshot.push_str(&truncated);
         snapshot.push_str("\n```\n\n");
     }
@@ -413,10 +403,7 @@ pub fn parse_qa_spec_gen_output(raw: &str) -> QASpecGenOutput {
                 if let Some(filename) = current_filename.take() {
                     let content = current_content.trim().to_string();
                     if !content.is_empty() {
-                        files.push(QASpecFile {
-                            filename,
-                            content,
-                        });
+                        files.push(QASpecFile { filename, content });
                     }
                 }
                 current_filename = Some(sanitize_path(name.trim()));
@@ -554,10 +541,7 @@ pub fn spawn_qa_spec_gen(
 ///
 /// If the process has finished, parses the output and writes files.
 /// Returns the list of written paths on success.
-pub fn poll_qa_spec_gen(
-    repo_root: &Path,
-    state: &mut QASpecGenState,
-) -> Option<Vec<PathBuf>> {
+pub fn poll_qa_spec_gen(repo_root: &Path, state: &mut QASpecGenState) -> Option<Vec<PathBuf>> {
     if state.status != QASpecGenStatus::Running {
         return None;
     }
@@ -591,10 +575,7 @@ pub fn poll_qa_spec_gen(
     if !parsed.files.is_empty() {
         match write_qa_spec_files(repo_root, &parsed) {
             Ok(paths) => {
-                eprintln!(
-                    "[qa-spec-gen] Wrote {} QA spec files",
-                    paths.len()
-                );
+                eprintln!("[qa-spec-gen] Wrote {} QA spec files", paths.len());
                 state.status = QASpecGenStatus::Completed;
                 state.last_generated_at = Some(Utc::now());
                 state.child_handle = None;
@@ -741,10 +722,8 @@ mod tests {
 
     #[test]
     fn qa_spec_is_current_requires_baseline_and_hash() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-current-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("othala-qaspec-current-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         // No baseline.md → not current.
@@ -767,10 +746,8 @@ mod tests {
 
     #[test]
     fn check_qa_spec_startup_returns_missing() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-startup-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("othala-qaspec-startup-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         assert_eq!(check_qa_spec_startup(&tmp), QASpecStartupStatus::Missing);
@@ -780,19 +757,14 @@ mod tests {
 
     #[test]
     fn check_qa_spec_startup_returns_up_to_date() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-uptodate-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("othala-qaspec-uptodate-{}", std::process::id()));
         let qa_dir = tmp.join(".othala/qa");
         fs::create_dir_all(&qa_dir).unwrap();
         fs::write(qa_dir.join("baseline.md"), "# QA Baseline\n").unwrap();
 
         // No git repo → considered up to date.
-        assert_eq!(
-            check_qa_spec_startup(&tmp),
-            QASpecStartupStatus::UpToDate
-        );
+        assert_eq!(check_qa_spec_startup(&tmp), QASpecStartupStatus::UpToDate);
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -812,8 +784,7 @@ mod tests {
         assert!(!should_regenerate(&state, &config, Utc::now()));
 
         let mut state = QASpecGenState::new();
-        state.last_generated_at =
-            Some(Utc::now() - chrono::Duration::seconds(600));
+        state.last_generated_at = Some(Utc::now() - chrono::Duration::seconds(600));
         assert!(should_regenerate(&state, &config, Utc::now()));
     }
 
@@ -880,10 +851,7 @@ Use tmux for TUI tests.
 
     #[test]
     fn write_qa_spec_files_creates_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-write-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-qaspec-write-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
 
         let output = QASpecGenOutput {
@@ -919,10 +887,7 @@ Use tmux for TUI tests.
 
     #[test]
     fn scan_test_infrastructure_includes_cargo_toml() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-scan-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-qaspec-scan-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
             tmp.join("Cargo.toml"),
@@ -939,15 +904,11 @@ Use tmux for TUI tests.
 
     #[test]
     fn build_qa_spec_gen_prompt_includes_snapshot() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-prompt-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-qaspec-prompt-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("Cargo.toml"), "[workspace]\n").unwrap();
 
-        let prompt =
-            build_qa_spec_gen_prompt(&tmp, Path::new("/nonexistent-templates"));
+        let prompt = build_qa_spec_gen_prompt(&tmp, Path::new("/nonexistent-templates"));
         assert!(prompt.contains("Test Infrastructure Snapshot"));
         assert!(prompt.contains("[workspace]"));
 
@@ -956,10 +917,7 @@ Use tmux for TUI tests.
 
     #[test]
     fn hash_roundtrip() {
-        let tmp = std::env::temp_dir().join(format!(
-            "othala-qaspec-hash-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("othala-qaspec-hash-{}", std::process::id()));
         let qa_dir = tmp.join(".othala/qa");
         fs::create_dir_all(&qa_dir).unwrap();
 

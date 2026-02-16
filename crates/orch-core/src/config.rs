@@ -56,6 +56,25 @@ pub struct OrgConfig {
     pub concurrency: ConcurrencyConfig,
     pub graphite: GraphiteOrgConfig,
     pub ui: UiConfig,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub webhook_url: Option<String>,
+    pub stdout: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: None,
+            stdout: true,
+        }
+    }
 }
 
 /// Model configuration - simplified for MVP.
@@ -228,6 +247,10 @@ allow_move = "manual"
 
 [ui]
 web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
 "#,
         )
         .expect("parse org config")

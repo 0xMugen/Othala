@@ -13,7 +13,7 @@ mod tests {
     use super::{
         notification_for_event, NotificationDispatcher, NotificationMessage, NotificationPolicy,
         NotificationSeverity, NotificationSinkKind, NotificationTopic, NotifyError, StdoutSink,
-        TelegramSink,
+        TelegramSink, WebhookSink,
     };
     use orch_core::events::Event;
     use std::any::TypeId;
@@ -28,6 +28,7 @@ mod tests {
         let _ = TypeId::of::<NotificationPolicy>();
         let _ = TypeId::of::<StdoutSink>();
         let _ = TypeId::of::<TelegramSink>();
+        let _ = TypeId::of::<WebhookSink>();
         let _ = TypeId::of::<NotificationDispatcher>();
     }
 

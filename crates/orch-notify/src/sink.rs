@@ -1,5 +1,6 @@
 use crate::error::NotifyError;
 use crate::types::{NotificationMessage, NotificationPolicy, NotificationSinkKind};
+use std::process::Command;
 
 pub trait NotificationSink: Send + Sync {
     fn kind(&self) -> NotificationSinkKind;
@@ -63,6 +64,64 @@ impl NotificationSink for TelegramSink {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WebhookSink {
+    pub url: String,
+    pub timeout_secs: u64,
+}
+
+impl NotificationSink for WebhookSink {
+    fn kind(&self) -> NotificationSinkKind {
+        NotificationSinkKind::Webhook
+    }
+
+    fn send(&self, message: &NotificationMessage) -> Result<(), NotifyError> {
+        let payload = serde_json::json!({
+            "topic": message.topic,
+            "severity": message.severity,
+            "title": &message.title,
+            "body": &message.body,
+            "task_id": message
+                .task_id
+                .as_ref()
+                .map(|task_id| task_id.0.clone())
+                .unwrap_or_default(),
+        });
+        let payload = serde_json::to_string(&payload).map_err(|e| NotifyError::SinkFailed {
+            message: format!("failed to encode webhook payload: {e}"),
+        })?;
+
+        let output = Command::new("curl")
+            .arg("-sS")
+            .arg("-m")
+            .arg(self.timeout_secs.to_string())
+            .arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("-d")
+            .arg(payload)
+            .arg(&self.url)
+            .output()
+            .map_err(|e| NotifyError::SinkFailed {
+                message: format!("failed to execute curl for webhook sink: {e}"),
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(NotifyError::SinkFailed {
+            message: format!(
+                "webhook sink request failed (status {:?}): {}",
+                output.status.code(),
+                stderr.trim()
+            ),
+        })
+    }
+}
+
 pub struct NotificationDispatcher {
     sinks: Vec<Box<dyn NotificationSink>>,
 }
@@ -78,6 +137,7 @@ impl NotificationDispatcher {
             match sink {
                 NotificationSinkKind::Stdout => sinks.push(Box::new(StdoutSink)),
                 NotificationSinkKind::Telegram => sinks.push(Box::new(TelegramSink::default())),
+                NotificationSinkKind::Webhook => {}
             }
         }
         Self { sinks }
@@ -221,5 +281,23 @@ mod tests {
             .send(&mk_message())
             .expect_err("transport is not implemented");
         assert!(matches!(err, NotifyError::SinkFailed { .. }));
+    }
+
+    #[test]
+    fn webhook_sink_kind_is_webhook() {
+        let sink = super::WebhookSink {
+            url: "https://example.test/webhook".to_string(),
+            timeout_secs: 5,
+        };
+        assert_eq!(sink.kind(), NotificationSinkKind::Webhook);
+    }
+
+    #[test]
+    fn dispatcher_with_stdout_sink_reports_success() {
+        let dispatcher = NotificationDispatcher::new(vec![Box::new(super::StdoutSink)]);
+        let results = dispatcher.dispatch(&mk_message());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, NotificationSinkKind::Stdout);
+        assert!(results[0].1.is_ok());
     }
 }
