@@ -2700,10 +2700,11 @@ fn main() -> anyhow::Result<()> {
                 service
                     .store
                     .list_all_events(since.as_deref(), until.as_deref())?
-            } else {
-                let task_id = task_id.expect("task id exists when not replaying all");
-                let events = service.store.list_events_for_task(task_id.as_str())?;
+            } else if let Some(ref tid) = task_id {
+                let events = service.store.list_events_for_task(tid.as_str())?;
                 filter_events_by_time(events, since_dt, until_dt)
+            } else {
+                vec![]
             };
 
             if json {

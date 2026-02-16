@@ -399,7 +399,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
-        " repo | task | title | state | verify | cost | activity",
+        " sel | repo | task | title | state | verify | cost | activity",
         header_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -431,6 +431,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         filtered_task_count += 1;
 
         let is_selected = selected_task_id.as_ref() == Some(&task.task_id);
+        let is_marked = app.state.selected_task_ids.contains(&task.task_id.0);
         let task_model = app
             .state
             .panes
@@ -440,7 +441,13 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .map(|pane| pane.model);
         let cost = format_cost_display(estimate_task_cost_usd(task, task_model));
         let state_style = Style::default().fg(state_color(task.state));
-        lines.push(format_task_row(is_selected, task, cost, state_style));
+        lines.push(format_task_row(
+            is_selected,
+            is_marked,
+            task,
+            cost,
+            state_style,
+        ));
     }
 
     if app.state.tasks.is_empty() {
@@ -457,9 +464,15 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let direction = if app.state.sort_reversed { "\u{2191}" } else { "\u{2193}" };
     let sort_label = app.state.sort_mode.label();
+    let selected_count = app.state.selected_count();
+    let base_title = if selected_count > 0 {
+        format!("Tasks ({selected_count} selected)")
+    } else {
+        "Tasks".to_string()
+    };
     let title = match app.state.active_filter_label() {
-        Some(label) => format!("Tasks [{direction} {sort_label}] [Filter: {label}]"),
-        None => format!("Tasks [{direction} {sort_label}]"),
+        Some(label) => format!("{base_title} [{direction} {sort_label}] [Filter: {label}]"),
+        None => format!("{base_title} [{direction} {sort_label}]"),
     };
 
     let widget = Paragraph::new(lines)
@@ -1119,6 +1132,7 @@ mod tests {
         let row = mk_row("T9");
         let line = format_task_row(
             true,
+            false,
             &row,
             "$0.12".to_string(),
             Style::default().fg(state_color(row.state)),

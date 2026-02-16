@@ -357,10 +357,10 @@ fn expand_directives(content: &str, current_path: &Path, repo_root: &Path) -> (S
 
 fn expand_glob_pattern(pattern: &str, current_path: &Path, repo_root: &Path) -> Vec<PathBuf> {
     let parent = current_path.parent().unwrap_or(Path::new("."));
-    let mut patterns = Vec::new();
-
-    patterns.push(normalise_path(Path::new(pattern)));
-    patterns.push(normalise_path(&parent.join(pattern)));
+    let patterns = [
+        normalise_path(Path::new(pattern)),
+        normalise_path(&parent.join(pattern)),
+    ];
 
     let mut files = Vec::new();
     collect_repo_files(repo_root, repo_root, &mut files);
