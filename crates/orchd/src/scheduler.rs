@@ -2,7 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use orch_core::config::OrgConfig;
-use orch_core::types::{ModelKind, RepoId, TaskId};
+use orch_core::state::TaskState;
+use orch_core::types::{ModelKind, RepoId, TaskId, TaskPriority};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +33,9 @@ impl SchedulerConfig {
 pub struct QueuedTask {
     pub task_id: TaskId,
     pub repo_id: RepoId,
+    pub depends_on: Vec<TaskId>,
     pub preferred_model: Option<ModelKind>,
-    pub priority: i32,
+    pub priority: TaskPriority,
     pub enqueued_at: DateTime<Utc>,
 }
 
@@ -57,6 +59,7 @@ pub struct ModelAvailability {
 pub struct SchedulingInput {
     pub queued: Vec<QueuedTask>,
     pub running: Vec<RunningTask>,
+    pub all_task_states: HashMap<TaskId, TaskState>,
     pub enabled_models: Vec<ModelKind>,
     pub availability: Vec<ModelAvailability>,
 }
@@ -65,6 +68,7 @@ pub struct SchedulingInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockReason {
+    DependenciesUnresolved,
     RepoLimitReached,
     ModelLimitReached,
     NoAvailableModel,
@@ -127,6 +131,18 @@ impl Scheduler {
         let mut blocked = Vec::new();
 
         for queued in input.queued {
+            let deps_resolved = queued
+                .depends_on
+                .iter()
+                .all(|dep| input.all_task_states.get(dep) == Some(&TaskState::Merged));
+            if !deps_resolved {
+                blocked.push(BlockedTask {
+                    task_id: queued.task_id,
+                    reason: BlockReason::DependenciesUnresolved,
+                });
+                continue;
+            }
+
             let repo_inflight = repo_counts.get(&queued.repo_id).copied().unwrap_or(0);
             if repo_inflight >= self.config.per_repo_limit {
                 blocked.push(BlockedTask {
@@ -236,12 +252,13 @@ mod tests {
     fn mk_queued(
         id: &str,
         repo: &str,
-        priority: i32,
+        priority: TaskPriority,
         preferred_model: Option<ModelKind>,
     ) -> QueuedTask {
         QueuedTask {
             task_id: TaskId(id.to_string()),
             repo_id: RepoId(repo.to_string()),
+            depends_on: Vec::new(),
             preferred_model,
             priority,
             enqueued_at: Utc::now(),
@@ -252,8 +269,14 @@ mod tests {
     fn plan_schedules_preferred_model() {
         let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10), (ModelKind::Codex, 10)]);
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T1", "repo", 1, Some(ModelKind::Claude))],
+            queued: vec![mk_queued(
+                "T1",
+                "repo",
+                TaskPriority::Normal,
+                Some(ModelKind::Claude),
+            )],
             running: Vec::new(),
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
             availability: Vec::new(),
         });
@@ -267,12 +290,18 @@ mod tests {
     fn plan_blocks_when_repo_limit_reached() {
         let scheduler = mk_scheduler(1, &[(ModelKind::Claude, 10)]);
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T2", "repo-a", 1, Some(ModelKind::Claude))],
+            queued: vec![mk_queued(
+                "T2",
+                "repo-a",
+                TaskPriority::Normal,
+                Some(ModelKind::Claude),
+            )],
             running: vec![RunningTask {
                 task_id: TaskId("T1".to_string()),
                 repo_id: RepoId("repo-a".to_string()),
                 model: ModelKind::Claude,
             }],
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Claude],
             availability: Vec::new(),
         });
@@ -286,12 +315,18 @@ mod tests {
     fn plan_blocks_when_model_limit_reached() {
         let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 1)]);
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T2", "repo-b", 1, Some(ModelKind::Claude))],
+            queued: vec![mk_queued(
+                "T2",
+                "repo-b",
+                TaskPriority::Normal,
+                Some(ModelKind::Claude),
+            )],
             running: vec![RunningTask {
                 task_id: TaskId("T1".to_string()),
                 repo_id: RepoId("repo-a".to_string()),
                 model: ModelKind::Claude,
             }],
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Claude],
             availability: Vec::new(),
         });
@@ -305,8 +340,9 @@ mod tests {
     fn plan_blocks_when_no_models_available() {
         let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T1", "repo", 1, None)],
+            queued: vec![mk_queued("T1", "repo", TaskPriority::Normal, None)],
             running: Vec::new(),
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Claude],
             availability: vec![ModelAvailability {
                 model: ModelKind::Claude,
@@ -323,12 +359,18 @@ mod tests {
     fn plan_falls_back_when_preferred_model_is_saturated() {
         let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 1), (ModelKind::Codex, 2)]);
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T2", "repo-b", 1, Some(ModelKind::Claude))],
+            queued: vec![mk_queued(
+                "T2",
+                "repo-b",
+                TaskPriority::Normal,
+                Some(ModelKind::Claude),
+            )],
             running: vec![RunningTask {
                 task_id: TaskId("T1".to_string()),
                 repo_id: RepoId("repo-a".to_string()),
                 model: ModelKind::Claude,
             }],
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Claude, ModelKind::Codex],
             availability: Vec::new(),
         });
@@ -349,14 +391,84 @@ mod tests {
             ],
         );
         let plan = scheduler.plan(SchedulingInput {
-            queued: vec![mk_queued("T1", "repo", 1, None)],
+            queued: vec![mk_queued("T1", "repo", TaskPriority::Normal, None)],
             running: Vec::new(),
+            all_task_states: HashMap::new(),
             enabled_models: vec![ModelKind::Gemini, ModelKind::Codex, ModelKind::Claude],
             availability: Vec::new(),
         });
 
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0].model, ModelKind::Gemini);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn plan_prioritizes_critical_tasks_before_lower_priority() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+        let now = Utc::now();
+        let mut low = mk_queued("T-low", "repo", TaskPriority::Low, Some(ModelKind::Claude));
+        low.enqueued_at = now - chrono::Duration::seconds(30);
+        let mut critical = mk_queued(
+            "T-critical",
+            "repo",
+            TaskPriority::Critical,
+            Some(ModelKind::Claude),
+        );
+        critical.enqueued_at = now;
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![low, critical],
+            running: Vec::new(),
+            all_task_states: HashMap::new(),
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 2);
+        assert_eq!(plan.assignments[0].task_id.0, "T-critical");
+    }
+
+    #[test]
+    fn dependency_blocks_task() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+        let mut queued = mk_queued("T2", "repo", TaskPriority::Normal, None);
+        queued.depends_on = vec![TaskId("T1".to_string())];
+
+        let mut all_task_states = HashMap::new();
+        all_task_states.insert(TaskId("T1".to_string()), TaskState::Ready);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![queued],
+            running: Vec::new(),
+            all_task_states,
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert!(plan.assignments.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].reason, BlockReason::DependenciesUnresolved);
+    }
+
+    #[test]
+    fn dependency_allows_when_resolved() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+        let mut queued = mk_queued("T2", "repo", TaskPriority::Normal, None);
+        queued.depends_on = vec![TaskId("T1".to_string())];
+
+        let mut all_task_states = HashMap::new();
+        all_task_states.insert(TaskId("T1".to_string()), TaskState::Merged);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![queued],
+            running: Vec::new(),
+            all_task_states,
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 1);
         assert!(plan.blocked.is_empty());
     }
 }

@@ -9,14 +9,18 @@ use orch_agents::setup::{
 };
 use orch_core::config::{
     apply_setup_selection_to_org_config, load_org_config, save_org_config, ConcurrencyConfig,
-    GraphiteOrgConfig, ModelsConfig, MovePolicy, NotificationConfig, OrgConfig, UiConfig,
+    DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy, NotificationConfig, OrgConfig,
+    UiConfig,
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId, TaskPriority};
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
-use orchd::{provision_chat_workspace_on_base, OrchdService, Scheduler, SchedulerConfig};
+use orchd::{
+    provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Write;
@@ -35,6 +39,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    CreateTask {
+        /// Repository ID
+        #[arg(short, long)]
+        repo: String,
+        #[arg(short, long)]
+        title: String,
+        /// Preferred model
+        #[arg(short, long, default_value = "claude")]
+        model: String,
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
+    },
+    SetPriority {
+        /// Chat/task ID
+        id: String,
+        priority: String,
+    },
     /// Create a new chat (AI coding session)
     Chat {
         #[command(subcommand)]
@@ -95,6 +119,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show event log for a task (or all tasks)
     Logs {
         /// Task/chat ID (omit for global events)
@@ -143,6 +171,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+    Export {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        task_id: Option<String>,
+    },
+    Import {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Costs {
+        #[arg(long = "task")]
+        task: Option<String>,
+    },
     /// Remove old completed/stopped tasks and their data
     Prune {
         /// Only prune tasks older than N days
@@ -177,6 +223,174 @@ enum ChatAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    List,
+    Create {
+        name: String,
+        #[arg(long = "from-task")]
+        from_task: String,
+    },
+    Show {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskTemplate {
+    title: String,
+    description: Option<String>,
+    repo_id: String,
+    preferred_model: Option<ModelKind>,
+    priority: String,
+}
+
+impl TaskTemplate {
+    fn from_task(task: &Task) -> Self {
+        Self {
+            title: task.title.clone(),
+            description: None,
+            repo_id: task.repo_id.0.clone(),
+            preferred_model: task.preferred_model,
+            priority: task.priority.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskExportRecord {
+    task_id: String,
+    title: String,
+    description: Option<String>,
+    state: String,
+    priority: String,
+    branch_name: Option<String>,
+    parent_branch: Option<String>,
+    repo_id: String,
+    preferred_model: Option<ModelKind>,
+}
+
+impl TaskExportRecord {
+    fn from_task(task: &Task, parent_branch: Option<String>) -> Self {
+        Self {
+            task_id: task.id.0.clone(),
+            title: task.title.clone(),
+            description: None,
+            state: format!("{}", task.state),
+            priority: task.priority.as_str().to_string(),
+            branch_name: task.branch_name.clone(),
+            parent_branch,
+            repo_id: task.repo_id.0.clone(),
+            preferred_model: task.preferred_model,
+        }
+    }
+}
+
+fn validate_template_name(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("template name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        anyhow::bail!("invalid template name: {name}");
+    }
+    Ok(())
+}
+
+fn templates_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".othala").join("templates")
+}
+
+fn template_path(repo_root: &Path, name: &str) -> PathBuf {
+    templates_dir(repo_root).join(format!("{name}.json"))
+}
+
+fn save_template(repo_root: &Path, name: &str, template: &TaskTemplate) -> anyhow::Result<()> {
+    validate_template_name(name)?;
+    let dir = templates_dir(repo_root);
+    std::fs::create_dir_all(&dir)?;
+    let path = template_path(repo_root, name);
+    let payload = serde_json::to_string_pretty(template)?;
+    std::fs::write(path, payload)?;
+    Ok(())
+}
+
+fn load_template(repo_root: &Path, name: &str) -> anyhow::Result<TaskTemplate> {
+    validate_template_name(name)?;
+    let path = template_path(repo_root, name);
+    let payload = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str::<TaskTemplate>(&payload)?)
+}
+
+fn list_templates(repo_root: &Path) -> anyhow::Result<Vec<String>> {
+    let dir = templates_dir(repo_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            names.push(stem.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn parse_export_state(state: &str) -> anyhow::Result<TaskState> {
+    match state.trim().to_uppercase().as_str() {
+        "CHATTING" => Ok(TaskState::Chatting),
+        "READY" => Ok(TaskState::Ready),
+        "SUBMITTING" => Ok(TaskState::Submitting),
+        "RESTACKING" => Ok(TaskState::Restacking),
+        "AWAITING_MERGE" => Ok(TaskState::AwaitingMerge),
+        "MERGED" => Ok(TaskState::Merged),
+        "STOPPED" => Ok(TaskState::Stopped),
+        other => anyhow::bail!("unknown task state in import: {other}"),
+    }
+}
+
+fn import_record_to_task(record: TaskExportRecord, existing: Option<Task>) -> anyhow::Result<Task> {
+    let now = Utc::now();
+    let mut task = if let Some(existing_task) = existing {
+        existing_task
+    } else {
+        Task::new(
+            TaskId::new(record.task_id.clone()),
+            RepoId(record.repo_id.clone()),
+            record.title.clone(),
+            PathBuf::from(format!(".orch/wt/{}", record.task_id)),
+        )
+    };
+
+    task.repo_id = RepoId(record.repo_id);
+    task.id = TaskId::new(record.task_id);
+    task.title = record.title;
+    task.state = parse_export_state(&record.state)?;
+    task.priority = parse_task_priority(&record.priority)?;
+    task.branch_name = record.branch_name;
+    task.preferred_model = record.preferred_model;
+    task.updated_at = now;
+    Ok(task)
+}
+
+fn aggregate_cost_estimates(runs: &[orchd::TaskRunRecord]) -> Vec<AgentCostEstimate> {
+    runs.iter()
+        .filter_map(|run| {
+            run.estimated_tokens.map(|tokens| AgentCostEstimate {
+                model: run.model,
+                input_tokens: tokens,
+                duration_secs: run.duration_secs.unwrap_or(0.0),
+            })
+        })
+        .collect()
 }
 
 fn print_banner() {
@@ -316,6 +530,80 @@ fn parse_model_name(s: &str) -> Option<ModelKind> {
     }
 }
 
+fn parse_task_priority(s: &str) -> anyhow::Result<TaskPriority> {
+    s.parse::<TaskPriority>().map_err(|e| anyhow::anyhow!(e))
+}
+
+fn create_task_command(
+    service: &OrchdService,
+    repo: String,
+    title: String,
+    model: String,
+    priority: TaskPriority,
+    json: bool,
+) -> anyhow::Result<()> {
+    let task_id = format!("chat-{}", Utc::now().timestamp_millis());
+    let task_id = TaskId::new(&task_id);
+    let start_path = std::env::current_dir()?;
+    let repo_id = RepoId(repo.clone());
+    let parent = find_stack_parent(&service.list_tasks()?, &repo_id);
+    let workspace = provision_chat_workspace_on_base(
+        &start_path,
+        &task_id,
+        parent.as_ref().map(|(_, branch)| branch.as_str()),
+    )?;
+
+    let mut task = Task::new(
+        task_id.clone(),
+        repo_id.clone(),
+        title.clone(),
+        workspace.worktree_path.clone(),
+    );
+    task.branch_name = Some(workspace.branch_name.clone());
+    task.priority = priority;
+    if let Some((parent_task_id, _)) = parent.as_ref() {
+        task.parent_task_id = Some(parent_task_id.clone());
+        if !task.depends_on.contains(parent_task_id) {
+            task.depends_on.push(parent_task_id.clone());
+        }
+    }
+
+    task.preferred_model = Some(parse_model(&model));
+
+    let event = Event {
+        id: EventId(format!("E-CREATE-{}", task_id.0)),
+        task_id: Some(task.id.clone()),
+        repo_id: Some(task.repo_id.clone()),
+        at: Utc::now(),
+        kind: EventKind::TaskCreated,
+    };
+
+    service.create_task(&task, &event)?;
+
+    if json {
+        print_task_json(&task);
+    } else if let Some((parent_task_id, parent_branch)) = parent {
+        println!(
+            "Created chat: {} - {} [{} @ {}] (stacked on {} / {})",
+            task_id.0,
+            title,
+            workspace.branch_name,
+            workspace.worktree_path.display(),
+            parent_task_id.0,
+            parent_branch
+        );
+    } else {
+        println!(
+            "Created chat: {} - {} [{} @ {}]",
+            task_id.0,
+            title,
+            workspace.branch_name,
+            workspace.worktree_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn model_name(model: ModelKind) -> &'static str {
     match model {
         ModelKind::Claude => "claude",
@@ -364,6 +652,7 @@ fn default_org_config(enabled_models: Vec<ModelKind>) -> OrgConfig {
             web_bind: "127.0.0.1:9842".to_string(),
         },
         notifications: NotificationConfig::default(),
+        daemon: DaemonOrgConfig::default(),
     }
 }
 
@@ -439,6 +728,203 @@ struct SelfTestCheck {
     ok: bool,
     critical: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorStatus {
+    Ok,
+    Missing,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    status: DoctorStatus,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DoctorReport {
+    checks: Vec<DoctorCheck>,
+    all_ok: bool,
+}
+
+fn command_available_via_which(executable: &str) -> bool {
+    Command::new("which")
+        .arg(executable)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn doctor_model_checks<F>(which_check: F) -> Vec<DoctorCheck>
+where
+    F: Fn(&str) -> bool,
+{
+    ["claude", "codex", "gemini"]
+        .iter()
+        .map(|model| {
+            let found = which_check(model);
+            DoctorCheck {
+                name: format!("model_{model}"),
+                ok: found,
+                status: if found {
+                    DoctorStatus::Ok
+                } else {
+                    DoctorStatus::Missing
+                },
+                detail: if found {
+                    format!("{model} found on PATH")
+                } else {
+                    format!("{model} missing from PATH")
+                },
+            }
+        })
+        .collect()
+}
+
+fn collect_doctor_checks<F>(repo_root: &Path, which_check: F) -> Vec<DoctorCheck>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut checks = doctor_model_checks(|model| which_check(model));
+
+    let sqlite_path = repo_root.join(".othala/state.sqlite");
+    let sqlite_ok = sqlite_path.is_file() && std::fs::File::open(&sqlite_path).is_ok();
+    checks.push(DoctorCheck {
+        name: "sqlite".to_string(),
+        ok: sqlite_ok,
+        status: if sqlite_ok {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Missing
+        },
+        detail: if sqlite_ok {
+            format!("{} is readable", sqlite_path.display())
+        } else {
+            format!("{} is missing or unreadable", sqlite_path.display())
+        },
+    });
+
+    let gt_found = which_check("gt");
+    checks.push(DoctorCheck {
+        name: "graphite".to_string(),
+        ok: gt_found,
+        status: if gt_found {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Missing
+        },
+        detail: if gt_found {
+            "gt found on PATH".to_string()
+        } else {
+            "gt missing from PATH".to_string()
+        },
+    });
+
+    let git_ok = Command::new("git")
+        .arg("status")
+        .current_dir(repo_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    checks.push(DoctorCheck {
+        name: "git".to_string(),
+        ok: git_ok,
+        status: if git_ok {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Error
+        },
+        detail: if git_ok {
+            "git status succeeded".to_string()
+        } else {
+            "git status failed".to_string()
+        },
+    });
+
+    let config_path = repo_root.join(".othala/config.toml");
+    let config_status = if !config_path.exists() {
+        (false, DoctorStatus::Missing, "config file missing".to_string())
+    } else {
+        match load_org_config(&config_path) {
+            Ok(_) => (true, DoctorStatus::Ok, "config parsed successfully".to_string()),
+            Err(err) => (
+                false,
+                DoctorStatus::Error,
+                format!("config parse failed: {err}"),
+            ),
+        }
+    };
+    checks.push(DoctorCheck {
+        name: "config".to_string(),
+        ok: config_status.0,
+        status: config_status.1,
+        detail: config_status.2,
+    });
+
+    let othala_dir = repo_root.join(".othala");
+    let disk_ok = othala_dir.is_dir();
+    checks.push(DoctorCheck {
+        name: "disk".to_string(),
+        ok: disk_ok,
+        status: if disk_ok {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Missing
+        },
+        detail: if disk_ok {
+            format!("{} exists", othala_dir.display())
+        } else {
+            format!("{} missing", othala_dir.display())
+        },
+    });
+
+    checks
+}
+
+fn doctor_report(repo_root: &Path) -> DoctorReport {
+    let checks = collect_doctor_checks(repo_root, command_available_via_which);
+    let all_ok = checks.iter().all(|check| check.ok);
+    DoctorReport { checks, all_ok }
+}
+
+fn doctor_status_label(status: &DoctorStatus) -> &'static str {
+    match status {
+        DoctorStatus::Ok => "ok",
+        DoctorStatus::Missing => "missing",
+        DoctorStatus::Error => "error",
+    }
+}
+
+fn run_doctor(json: bool) -> anyhow::Result<bool> {
+    let repo_root = std::env::current_dir()?;
+    let report = doctor_report(&repo_root);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{:<20} {:<10} DETAIL", "CHECK", "STATUS");
+        println!("{}", "-".repeat(80));
+        for check in &report.checks {
+            let status = doctor_status_label(&check.status);
+            println!("{:<20} {:<10} {}", check.name, status, check.detail);
+        }
+        println!();
+        println!(
+            "Overall: {}",
+            if report.all_ok { "healthy" } else { "issues found" }
+        );
+    }
+
+    Ok(report.all_ok)
 }
 
 fn command_available(executable: &str) -> bool {
@@ -644,6 +1130,32 @@ fn main() -> anyhow::Result<()> {
     let service = OrchdService::open(&db_path, &event_log_path, scheduler)?;
 
     match cli.command {
+        Commands::CreateTask {
+            repo,
+            title,
+            model,
+            priority,
+            json,
+        } => {
+            create_task_command(
+                &service,
+                repo,
+                title,
+                model,
+                parse_task_priority(&priority)?,
+                json,
+            )?;
+        }
+        Commands::SetPriority { id, priority } => {
+            let task_id = TaskId::new(&id);
+            let Some(mut task) = service.task(&task_id)? else {
+                anyhow::bail!("task not found: {id}");
+            };
+            task.priority = parse_task_priority(&priority)?;
+            task.updated_at = Utc::now();
+            service.store.upsert_task(&task)?;
+            println!("Updated priority: {} -> {}", task.id.0, task.priority);
+        }
         Commands::Chat { action } => match action {
             ChatAction::New {
                 repo,
@@ -651,64 +1163,14 @@ fn main() -> anyhow::Result<()> {
                 model,
                 json,
             } => {
-                let task_id = format!("chat-{}", Utc::now().timestamp_millis());
-                let task_id = TaskId::new(&task_id);
-                let start_path = std::env::current_dir()?;
-                let repo_id = RepoId(repo.clone());
-                let parent = find_stack_parent(&service.list_tasks()?, &repo_id);
-                let workspace = provision_chat_workspace_on_base(
-                    &start_path,
-                    &task_id,
-                    parent.as_ref().map(|(_, branch)| branch.as_str()),
+                create_task_command(
+                    &service,
+                    repo,
+                    title,
+                    model,
+                    TaskPriority::Normal,
+                    json,
                 )?;
-
-                let mut task = Task::new(
-                    task_id.clone(),
-                    repo_id.clone(),
-                    title.clone(),
-                    workspace.worktree_path.clone(),
-                );
-                task.branch_name = Some(workspace.branch_name.clone());
-                if let Some((parent_task_id, _)) = parent.as_ref() {
-                    task.parent_task_id = Some(parent_task_id.clone());
-                    if !task.depends_on.contains(parent_task_id) {
-                        task.depends_on.push(parent_task_id.clone());
-                    }
-                }
-
-                task.preferred_model = Some(parse_model(&model));
-
-                let event = Event {
-                    id: EventId(format!("E-CREATE-{}", task_id.0)),
-                    task_id: Some(task.id.clone()),
-                    repo_id: Some(task.repo_id.clone()),
-                    at: Utc::now(),
-                    kind: EventKind::TaskCreated,
-                };
-
-                service.create_task(&task, &event)?;
-
-                if json {
-                    print_task_json(&task);
-                } else if let Some((parent_task_id, parent_branch)) = parent {
-                    println!(
-                        "Created chat: {} - {} [{} @ {}] (stacked on {} / {})",
-                        task_id.0,
-                        title,
-                        workspace.branch_name,
-                        workspace.worktree_path.display(),
-                        parent_task_id.0,
-                        parent_branch
-                    );
-                } else {
-                    println!(
-                        "Created chat: {} - {} [{} @ {}]",
-                        task_id.0,
-                        title,
-                        workspace.branch_name,
-                        workspace.worktree_path.display()
-                    );
-                }
             }
             ChatAction::List { json } => {
                 print_task_list(&service.list_tasks()?, json);
@@ -773,7 +1235,8 @@ fn main() -> anyhow::Result<()> {
             let template_dir = PathBuf::from("templates/prompts");
 
             let config_path = PathBuf::from(".othala/config.toml");
-            let (enabled_models, default_model, notification_dispatcher) = if config_path.exists() {
+            let (enabled_models, default_model, notification_dispatcher, daemon_org_config) =
+                if config_path.exists() {
                 let org_config = load_org_config(&config_path)?;
                 use orch_core::validation::{Validate, ValidationLevel};
                 let issues = org_config.validate();
@@ -794,6 +1257,7 @@ fn main() -> anyhow::Result<()> {
                     org_config.models.enabled,
                     default,
                     notification_dispatcher,
+                    org_config.daemon,
                 )
             } else {
                 eprintln!("  \x1b[33mNo .othala/config.toml — using defaults (run `othala wizard` to configure)\x1b[0m");
@@ -801,6 +1265,7 @@ fn main() -> anyhow::Result<()> {
                     vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
                     ModelKind::Claude,
                     None,
+                    DaemonOrgConfig::default(),
                 )
             };
             eprintln!(
@@ -847,7 +1312,8 @@ fn main() -> anyhow::Result<()> {
                 context_gen_config,
                 skip_qa,
                 skip_context_regen: skip_context_gen,
-                agent_timeout_secs: 1_800,
+                dry_run: false,
+                agent_timeout_secs: daemon_org_config.agent_timeout_secs,
             };
 
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -948,7 +1414,9 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
 
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(std::time::Duration::from_secs(
+                    daemon_org_config.tick_interval_secs,
+                ));
             }
 
             let final_tasks = service.list_tasks()?;
@@ -959,6 +1427,10 @@ fn main() -> anyhow::Result<()> {
         Commands::SelfTest { json } => {
             let critical_ok = run_self_test(json);
             std::process::exit(if critical_ok { 0 } else { 1 });
+        }
+        Commands::Doctor { json } => {
+            let healthy = run_doctor(json)?;
+            std::process::exit(if healthy { 0 } else { 1 });
         }
         Commands::Wizard {
             enable,
@@ -1292,6 +1764,124 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Template { action } => {
+            let repo_root = std::env::current_dir()?;
+            match action {
+                TemplateAction::List => {
+                    let names = list_templates(&repo_root)?;
+                    if names.is_empty() {
+                        println!("No templates found.");
+                    } else {
+                        for name in names {
+                            println!("{name}");
+                        }
+                    }
+                }
+                TemplateAction::Create { name, from_task } => {
+                    let task_id = TaskId::new(&from_task);
+                    let Some(task) = service.task(&task_id)? else {
+                        anyhow::bail!("task not found: {from_task}");
+                    };
+                    let template = TaskTemplate::from_task(&task);
+                    save_template(&repo_root, &name, &template)?;
+                    println!("Saved template: {name}");
+                }
+                TemplateAction::Show { name } => {
+                    let template = load_template(&repo_root, &name)?;
+                    println!("{}", serde_json::to_string_pretty(&template)?);
+                }
+            }
+        }
+        Commands::Export { output, task_id } => {
+            let tasks = service.list_tasks()?;
+            let parents: HashMap<String, Option<String>> = tasks
+                .iter()
+                .map(|task| {
+                    let parent_branch = task.parent_task_id.as_ref().and_then(|parent_id| {
+                        tasks
+                            .iter()
+                            .find(|candidate| candidate.id == *parent_id)
+                            .and_then(|parent| parent.branch_name.clone())
+                    });
+                    (task.id.0.clone(), parent_branch)
+                })
+                .collect();
+
+            let records: Vec<TaskExportRecord> = if let Some(id) = task_id {
+                let task = tasks
+                    .iter()
+                    .find(|task| task.id.0 == id)
+                    .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))?;
+                vec![TaskExportRecord::from_task(
+                    task,
+                    parents.get(&task.id.0).cloned().flatten(),
+                )]
+            } else {
+                tasks
+                    .iter()
+                    .map(|task| {
+                        TaskExportRecord::from_task(
+                            task,
+                            parents.get(&task.id.0).cloned().flatten(),
+                        )
+                    })
+                    .collect()
+            };
+
+            let payload = serde_json::to_string_pretty(&records)?;
+            std::fs::write(&output, payload)?;
+            println!("Exported {} task(s) to {}", records.len(), output.display());
+        }
+        Commands::Import { input } => {
+            let payload = std::fs::read_to_string(&input)?;
+            let records: Vec<TaskExportRecord> = serde_json::from_str(&payload)?;
+            let mut imported = 0usize;
+
+            for record in records {
+                let existing = service.task(&TaskId::new(record.task_id.clone()))?;
+                let task = import_record_to_task(record, existing)?;
+                service.upsert_task(&task)?;
+                imported += 1;
+            }
+
+            println!("Imported {} task(s) from {}", imported, input.display());
+        }
+        Commands::Costs { task } => {
+            let tasks = service.list_tasks()?;
+            if let Some(task_id) = task {
+                let runs = service.task_runs(&TaskId::new(&task_id))?;
+                let estimates = aggregate_cost_estimates(&runs);
+                let total_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
+                let total_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
+                println!("Task: {task_id}");
+                println!("Estimated tokens: {total_tokens}");
+                println!("Duration (secs): {:.2}", total_duration);
+                for estimate in estimates {
+                    println!(
+                        "  model={} tokens={} duration_secs={:.2}",
+                        estimate.model.as_str(),
+                        estimate.input_tokens,
+                        estimate.duration_secs
+                    );
+                }
+            } else {
+                let mut total_tokens = 0u64;
+                let mut total_duration = 0.0f64;
+                for task in &tasks {
+                    let runs = service.task_runs(&task.id)?;
+                    let estimates = aggregate_cost_estimates(&runs);
+                    let task_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
+                    let task_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
+                    total_tokens += task_tokens;
+                    total_duration += task_duration;
+                    println!(
+                        "{} tokens={} duration_secs={:.2}",
+                        task.id.0, task_tokens, task_duration
+                    );
+                }
+                println!("TOTAL tokens={} duration_secs={:.2}", total_tokens, total_duration);
+            }
+        }
         Commands::Prune {
             older_than_days,
             force,
@@ -1442,5 +2032,227 @@ fn format_event_kind(kind: &EventKind) -> String {
         EventKind::QAFailed { failures } => {
             format!("\x1b[31mqa_failed\x1b[0m: {}", failures.join("; "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use orchd::TaskRunRecord;
+    use serde_json::Value;
+    use std::fs;
+
+    #[test]
+    fn create_task_cli_parses_priority_flag() {
+        let cli = Cli::try_parse_from([
+            "othala",
+            "create-task",
+            "--repo",
+            "example",
+            "--title",
+            "Add feature",
+            "--priority",
+            "high",
+        ])
+        .expect("parse create-task");
+
+        match cli.command {
+            Commands::CreateTask { priority, .. } => assert_eq!(priority, "high"),
+            _ => panic!("expected create-task command"),
+        }
+    }
+
+    #[test]
+    fn set_priority_cli_parses_task_id_and_priority() {
+        let cli = Cli::try_parse_from(["othala", "set-priority", "T-42", "critical"])
+            .expect("parse set-priority");
+
+        match cli.command {
+            Commands::SetPriority { id, priority } => {
+                assert_eq!(id, "T-42");
+                assert_eq!(priority, "critical");
+            }
+            _ => panic!("expected set-priority command"),
+        }
+    }
+
+    #[test]
+    fn template_path_uses_othala_templates_directory() {
+        let root = PathBuf::from("/tmp/othala-main-tests");
+        let path = template_path(&root, "starter");
+        assert_eq!(path, root.join(".othala/templates/starter.json"));
+    }
+
+    #[test]
+    fn save_and_load_template_roundtrip() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-template-roundtrip-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let template = TaskTemplate {
+            title: "Template Task".to_string(),
+            description: None,
+            repo_id: "example".to_string(),
+            preferred_model: Some(ModelKind::Codex),
+            priority: "high".to_string(),
+        };
+        save_template(&root, "starter", &template).expect("save template");
+        let loaded = load_template(&root, "starter").expect("load template");
+        assert_eq!(loaded, template);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn list_templates_returns_json_stems() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-template-list-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(templates_dir(&root)).expect("create template dir");
+        fs::write(template_path(&root, "a"), "{}").expect("write a");
+        fs::write(template_path(&root, "b"), "{}").expect("write b");
+        fs::write(templates_dir(&root).join("ignore.txt"), "x").expect("write ignored");
+
+        let names = list_templates(&root).expect("list templates");
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn export_record_contains_expected_fields() {
+        let mut task = Task::new(
+            TaskId::new("T-EXP-1"),
+            RepoId("repo-a".to_string()),
+            "Export me".to_string(),
+            PathBuf::from(".orch/wt/T-EXP-1"),
+        );
+        task.state = TaskState::Ready;
+        task.priority = TaskPriority::Critical;
+        task.branch_name = Some("task/T-EXP-1".to_string());
+        task.preferred_model = Some(ModelKind::Claude);
+
+        let record = TaskExportRecord::from_task(&task, Some("task/parent".to_string()));
+        assert_eq!(record.task_id, "T-EXP-1");
+        assert_eq!(record.title, "Export me");
+        assert_eq!(record.state, "READY");
+        assert_eq!(record.priority, "critical");
+        assert_eq!(record.parent_branch.as_deref(), Some("task/parent"));
+    }
+
+    #[test]
+    fn import_record_to_task_applies_export_values() {
+        let record = TaskExportRecord {
+            task_id: "T-IMP-1".to_string(),
+            title: "Imported".to_string(),
+            description: Some("ignored".to_string()),
+            state: "CHATTING".to_string(),
+            priority: "high".to_string(),
+            branch_name: Some("task/T-IMP-1".to_string()),
+            parent_branch: None,
+            repo_id: "repo-b".to_string(),
+            preferred_model: Some(ModelKind::Gemini),
+        };
+
+        let task = import_record_to_task(record, None).expect("import record");
+        assert_eq!(task.id.0, "T-IMP-1");
+        assert_eq!(task.repo_id.0, "repo-b");
+        assert_eq!(task.title, "Imported");
+        assert_eq!(task.state, TaskState::Chatting);
+        assert_eq!(task.priority, TaskPriority::High);
+        assert_eq!(task.branch_name.as_deref(), Some("task/T-IMP-1"));
+        assert_eq!(task.preferred_model, Some(ModelKind::Gemini));
+    }
+
+    #[test]
+    fn export_import_json_roundtrip_records() {
+        let records = vec![TaskExportRecord {
+            task_id: "T-JSON-1".to_string(),
+            title: "Roundtrip".to_string(),
+            description: None,
+            state: "STOPPED".to_string(),
+            priority: "normal".to_string(),
+            branch_name: None,
+            parent_branch: None,
+            repo_id: "repo-json".to_string(),
+            preferred_model: Some(ModelKind::Codex),
+        }];
+        let json = serde_json::to_string(&records).expect("serialize");
+        let decoded: Vec<TaskExportRecord> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, records);
+    }
+
+    #[test]
+    fn aggregate_cost_estimates_uses_run_metrics() {
+        let run = TaskRunRecord {
+            run_id: "R-COST-1".to_string(),
+            task_id: TaskId::new("T-COST-1"),
+            repo_id: RepoId("repo-cost".to_string()),
+            model: ModelKind::Claude,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+            estimated_tokens: Some(250),
+            duration_secs: Some(8.0),
+        };
+        let estimates = aggregate_cost_estimates(&[run]);
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].input_tokens, 250);
+        assert_eq!(estimates[0].duration_secs, 8.0);
+    }
+
+    #[test]
+    fn aggregate_cost_estimates_skips_runs_without_token_estimate() {
+        let run = TaskRunRecord {
+            run_id: "R-COST-2".to_string(),
+            task_id: TaskId::new("T-COST-2"),
+            repo_id: RepoId("repo-cost".to_string()),
+            model: ModelKind::Codex,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+            estimated_tokens: None,
+            duration_secs: Some(3.0),
+        };
+        let estimates = aggregate_cost_estimates(&[run]);
+        assert!(estimates.is_empty());
+    }
+
+    #[test]
+    fn doctor_detects_missing_model() {
+        let checks = doctor_model_checks(|name| name != "codex");
+        let codex = checks
+            .iter()
+            .find(|check| check.name == "model_codex")
+            .expect("codex check present");
+        assert!(!codex.ok);
+        assert_eq!(codex.status, DoctorStatus::Missing);
+    }
+
+    #[test]
+    fn doctor_json_output_format() {
+        let report = DoctorReport {
+            checks: vec![DoctorCheck {
+                name: "model_claude".to_string(),
+                ok: true,
+                status: DoctorStatus::Ok,
+                detail: "claude found on PATH".to_string(),
+            }],
+            all_ok: true,
+        };
+
+        let json = serde_json::to_string_pretty(&report).expect("serialize doctor report");
+        let value: Value = serde_json::from_str(&json).expect("parse doctor report json");
+
+        assert!(value.get("checks").is_some());
+        assert_eq!(value.get("all_ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(value["checks"][0]["name"], "model_claude");
+        assert_eq!(value["checks"][0]["status"], "ok");
     }
 }

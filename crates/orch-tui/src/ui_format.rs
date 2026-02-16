@@ -61,7 +61,11 @@ pub(crate) fn status_line_color(message: &str) -> Color {
     }
 }
 
-pub(crate) fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) -> Line<'a> {
+pub(crate) fn format_task_row<'a>(
+    is_selected: bool,
+    task: &'a TaskOverviewRow,
+    cost_display: String,
+) -> Line<'a> {
     let ts = to_local_time(task.last_activity);
     let sc = display_state_color(task.state, &task.display_state);
 
@@ -104,6 +108,8 @@ pub(crate) fn format_task_row<'a>(is_selected: bool, task: &'a TaskOverviewRow) 
         ),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(&task.verify_summary, base_style),
+        Span::styled(" | ", Style::default().fg(DIM)),
+        Span::styled(cost_display, base_style),
         Span::styled(" | ", Style::default().fg(DIM)),
         Span::styled(ts, Style::default().fg(DIM)),
     ])

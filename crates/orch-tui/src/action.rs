@@ -28,6 +28,8 @@ pub enum UiCommand {
     SelectPreviousTask,
     SelectNextPane,
     SelectPreviousPane,
+    StartFilter,
+    CycleStateFilter,
     ToggleFocusedPane,
     ToggleFocusedTask,
     ShowHelp,
@@ -45,6 +47,9 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
     if key.code == KeyCode::Esc {
         return Some(UiCommand::Quit);
     }
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('f') {
+        return Some(UiCommand::CycleStateFilter);
+    }
 
     match key.code {
         KeyCode::Down => Some(UiCommand::SelectNextTask),
@@ -53,6 +58,8 @@ pub fn map_key_to_command(key: KeyEvent) -> Option<UiCommand> {
         KeyCode::Left => Some(UiCommand::SelectPreviousPane),
         KeyCode::Tab => Some(UiCommand::ToggleFocusedPane),
         KeyCode::Enter => Some(UiCommand::ToggleFocusedTask),
+        KeyCode::Char('/') => Some(UiCommand::StartFilter),
+        KeyCode::Char('F') => Some(UiCommand::CycleStateFilter),
         KeyCode::Char('?') => Some(UiCommand::ShowHelp),
         KeyCode::Char('c') => Some(UiCommand::Dispatch(UiAction::CreateTask)),
         KeyCode::Char('a') => Some(UiCommand::Dispatch(UiAction::ApproveTask)),
@@ -152,6 +159,18 @@ mod tests {
         assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(UiCommand::ToggleFocusedTask)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            Some(UiCommand::StartFilter)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            Some(UiCommand::CycleStateFilter)
+        );
+        assert_eq!(
+            map_key_to_command(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::SHIFT)),
+            Some(UiCommand::CycleStateFilter)
         );
         assert_eq!(
             map_key_to_command(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),

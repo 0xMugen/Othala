@@ -2,7 +2,14 @@ use chrono::{DateTime, Utc};
 use orch_core::types::{ModelKind, RepoId, TaskId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentCostEstimate {
+    pub model: ModelKind,
+    pub input_tokens: u64,
+    pub duration_secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRunRecord {
     pub run_id: String,
     pub task_id: TaskId,
@@ -12,6 +19,10 @@ pub struct TaskRunRecord {
     pub finished_at: Option<DateTime<Utc>>,
     pub stop_reason: Option<String>,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub estimated_tokens: Option<u64>,
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,7 +40,7 @@ mod tests {
     use chrono::Utc;
     use orch_core::types::{ModelKind, RepoId, TaskId};
 
-    use super::{ArtifactRecord, TaskRunRecord};
+    use super::{AgentCostEstimate, ArtifactRecord, TaskRunRecord};
 
     #[test]
     fn task_run_record_roundtrip_preserves_optional_fields() {
@@ -43,6 +54,8 @@ mod tests {
             finished_at: Some(now),
             stop_reason: Some("completed".to_string()),
             exit_code: Some(0),
+            estimated_tokens: Some(128),
+            duration_secs: Some(3.25),
         };
 
         let encoded = serde_json::to_string(&record).expect("serialize");
@@ -61,6 +74,8 @@ mod tests {
             finished_at: None,
             stop_reason: None,
             exit_code: None,
+            estimated_tokens: None,
+            duration_secs: None,
         };
 
         let encoded = serde_json::to_string(&record).expect("serialize");
@@ -96,6 +111,8 @@ mod tests {
             finished_at: Some(now),
             stop_reason: Some("timeout".to_string()),
             exit_code: Some(124),
+            estimated_tokens: Some(512),
+            duration_secs: Some(30.0),
         };
 
         let encoded = serde_json::to_string(&record).expect("serialize");
@@ -117,5 +134,18 @@ mod tests {
         let encoded = serde_json::to_string(&record).expect("serialize");
         let decoded: ArtifactRecord = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn agent_cost_estimate_roundtrip_preserves_fields() {
+        let estimate = AgentCostEstimate {
+            model: ModelKind::Claude,
+            input_tokens: 321,
+            duration_secs: 7.5,
+        };
+
+        let encoded = serde_json::to_string(&estimate).expect("serialize");
+        let decoded: AgentCostEstimate = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, estimate);
     }
 }

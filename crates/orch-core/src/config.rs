@@ -58,6 +58,33 @@ pub struct OrgConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub daemon: DaemonOrgConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonOrgConfig {
+    #[serde(default = "default_tick_interval")]
+    pub tick_interval_secs: u64,
+    #[serde(default = "default_agent_timeout")]
+    pub agent_timeout_secs: u64,
+}
+
+fn default_tick_interval() -> u64 {
+    2
+}
+
+fn default_agent_timeout() -> u64 {
+    1_800
+}
+
+impl Default for DaemonOrgConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_secs: default_tick_interval(),
+            agent_timeout_secs: default_agent_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +368,84 @@ submit_mode = "single"
         assert_eq!(repo.nix.dev_shell, "nix develop");
         assert_eq!(repo.verify.command, "cargo check && cargo test");
         assert_eq!(repo.graphite.submit_mode, Some(SubmitMode::Single));
+    }
+
+    #[test]
+    fn daemon_config_defaults() {
+        let config = sample_org();
+        assert_eq!(config.daemon.tick_interval_secs, 2);
+        assert_eq!(config.daemon.agent_timeout_secs, 1_800);
+    }
+
+    #[test]
+    fn daemon_config_custom_values() {
+        let config = parse_org_config(
+            r#"
+[models]
+enabled = ["claude"]
+
+[concurrency]
+per_repo = 5
+claude = 3
+codex = 1
+gemini = 1
+
+[graphite]
+auto_submit = false
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+
+[daemon]
+tick_interval_secs = 7
+agent_timeout_secs = 90
+"#,
+        )
+        .expect("parse org config with custom daemon values");
+
+        assert_eq!(config.daemon.tick_interval_secs, 7);
+        assert_eq!(config.daemon.agent_timeout_secs, 90);
+    }
+
+    #[test]
+    fn daemon_config_partial_override() {
+        let config = parse_org_config(
+            r#"
+[models]
+enabled = ["claude"]
+
+[concurrency]
+per_repo = 5
+claude = 3
+codex = 1
+gemini = 1
+
+[graphite]
+auto_submit = false
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+
+[daemon]
+tick_interval_secs = 11
+"#,
+        )
+        .expect("parse org config with partial daemon override");
+
+        assert_eq!(config.daemon.tick_interval_secs, 11);
+        assert_eq!(config.daemon.agent_timeout_secs, 1_800);
     }
 
     #[test]

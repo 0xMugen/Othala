@@ -30,7 +30,7 @@ use crate::OrchdService;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Configuration for the daemon loop.
 #[derive(Debug, Clone)]
@@ -52,6 +52,7 @@ pub struct DaemonConfig {
     pub skip_qa: bool,
     /// Skip background context regeneration during tick loop.
     pub skip_context_regen: bool,
+    pub dry_run: bool,
     pub agent_timeout_secs: u64,
 }
 
@@ -63,6 +64,7 @@ pub struct DaemonState {
     pub context_gen: ContextGenState,
     /// Per-task QA agent state (keyed by task_id).
     pub qa_agents: HashMap<String, QAState>,
+    pub verify_cache: HashMap<String, String>,
     pub model_health: ModelHealthTracker,
     pub restack_retries: HashMap<String, RestackRetryState>,
     pub notification_dispatcher: Option<NotificationDispatcher>,
@@ -117,6 +119,7 @@ impl DaemonState {
             pipelines: HashMap::new(),
             context_gen: ContextGenState::new(),
             qa_agents: HashMap::new(),
+            verify_cache: HashMap::new(),
             model_health: ModelHealthTracker::new(),
             restack_retries: HashMap::new(),
             notification_dispatcher: None,
@@ -590,6 +593,7 @@ fn handle_agent_completion(
     now: DateTime<Utc>,
 ) -> Vec<DaemonAction> {
     let mut actions = Vec::new();
+    daemon_state.verify_cache.remove(&outcome.task_id.0);
 
     let completion_event = Event {
         id: EventId(format!(
@@ -614,6 +618,26 @@ fn handle_agent_completion(
     {
         eprintln!(
             "[daemon] Failed to record agent completion for {}: {}",
+            outcome.task_id.0, e
+        );
+    }
+
+    let stop_reason = if outcome.patch_ready || outcome.success {
+        "completed"
+    } else if outcome.needs_human {
+        "needs_human"
+    } else {
+        "failed"
+    };
+    if let Err(e) = service.store.finish_open_runs_for_task(
+        &outcome.task_id,
+        now,
+        stop_reason,
+        outcome.exit_code,
+        Some(outcome.duration_secs as f64),
+    ) {
+        eprintln!(
+            "[daemon] Failed to persist run completion for {}: {}",
             outcome.task_id.0, e
         );
     }
@@ -701,6 +725,11 @@ fn find_parent_branch(service: &OrchdService, task: &Task) -> Option<String> {
     parent.branch_name
 }
 
+fn estimate_tokens_from_prompt(prompt: &str) -> u64 {
+    let chars = prompt.chars().count() as u64;
+    chars.div_ceil(4)
+}
+
 fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
     let output = Command::new("bash")
         .arg("-lc")
@@ -719,6 +748,23 @@ fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
         "verify command `{command}` failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
         output.status.code()
     ))
+}
+
+fn get_worktree_head_sha(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 fn apply_retry_transition(
@@ -853,6 +899,13 @@ pub fn execute_actions(
                 prompt,
                 worktree_path,
             } => {
+                if config.dry_run {
+                    eprintln!(
+                        "[dry-run] Would spawn agent for {} with model {}",
+                        task_id.0, model
+                    );
+                    continue;
+                }
                 if let Ok(Some(task)) = service.task(task_id) {
                     if let Err(e) = supervisor.spawn_agent(
                         task_id,
@@ -864,6 +917,16 @@ pub fn execute_actions(
                     ) {
                         eprintln!("[daemon] Failed to spawn agent for {}: {}", task_id.0, e);
                     } else {
+                        let estimated_tokens = estimate_tokens_from_prompt(prompt);
+                        if let Err(e) = service
+                            .store
+                            .set_open_run_estimated_tokens(task_id, estimated_tokens)
+                        {
+                            eprintln!(
+                                "[daemon] Failed to store token estimate for {}: {}",
+                                task_id.0, e
+                            );
+                        }
                         let event = Event {
                             id: EventId(format!(
                                 "E-AGENT-SPAWNED-{}-{}",
@@ -891,7 +954,15 @@ pub fn execute_actions(
                 }
             }
             DaemonAction::MarkReady { task_id } => {
-                let event_id = EventId(format!("E-READY-{}", task_id.0));
+                if config.dry_run {
+                    eprintln!("[dry-run] Would mark {} ready", task_id.0);
+                    continue;
+                }
+                let event_id = EventId(format!(
+                    "E-READY-{}-{}",
+                    task_id.0,
+                    now.timestamp_nanos_opt().unwrap_or_default()
+                ));
                 match service.mark_ready(task_id, event_id, now) {
                     Ok(_) => eprintln!("[daemon] {} -> Ready", task_id.0),
                     Err(e) => eprintln!("[daemon] Failed to mark {} ready: {}", task_id.0, e),
@@ -899,7 +970,11 @@ pub fn execute_actions(
             }
             DaemonAction::RecordNeedsHuman { task_id, reason } => {
                 let event = Event {
-                    id: EventId(format!("E-HUMAN-{}", task_id.0)),
+                    id: EventId(format!(
+                        "E-HUMAN-{}-{}",
+                        task_id.0,
+                        now.timestamp_nanos_opt().unwrap_or_default()
+                    )),
                     task_id: Some(task_id.clone()),
                     repo_id: None,
                     at: now,
@@ -922,32 +997,45 @@ pub fn execute_actions(
                 task_id,
                 next_model,
                 reason,
-            } => match apply_retry_transition(
-                service,
-                daemon_state.notification_dispatcher.as_ref(),
-                task_id,
-                *next_model,
-                reason,
-                now,
-            ) {
-                Ok(true) => {
-                    daemon_state.pipelines.remove(&task_id.0);
-                    daemon_state.restack_retries.remove(&task_id.0);
-                    eprintln!("[daemon] {} scheduled retry with {}", task_id.0, next_model);
-                }
-                Ok(false) => {
-                    daemon_state.pipelines.remove(&task_id.0);
-                    daemon_state.restack_retries.remove(&task_id.0);
+            } => {
+                if config.dry_run {
                     eprintln!(
-                        "[daemon] {} reached max retries; task moved to STOPPED",
-                        task_id.0
+                        "[dry-run] Would schedule retry for {} with {} ({})",
+                        task_id.0, next_model, reason
                     );
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("[daemon] Failed to schedule retry for {}: {}", task_id.0, e);
+                match apply_retry_transition(
+                    service,
+                    daemon_state.notification_dispatcher.as_ref(),
+                    task_id,
+                    *next_model,
+                    reason,
+                    now,
+                ) {
+                    Ok(true) => {
+                        daemon_state.pipelines.remove(&task_id.0);
+                        daemon_state.restack_retries.remove(&task_id.0);
+                        eprintln!("[daemon] {} scheduled retry with {}", task_id.0, next_model);
+                    }
+                    Ok(false) => {
+                        daemon_state.pipelines.remove(&task_id.0);
+                        daemon_state.restack_retries.remove(&task_id.0);
+                        eprintln!(
+                            "[daemon] {} reached max retries; task moved to STOPPED",
+                            task_id.0
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[daemon] Failed to schedule retry for {}: {}", task_id.0, e);
+                    }
                 }
-            },
+            }
             DaemonAction::TaskFailed { task_id, reason } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would stop {} with failure: {}", task_id.0, reason);
+                    continue;
+                }
                 stop_task_with_failure_reason(
                     service,
                     daemon_state.notification_dispatcher.as_ref(),
@@ -959,11 +1047,27 @@ pub fn execute_actions(
 
                 eprintln!("[daemon] {} failed → stopped: {}", task_id.0, reason);
             }
-            DaemonAction::ExecutePipeline { action } => match action {
+            DaemonAction::ExecutePipeline { action } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would execute pipeline action: {:?}", action);
+                    continue;
+                }
+                match action {
                 PipelineAction::RunVerify {
                     task_id,
                     worktree_path,
                 } => {
+                    let current_sha = get_worktree_head_sha(worktree_path);
+                    if let Some(sha) = current_sha.as_ref() {
+                        if daemon_state.verify_cache.get(&task_id.0) == Some(sha) {
+                            eprintln!("[daemon] verify cache hit for {}, skipping", task_id.0);
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.advance();
+                            }
+                            continue;
+                        }
+                    }
+
                     let verify_cmd = config
                         .verify_command
                         .as_deref()
@@ -987,6 +1091,9 @@ pub fn execute_actions(
 
                     match run_verify_command(worktree_path, verify_cmd) {
                         Ok(()) => {
+                            if let Some(sha) = current_sha {
+                                daemon_state.verify_cache.insert(task_id.0.clone(), sha);
+                            }
                             let _ = record_event_with_notification(
                                 service,
                                 daemon_state.notification_dispatcher.as_ref(),
@@ -1007,6 +1114,7 @@ pub fn execute_actions(
                             }
                         }
                         Err(error) => {
+                            daemon_state.verify_cache.remove(&task_id.0);
                             let _ = record_event_with_notification(
                                 service,
                                 daemon_state.notification_dispatcher.as_ref(),
@@ -1203,6 +1311,15 @@ pub fn execute_actions(
                         continue;
                     }
 
+                    // Fetch latest trunk before submitting to avoid
+                    // "trunk branch is out of date" errors from Graphite.
+                    let _ = Command::new("git")
+                        .args(["fetch", "origin"])
+                        .current_dir(worktree_path)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+
                     let graphite = GraphiteClient::new(worktree_path.clone());
                     match graphite.submit(*mode) {
                         Ok(()) => {
@@ -1275,7 +1392,8 @@ pub fn execute_actions(
                         task_id.0, stage, error
                     );
                 }
-            },
+                }
+            }
             DaemonAction::TriggerContextRegen => {
                 if should_regenerate(
                     &daemon_state.context_gen,
@@ -1328,6 +1446,10 @@ pub fn execute_actions(
                 );
             }
             DaemonAction::SpawnQA { task_id, qa_type } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would spawn QA {} for {}", qa_type, task_id.0);
+                    continue;
+                }
                 // Load baseline spec and build QA prompt.
                 if let Some(baseline) = load_baseline(&config.repo_root) {
                     let branch = format!("task/{}", task_id.0);
@@ -1373,7 +1495,7 @@ pub fn execute_actions(
 
                         // Record event.
                         let event = Event {
-                            id: EventId(format!("E-QA-{}-{}", qa_type, task_id.0)),
+                            id: EventId(format!("E-QA-{}-{}-{}", qa_type, task_id.0, now.timestamp_nanos_opt().unwrap_or_default())),
                             task_id: Some(task_id.clone()),
                             repo_id: None,
                             at: now,
@@ -1390,6 +1512,13 @@ pub fn execute_actions(
                 }
             }
             DaemonAction::QACompleted { task_id, result } => {
+                if config.dry_run {
+                    eprintln!(
+                        "[dry-run] Would mark QA completed for {} ({}/{})",
+                        task_id.0, result.summary.passed, result.summary.total
+                    );
+                    continue;
+                }
                 // Save QA result.
                 match save_qa_result(&config.repo_root, result) {
                     Ok(path) => {
@@ -1410,7 +1539,7 @@ pub fn execute_actions(
                 }
 
                 let event = Event {
-                    id: EventId(format!("E-QA-DONE-{}", task_id.0)),
+                    id: EventId(format!("E-QA-DONE-{}-{}", task_id.0, now.timestamp_nanos_opt().unwrap_or_default())),
                     task_id: Some(task_id.clone()),
                     repo_id: None,
                     at: now,
@@ -1427,6 +1556,10 @@ pub fn execute_actions(
                 );
             }
             DaemonAction::QAFailed { task_id, result } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would record QA failure for {}", task_id.0);
+                    continue;
+                }
                 let failures: Vec<String> = result
                     .tests
                     .iter()
@@ -1445,7 +1578,7 @@ pub fn execute_actions(
                 );
 
                 let event = Event {
-                    id: EventId(format!("E-QA-FAIL-{}", task_id.0)),
+                    id: EventId(format!("E-QA-FAIL-{}-{}", task_id.0, now.timestamp_nanos_opt().unwrap_or_default())),
                     task_id: Some(task_id.clone()),
                     repo_id: None,
                     at: now,
@@ -1486,6 +1619,7 @@ mod tests {
     use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn mk_service() -> OrchdService {
         let store = SqliteStore::open_in_memory().expect("in-memory db");
@@ -1523,6 +1657,7 @@ mod tests {
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
             skip_context_regen: false,
+            dry_run: false,
             agent_timeout_secs: 1_800,
         }
     }
@@ -1544,6 +1679,47 @@ mod tests {
             at: Utc::now(),
             kind: EventKind::TaskCreated,
         }
+    }
+
+    fn init_git_repo_with_commit() -> (PathBuf, String) {
+        let repo = std::env::temp_dir().join(format!(
+            "othala-daemon-git-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&repo).expect("create repo dir");
+        fs::write(repo.join("README.md"), "# test\n").expect("write readme");
+
+        let init_status = Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        assert!(init_status.success(), "git init should succeed");
+
+        let add_status = Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+        assert!(add_status.success(), "git add should succeed");
+
+        let commit_status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Othala Tests",
+                "-c",
+                "user.email=tests@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git commit");
+        assert!(commit_status.success(), "git commit should succeed");
+
+        let sha = get_worktree_head_sha(&repo).expect("head sha");
+        (repo, sha)
     }
 
     #[test]
@@ -1795,6 +1971,7 @@ mod tests {
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
             skip_context_regen: false,
+            dry_run: false,
             agent_timeout_secs: 1_800,
         };
         (config, tmp)
@@ -2182,5 +2359,222 @@ mod tests {
             }
             other => panic!("expected SpawnAgent, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn get_worktree_head_sha_returns_value_for_git_repo() {
+        let (repo, sha) = init_git_repo_with_commit();
+        let detected = get_worktree_head_sha(&repo).expect("head sha");
+        assert_eq!(detected, sha);
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn dry_run_skips_agent_spawn() {
+        let service = mk_service();
+        let mut config = mk_config();
+        config.dry_run = true;
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let task = mk_task("T-DRY-1");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let task_id = task.id.clone();
+        let actions = vec![DaemonAction::SpawnAgent {
+            task_id: task_id.clone(),
+            model: ModelKind::Claude,
+            prompt: "dry-run agent".to_string(),
+            worktree_path: task.worktree_path,
+        }];
+
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(!supervisor.has_session(&task_id));
+    }
+
+    #[test]
+    fn dry_run_still_logs() {
+        let service = mk_service();
+        let mut config = mk_config();
+        config.dry_run = true;
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let actions = vec![DaemonAction::Log {
+            message: "dry-run-log-smoke".to_string(),
+        }];
+
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+    }
+
+    #[test]
+    fn execute_actions_skips_verify_on_cache_hit() {
+        let service = mk_service();
+        let (repo, sha) = init_git_repo_with_commit();
+        let mut config = mk_config();
+        config.verify_command = Some("touch SHOULD_NOT_EXIST".to_string());
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-VC-1");
+
+        let mut task = mk_task("T-VC-1");
+        task.state = TaskState::Ready;
+        task.worktree_path = repo.clone();
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        daemon_state.verify_cache.insert(task_id.0.clone(), sha);
+        daemon_state.pipelines.insert(
+            task_id.0.clone(),
+            PipelineState::new(
+                task_id.clone(),
+                "task/T-VC-1".to_string(),
+                repo.clone(),
+                SubmitMode::Single,
+                None,
+            ),
+        );
+
+        let actions = vec![DaemonAction::ExecutePipeline {
+            action: PipelineAction::RunVerify {
+                task_id: task_id.clone(),
+                worktree_path: repo.clone(),
+            },
+        }];
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+
+        let pipeline = daemon_state
+            .pipelines
+            .get(&task_id.0)
+            .expect("pipeline exists");
+        assert_eq!(pipeline.stage, PipelineStage::Submit);
+        assert!(!repo.join("SHOULD_NOT_EXIST").exists());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn execute_actions_stores_verify_sha_on_success() {
+        let service = mk_service();
+        let (repo, sha) = init_git_repo_with_commit();
+        let mut config = mk_config();
+        config.verify_command = Some("touch VERIFY_RAN".to_string());
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-VC-2");
+
+        let mut task = mk_task("T-VC-2");
+        task.state = TaskState::Ready;
+        task.worktree_path = repo.clone();
+        task.preferred_model = Some(ModelKind::Claude);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        daemon_state.pipelines.insert(
+            task_id.0.clone(),
+            PipelineState::new(
+                task_id.clone(),
+                "task/T-VC-2".to_string(),
+                repo.clone(),
+                SubmitMode::Single,
+                None,
+            ),
+        );
+
+        let actions = vec![DaemonAction::ExecutePipeline {
+            action: PipelineAction::RunVerify {
+                task_id: task_id.clone(),
+                worktree_path: repo.clone(),
+            },
+        }];
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+
+        assert_eq!(daemon_state.verify_cache.get(&task_id.0), Some(&sha));
+        assert!(repo.join("VERIFY_RAN").exists());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn execute_actions_removes_verify_cache_on_failure() {
+        let service = mk_service();
+        let (repo, _) = init_git_repo_with_commit();
+        let mut config = mk_config();
+        config.verify_command = Some("false".to_string());
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-VC-3");
+
+        let mut task = mk_task("T-VC-3");
+        task.state = TaskState::Ready;
+        task.worktree_path = repo.clone();
+        task.preferred_model = Some(ModelKind::Claude);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        daemon_state
+            .verify_cache
+            .insert(task_id.0.clone(), "stale-sha".to_string());
+        daemon_state.pipelines.insert(
+            task_id.0.clone(),
+            PipelineState::new(
+                task_id.clone(),
+                "task/T-VC-3".to_string(),
+                repo.clone(),
+                SubmitMode::Single,
+                None,
+            ),
+        );
+
+        let actions = vec![DaemonAction::ExecutePipeline {
+            action: PipelineAction::RunVerify {
+                task_id: task_id.clone(),
+                worktree_path: repo.clone(),
+            },
+        }];
+        execute_actions(&actions, &service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(!daemon_state.verify_cache.contains_key(&task_id.0));
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn handle_agent_completion_invalidates_verify_cache_entry() {
+        let service = mk_service();
+        let config = mk_config();
+        let task = mk_task("T-VC-4");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        let mut daemon_state = DaemonState::new();
+        daemon_state
+            .verify_cache
+            .insert("T-VC-4".to_string(), "abc123".to_string());
+
+        let outcome = AgentOutcome {
+            task_id: TaskId::new("T-VC-4"),
+            model: ModelKind::Claude,
+            exit_code: Some(0),
+            patch_ready: true,
+            needs_human: false,
+            success: true,
+            duration_secs: 5,
+        };
+
+        let _ = handle_agent_completion(
+            &service,
+            None,
+            &outcome,
+            &config,
+            &mut daemon_state,
+            Utc::now(),
+        );
+
+        assert!(!daemon_state.verify_cache.contains_key("T-VC-4"));
     }
 }
