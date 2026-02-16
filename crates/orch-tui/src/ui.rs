@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use orch_core::state::TaskState;
 use orch_core::types::ModelKind;
 
 use crate::app::{InputMode, TuiApp};
@@ -80,6 +81,125 @@ fn task_cost_summary(task: &TaskOverviewRow, model: Option<ModelKind>) -> String
     )
 }
 
+pub fn format_dependency_chain(task: &TaskOverviewRow, all_tasks: &[TaskOverviewRow]) -> String {
+    let chain: Vec<String> = task
+        .depends_on_display
+        .iter()
+        .map(|dep| {
+            let state_indicator = all_tasks
+                .iter()
+                .find(|t| t.task_id.0 == *dep)
+                .map(|t| if t.state == TaskState::Merged { "✓" } else { "…" })
+                .unwrap_or("?");
+            format!("{dep} {state_indicator}")
+        })
+        .collect();
+    if chain.is_empty() {
+        "None".to_string()
+    } else {
+        format!("{} → {} (this)", chain.join(" → "), task.task_id.0)
+    }
+}
+
+fn dependency_chain_line(task: &TaskOverviewRow, all_tasks: &[TaskOverviewRow]) -> Line<'static> {
+    let mut spans = vec![Span::styled("Dependencies: ", Style::default().fg(DIM))];
+
+    for (index, dep) in task.depends_on_display.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" → ", Style::default().fg(DIM)));
+        }
+
+        let dep_style = match all_tasks.iter().find(|candidate| candidate.task_id.0 == *dep) {
+            Some(found) if found.state == TaskState::Merged => Style::default().fg(Color::Green),
+            Some(_) => Style::default().fg(Color::Yellow),
+            None => Style::default().fg(MUTED),
+        };
+
+        spans.push(Span::styled(dep.clone(), dep_style));
+    }
+
+    spans.push(Span::styled(" → ", Style::default().fg(DIM)));
+    spans.push(Span::styled(
+        format!("{} (this task)", task.task_id.0),
+        Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+    ));
+
+    Line::from(spans)
+}
+
+fn timeline_event_color(event_type: &str) -> Color {
+    let lowered = event_type.to_ascii_lowercase();
+    if lowered.contains("error") || lowered.contains("fail") {
+        Color::Red
+    } else if lowered.contains("warn") {
+        Color::Yellow
+    } else if lowered.contains("success") || lowered.contains("merge") || lowered.contains("complete") {
+        Color::Green
+    } else if lowered.contains("spawn") || lowered.contains("start") {
+        Color::Cyan
+    } else {
+        Color::White
+    }
+}
+
+fn format_timeline_timestamp(timestamp: &str) -> String {
+    if let Some((_, rest)) = timestamp.split_once('T') {
+        return rest.chars().take(8).collect();
+    }
+    timestamp.chars().take(8).collect()
+}
+
+fn render_timeline_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 {
+        return;
+    }
+
+    let mut events = app.state.timeline_events.clone();
+    events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let mut lines = Vec::new();
+    if events.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no timeline events",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for event in events.into_iter().take(20) {
+            let timestamp = format_timeline_timestamp(&event.timestamp);
+            lines.push(Line::from(vec![
+                Span::styled(format!("[{timestamp}]"), Style::default().fg(DIM)),
+                Span::styled(" ", Style::default()),
+                Span::styled(event.task_id, Style::default().fg(ACCENT)),
+                Span::styled(" | ", Style::default().fg(DIM)),
+                Span::styled(
+                    event.description,
+                    Style::default().fg(timeline_event_color(&event.event_type)),
+                ),
+            ]));
+        }
+    }
+
+    let widget = Paragraph::new(lines)
+        .block(normal_block("Timeline (last 20)"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn render_main_content(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if app.state.focused_task {
+        render_focused_task(frame, area, app);
+    } else if app.state.focused_pane_idx.is_some() {
+        render_focused_pane(frame, area, app);
+    } else {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        render_task_list(frame, body[0], app);
+        render_pane_summary(frame, body[1], app);
+    }
+}
+
 fn normal_block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
@@ -128,17 +248,15 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
 
     render_header(frame, root[0], app);
 
-    if app.state.focused_task {
-        render_focused_task(frame, root[1], app);
-    } else if app.state.focused_pane_idx.is_some() {
-        render_focused_pane(frame, root[1], app);
-    } else {
+    if app.state.show_timeline {
         let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(root[1]);
-        render_task_list(frame, body[0], app);
-        render_pane_summary(frame, body[1], app);
+        render_main_content(frame, body[0], app);
+        render_timeline_panel(frame, body[1], app);
+    } else {
+        render_main_content(frame, root[1], app);
     }
 
     render_error_summary(frame, root[2], app);
@@ -586,10 +704,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled(task.branch.clone(), Style::default().fg(HEADER_FG)),
         ]));
         if !task.depends_on_display.is_empty() {
-            status_lines.push(Line::from(vec![
-                Span::styled("Deps: ", Style::default().fg(DIM)),
-                Span::styled(task.depends_on_display.join(", "), Style::default().fg(HEADER_FG)),
-            ]));
+            status_lines.push(dependency_chain_line(task, &app.state.tasks));
         }
         if let Some(pr_url) = &task.pr_url {
             status_lines.push(Line::from(vec![
@@ -900,7 +1015,8 @@ mod tests {
     use crate::TuiApp;
 
     use super::{
-        estimate_task_cost_usd, footer_height, format_cost_display, format_pane_tabs,
+        estimate_task_cost_usd, footer_height, format_cost_display, format_dependency_chain,
+        format_pane_tabs,
         format_task_row, pane_status_tag, state_color, status_activity, status_line_color,
         status_sidebar_lines, to_local_time, wrapped_visual_line_count,
     };
@@ -927,6 +1043,30 @@ mod tests {
             pr_url: None,
             model_display: None,
         }
+    }
+
+    #[test]
+    fn format_dependency_chain_empty() {
+        let row = mk_row("T123");
+        assert_eq!(format_dependency_chain(&row, &[]), "None");
+    }
+
+    #[test]
+    fn format_dependency_chain_with_deps() {
+        let mut current = mk_row("T123");
+        current.depends_on_display = vec!["T100".to_string(), "T101".to_string()];
+
+        let mut dep_merged = mk_row("T100");
+        dep_merged.state = TaskState::Merged;
+
+        let mut dep_pending = mk_row("T101");
+        dep_pending.state = TaskState::Ready;
+
+        let all_tasks = vec![dep_merged, dep_pending, current.clone()];
+        assert_eq!(
+            format_dependency_chain(&current, &all_tasks),
+            "T100 ✓ → T101 … → T123 (this)"
+        );
     }
 
     #[test]

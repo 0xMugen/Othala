@@ -183,9 +183,9 @@ impl Validate for TaskSpec {
 mod tests {
     use super::{Validate, ValidationLevel};
     use crate::config::{
-        ConcurrencyConfig, DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy,
-        NixConfig, NotificationConfig, OrgConfig, RepoConfig, RepoGraphiteConfig, UiConfig,
-        VerifyConfig,
+        BudgetConfig, ConcurrencyConfig, DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig,
+        MovePolicy, NixConfig, NotificationConfig, OrgConfig, RepoConfig, RepoGraphiteConfig,
+        UiConfig, VerifyConfig,
     };
     use crate::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskSpec};
     use std::path::PathBuf;
@@ -212,6 +212,7 @@ mod tests {
             },
             notifications: NotificationConfig::default(),
             daemon: DaemonOrgConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
 

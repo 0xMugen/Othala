@@ -70,6 +70,14 @@ pub struct ErrorEntry {
     pub level: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub timestamp: String,
+    pub task_id: String,
+    pub description: String,
+    pub event_type: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortMode {
     ByState,
@@ -368,6 +376,10 @@ pub struct DashboardState {
     pub recent_errors: Vec<ErrorEntry>,
     #[serde(default)]
     pub log_root: Option<String>,
+    #[serde(default)]
+    pub timeline_events: Vec<TimelineEvent>,
+    #[serde(default)]
+    pub show_timeline: bool,
     pub model_health: Vec<ModelHealthDisplay>,
     pub filter_text: Option<String>,
     pub filter_state: Option<TaskState>,
@@ -394,6 +406,8 @@ impl Default for DashboardState {
             panes: Vec::new(),
             recent_errors: Vec::new(),
             log_root: None,
+            timeline_events: Vec::new(),
+            show_timeline: false,
             model_health: Vec::new(),
             filter_text: None,
             filter_state: None,
@@ -944,6 +958,27 @@ mod tests {
     }
 
     #[test]
+    fn timeline_events_default_empty() {
+        let state = DashboardState::default();
+        assert!(state.timeline_events.is_empty());
+    }
+
+    #[test]
+    fn timeline_event_serialization() {
+        let event = TimelineEvent {
+            timestamp: "2026-02-16T10:30:22Z".to_string(),
+            task_id: "T123".to_string(),
+            description: "Agent spawned (claude)".to_string(),
+            event_type: "spawn".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize timeline event");
+        let parsed: TimelineEvent =
+            serde_json::from_str(&json).expect("deserialize timeline event");
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
     fn state_summary_counts_tasks() {
         let state = DashboardState {
             tasks: vec![
@@ -957,6 +992,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -983,6 +1020,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1029,6 +1068,8 @@ mod tests {
             filter_text: Some("oauth".to_string()),
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1045,6 +1086,8 @@ mod tests {
             filter_text: Some("t100".to_string()),
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1062,6 +1105,8 @@ mod tests {
             filter_state: Some(TaskState::Ready),
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1080,6 +1125,8 @@ mod tests {
             filter_state: Some(TaskState::Ready),
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1098,6 +1145,8 @@ mod tests {
             sort_reversed: false,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1121,6 +1170,8 @@ mod tests {
             sort_reversed: true,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1172,6 +1223,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1188,6 +1241,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1209,6 +1264,8 @@ mod tests {
             focused_pane_idx: Some(1),
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1258,6 +1315,8 @@ mod tests {
             selected_pane_category: PaneCategory::Agent,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1282,6 +1341,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1303,6 +1364,8 @@ mod tests {
             ],
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1333,6 +1396,8 @@ mod tests {
             selected_pane_category: PaneCategory::QA,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1361,6 +1426,8 @@ mod tests {
             selected_pane_category: PaneCategory::QA,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 
@@ -1384,6 +1451,8 @@ mod tests {
             selected_pane_category: PaneCategory::Agent,
             recent_errors: vec![],
             log_root: None,
+            timeline_events: vec![],
+            show_timeline: false,
             ..DashboardState::default()
         };
 

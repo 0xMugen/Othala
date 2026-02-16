@@ -2,15 +2,15 @@
 //!
 //! Simplified CLI for managing AI coding sessions that auto-submit to Graphite.
 
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use clap::{Parser, Subcommand};
 use orch_agents::setup::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupProbeConfig,
 };
 use orch_core::config::{
-    apply_setup_selection_to_org_config, load_org_config, save_org_config, ConcurrencyConfig,
-    DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy, NotificationConfig, OrgConfig,
-    UiConfig,
+    apply_setup_selection_to_org_config, load_org_config, save_org_config, BudgetConfig,
+    ConcurrencyConfig, DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy,
+    NotificationConfig, OrgConfig, UiConfig,
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
@@ -181,6 +181,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Replay {
+        /// Task ID to replay (omit for all tasks)
+        task_id: Option<String>,
+        /// Show events since this ISO timestamp
+        #[arg(long)]
+        since: Option<String>,
+        /// Show events until this ISO timestamp
+        #[arg(long)]
+        until: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Show all events (not just for one task)
+        #[arg(long)]
+        all: bool,
+    },
     /// Show persisted agent output for a task
     Tail {
         /// Task/chat ID
@@ -261,6 +277,8 @@ enum Commands {
     Costs {
         #[arg(long = "task")]
         task: Option<String>,
+        #[arg(long)]
+        budget: bool,
     },
     /// Remove old completed/stopped tasks and their data
     Prune {
@@ -492,6 +510,23 @@ fn aggregate_cost_estimates(runs: &[orchd::TaskRunRecord]) -> Vec<AgentCostEstim
             })
         })
         .collect()
+}
+
+fn aggregate_budget_usage(runs: &[orchd::TaskRunRecord], now: chrono::DateTime<Utc>) -> (u64, u64) {
+    let mut today = 0u64;
+    let mut month = 0u64;
+    for run in runs {
+        let Some(tokens) = run.estimated_tokens else {
+            continue;
+        };
+        if run.started_at.year() == now.year() && run.started_at.month() == now.month() {
+            month = month.saturating_add(tokens);
+            if run.started_at.day() == now.day() {
+                today = today.saturating_add(tokens);
+            }
+        }
+    }
+    (today, month)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1124,6 +1159,7 @@ fn default_org_config(enabled_models: Vec<ModelKind>) -> OrgConfig {
         },
         notifications: NotificationConfig::default(),
         daemon: DaemonOrgConfig::default(),
+        budget: BudgetConfig::default(),
     }
 }
 
@@ -2650,6 +2686,36 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Replay {
+            task_id,
+            since,
+            until,
+            json,
+            all,
+        } => {
+            let since_dt = parse_time_filter("since", since.as_deref())?;
+            let until_dt = parse_time_filter("until", until.as_deref())?;
+
+            let events = if all || task_id.is_none() {
+                service
+                    .store
+                    .list_all_events(since.as_deref(), until.as_deref())?
+            } else {
+                let task_id = task_id.expect("task id exists when not replaying all");
+                let events = service.store.list_events_for_task(task_id.as_str())?;
+                filter_events_by_time(events, since_dt, until_dt)
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else if events.is_empty() {
+                println!("No events found.");
+            } else {
+                for event in &events {
+                    println!("{}", format_event(event));
+                }
+            }
+        }
         Commands::Tail { id, lines, follow } => {
             let repo_root = std::env::current_dir()?;
             let task_id = TaskId::new(&id);
@@ -2942,40 +3008,69 @@ fn main() -> anyhow::Result<()> {
 
             println!("Imported {} task(s) from {}", imported, input.display());
         }
-        Commands::Costs { task } => {
-            let tasks = service.list_tasks()?;
-            if let Some(task_id) = task {
-                let runs = service.task_runs(&TaskId::new(&task_id))?;
-                let estimates = aggregate_cost_estimates(&runs);
-                let total_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
-                let total_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
-                println!("Task: {task_id}");
-                println!("Estimated tokens: {total_tokens}");
-                println!("Duration (secs): {:.2}", total_duration);
-                for estimate in estimates {
-                    println!(
-                        "  model={} tokens={} duration_secs={:.2}",
-                        estimate.model.as_str(),
-                        estimate.input_tokens,
-                        estimate.duration_secs
-                    );
+        Commands::Costs { task, budget } => {
+            if budget {
+                let repo_root = std::env::current_dir()?;
+                let config_path = repo_root.join(".othala/config.toml");
+                let budget_config = load_org_config(&config_path)
+                    .map(|config| config.budget)
+                    .unwrap_or_default();
+
+                let mut all_runs = Vec::new();
+                for task in service.list_tasks()? {
+                    all_runs.extend(service.task_runs(&task.id)?);
                 }
+
+                let now = Utc::now();
+                let (used_today, used_month) = aggregate_budget_usage(&all_runs, now);
+                println!("Budget enabled: {}", budget_config.enabled);
+                println!(
+                    "Daily: used={} limit={} remaining={}",
+                    used_today,
+                    budget_config.daily_token_limit,
+                    budget_config.daily_token_limit.saturating_sub(used_today)
+                );
+                println!(
+                    "Monthly: used={} limit={} remaining={}",
+                    used_month,
+                    budget_config.monthly_token_limit,
+                    budget_config.monthly_token_limit.saturating_sub(used_month)
+                );
             } else {
-                let mut total_tokens = 0u64;
-                let mut total_duration = 0.0f64;
-                for task in &tasks {
-                    let runs = service.task_runs(&task.id)?;
+                let tasks = service.list_tasks()?;
+                if let Some(task_id) = task {
+                    let runs = service.task_runs(&TaskId::new(&task_id))?;
                     let estimates = aggregate_cost_estimates(&runs);
-                    let task_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
-                    let task_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
-                    total_tokens += task_tokens;
-                    total_duration += task_duration;
-                    println!(
-                        "{} tokens={} duration_secs={:.2}",
-                        task.id.0, task_tokens, task_duration
-                    );
+                    let total_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
+                    let total_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
+                    println!("Task: {task_id}");
+                    println!("Estimated tokens: {total_tokens}");
+                    println!("Duration (secs): {:.2}", total_duration);
+                    for estimate in estimates {
+                        println!(
+                            "  model={} tokens={} duration_secs={:.2}",
+                            estimate.model.as_str(),
+                            estimate.input_tokens,
+                            estimate.duration_secs
+                        );
+                    }
+                } else {
+                    let mut total_tokens = 0u64;
+                    let mut total_duration = 0.0f64;
+                    for task in &tasks {
+                        let runs = service.task_runs(&task.id)?;
+                        let estimates = aggregate_cost_estimates(&runs);
+                        let task_tokens: u64 = estimates.iter().map(|e| e.input_tokens).sum();
+                        let task_duration: f64 = estimates.iter().map(|e| e.duration_secs).sum();
+                        total_tokens += task_tokens;
+                        total_duration += task_duration;
+                        println!(
+                            "{} tokens={} duration_secs={:.2}",
+                            task.id.0, task_tokens, task_duration
+                        );
+                    }
+                    println!("TOTAL tokens={} duration_secs={:.2}", total_tokens, total_duration);
                 }
-                println!("TOTAL tokens={} duration_secs={:.2}", total_tokens, total_duration);
             }
         }
         Commands::Prune {
@@ -3063,6 +3158,115 @@ fn print_dep_tree(tasks: &[Task], task: &Task, depth: usize) {
     }
 }
 
+fn parse_time_filter(name: &str, value: Option<&str>) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+    value
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|err| anyhow::anyhow!("invalid --{name} timestamp '{raw}': {err}"))
+        })
+        .transpose()
+}
+
+fn filter_events_by_time(
+    events: Vec<Event>,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|event| since.is_none_or(|start| event.at >= start))
+        .filter(|event| until.is_none_or(|end| event.at <= end))
+        .collect()
+}
+
+fn format_event(event: &Event) -> String {
+    let (kind_name, kind_desc) = match &event.kind {
+        EventKind::TaskCreated => ("TaskCreated", "Task created".to_string()),
+        EventKind::TaskStateChanged { from, to } => {
+            ("TaskStateChanged", format!("{from} -> {to}"))
+        }
+        EventKind::ParentHeadUpdated { parent_task_id } => {
+            ("ParentHeadUpdated", format!("parent_task_id={}", parent_task_id.0))
+        }
+        EventKind::RestackStarted => ("RestackStarted", "Restack started".to_string()),
+        EventKind::RestackCompleted => ("RestackCompleted", "Restack completed".to_string()),
+        EventKind::RestackConflict => ("RestackConflict", "Restack conflict".to_string()),
+        EventKind::VerifyStarted => ("VerifyStarted", "Verify started".to_string()),
+        EventKind::VerifyCompleted { success } => {
+            ("VerifyCompleted", format!("success={success}"))
+        }
+        EventKind::ReadyReached => ("ReadyReached", "Ready reached".to_string()),
+        EventKind::SubmitStarted { mode } => ("SubmitStarted", format!("mode={mode:?}")),
+        EventKind::SubmitCompleted => ("SubmitCompleted", "Submit completed".to_string()),
+        EventKind::NeedsHuman { reason } => ("NeedsHuman", format!("reason={reason}")),
+        EventKind::Error { code, message } => {
+            ("Error", format!("code={code}, message={message}"))
+        }
+        EventKind::RetryScheduled {
+            attempt,
+            model,
+            reason,
+        } => (
+            "RetryScheduled",
+            format!("attempt={attempt}, model={model}, reason={reason}"),
+        ),
+        EventKind::AgentSpawned { model } => ("AgentSpawned", format!("model={model}")),
+        EventKind::AgentCompleted {
+            model,
+            success,
+            duration_secs,
+        } => (
+            "AgentCompleted",
+            format!("model={model}, success={success}, duration_secs={duration_secs}"),
+        ),
+        EventKind::CancellationRequested { reason } => {
+            ("CancellationRequested", format!("reason={reason}"))
+        }
+        EventKind::ModelFallback {
+            from_model,
+            to_model,
+            reason,
+        } => (
+            "ModelFallback",
+            format!("from={from_model}, to={to_model}, reason={reason}"),
+        ),
+        EventKind::ContextRegenStarted => {
+            ("ContextRegenStarted", "Context regen started".to_string())
+        }
+        EventKind::ContextRegenCompleted { success } => {
+            ("ContextRegenCompleted", format!("success={success}"))
+        }
+        EventKind::ConfigReloaded { changes } => ("ConfigReloaded", format!("changes={changes}")),
+        EventKind::TaskFailed { reason, is_final } => {
+            ("TaskFailed", format!("reason={reason}, is_final={is_final}"))
+        }
+        EventKind::TestSpecValidated { passed, details } => (
+            "TestSpecValidated",
+            format!("passed={passed}, details={details}"),
+        ),
+        EventKind::OrchestratorDecomposed { sub_task_ids } => (
+            "OrchestratorDecomposed",
+            format!("sub_task_ids={}", sub_task_ids.join(",")),
+        ),
+        EventKind::QAStarted { qa_type } => ("QAStarted", format!("qa_type={qa_type}")),
+        EventKind::QACompleted {
+            passed,
+            failed,
+            total,
+        } => (
+            "QACompleted",
+            format!("passed={passed}, failed={failed}, total={total}"),
+        ),
+        EventKind::QAFailed { failures } => ("QAFailed", format!("failures={}", failures.join(";"))),
+        EventKind::BudgetExceeded => ("BudgetExceeded", "budget exceeded".to_string()),
+    };
+
+    let timestamp = event.at.format("%Y-%m-%d %H:%M:%S");
+    let task_label = event.task_id.as_ref().map(|id| id.0.as_str()).unwrap_or("-");
+    format!("[{timestamp}] {task_label} | {kind_name} | {kind_desc}")
+}
+
 fn format_event_kind(kind: &EventKind) -> String {
     match kind {
         EventKind::TaskCreated => "task_created".to_string(),
@@ -3146,6 +3350,7 @@ fn format_event_kind(kind: &EventKind) -> String {
         EventKind::QAFailed { failures } => {
             format!("\x1b[31mqa_failed\x1b[0m: {}", failures.join("; "))
         }
+        EventKind::BudgetExceeded => "\x1b[31mbudget_exceeded\x1b[0m".to_string(),
     }
 }
 
@@ -3195,6 +3400,38 @@ mod tests {
     }
 
     #[test]
+    fn replay_cli_parses_task_and_filters() {
+        let cli = Cli::try_parse_from([
+            "othala",
+            "replay",
+            "T-100",
+            "--since",
+            "2026-02-10T08:00:00Z",
+            "--until",
+            "2026-02-10T09:00:00Z",
+            "--json",
+        ])
+        .expect("parse replay");
+
+        match cli.command {
+            Commands::Replay {
+                task_id,
+                since,
+                until,
+                json,
+                all,
+            } => {
+                assert_eq!(task_id.as_deref(), Some("T-100"));
+                assert_eq!(since.as_deref(), Some("2026-02-10T08:00:00Z"));
+                assert_eq!(until.as_deref(), Some("2026-02-10T09:00:00Z"));
+                assert!(json);
+                assert!(!all);
+            }
+            _ => panic!("expected replay command"),
+        }
+    }
+
+    #[test]
     fn diff_stat_flag_works() {
         let cli = Cli::try_parse_from(["othala", "diff", "T-42", "--stat"]).expect("parse diff");
 
@@ -3212,6 +3449,19 @@ mod tests {
                 );
             }
             _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn costs_cli_parses_budget_flag() {
+        let cli = Cli::try_parse_from(["othala", "costs", "--budget"]).expect("parse costs");
+
+        match cli.command {
+            Commands::Costs { task, budget } => {
+                assert!(task.is_none());
+                assert!(budget);
+            }
+            _ => panic!("expected costs command"),
         }
     }
 
@@ -3605,6 +3855,235 @@ mod tests {
         assert!(rendered.contains("reason: \"verify failed\""));
         assert!(rendered.contains("codex"));
         assert!(rendered.contains("completed 10:40:11"));
+    }
+
+    #[test]
+    fn replay_formats_events_chronologically() {
+        let service = mk_test_service();
+        let task_id = TaskId::new("T-REPLAY-ORDER");
+        let repo_id = RepoId("repo-replay-order".to_string());
+
+        let first = Utc
+            .with_ymd_and_hms(2026, 2, 10, 10, 0, 0)
+            .single()
+            .expect("valid first timestamp");
+        let second = Utc
+            .with_ymd_and_hms(2026, 2, 10, 10, 1, 0)
+            .single()
+            .expect("valid second timestamp");
+
+        service
+            .store
+            .append_event(&Event {
+                id: EventId("E-REPLAY-ORDER-2".to_string()),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(repo_id.clone()),
+                at: second,
+                kind: EventKind::VerifyStarted,
+            })
+            .expect("append second event");
+        service
+            .store
+            .append_event(&Event {
+                id: EventId("E-REPLAY-ORDER-1".to_string()),
+                task_id: Some(task_id),
+                repo_id: Some(repo_id),
+                at: first,
+                kind: EventKind::AgentSpawned {
+                    model: "claude".to_string(),
+                },
+            })
+            .expect("append first event");
+
+        let replayed = service
+            .store
+            .list_all_events(None, None)
+            .expect("list all events");
+        let ids: Vec<_> = replayed.iter().map(|event| event.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["E-REPLAY-ORDER-1", "E-REPLAY-ORDER-2"]);
+    }
+
+    #[test]
+    fn replay_filters_by_task_id() {
+        let service = mk_test_service();
+        let task_a = mk_task("T-REPLAY-FILTER-A", TaskState::Chatting);
+        let task_b = mk_task("T-REPLAY-FILTER-B", TaskState::Chatting);
+        service
+            .create_task(&task_a, &mk_created_event(&task_a))
+            .expect("create task a");
+        service
+            .create_task(&task_b, &mk_created_event(&task_b))
+            .expect("create task b");
+
+        service
+            .record_event(&Event {
+                id: EventId("E-REPLAY-FILTER-A-1".to_string()),
+                task_id: Some(task_a.id.clone()),
+                repo_id: Some(task_a.repo_id.clone()),
+                at: Utc::now(),
+                kind: EventKind::VerifyStarted,
+            })
+            .expect("record task a event");
+        service
+            .record_event(&Event {
+                id: EventId("E-REPLAY-FILTER-B-1".to_string()),
+                task_id: Some(task_b.id.clone()),
+                repo_id: Some(task_b.repo_id.clone()),
+                at: Utc::now(),
+                kind: EventKind::VerifyStarted,
+            })
+            .expect("record task b event");
+
+        let events = service
+            .store
+            .list_events_for_task(&task_a.id.0)
+            .expect("list task a events");
+        assert!(events.iter().all(|event| {
+            event
+                .task_id
+                .as_ref()
+                .is_some_and(|id| id.0 == task_a.id.0)
+        }));
+    }
+
+    #[test]
+    fn replay_filters_by_since() {
+        let task_id = TaskId::new("T-REPLAY-SINCE");
+        let repo_id = RepoId("repo-replay-since".to_string());
+        let first = Utc
+            .with_ymd_and_hms(2026, 2, 10, 8, 0, 0)
+            .single()
+            .expect("valid first timestamp");
+        let second = Utc
+            .with_ymd_and_hms(2026, 2, 10, 9, 0, 0)
+            .single()
+            .expect("valid second timestamp");
+        let third = Utc
+            .with_ymd_and_hms(2026, 2, 10, 10, 0, 0)
+            .single()
+            .expect("valid third timestamp");
+
+        let events = vec![
+            Event {
+                id: EventId("E-REPLAY-SINCE-1".to_string()),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(repo_id.clone()),
+                at: first,
+                kind: EventKind::TaskCreated,
+            },
+            Event {
+                id: EventId("E-REPLAY-SINCE-2".to_string()),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(repo_id.clone()),
+                at: second,
+                kind: EventKind::VerifyStarted,
+            },
+            Event {
+                id: EventId("E-REPLAY-SINCE-3".to_string()),
+                task_id: Some(task_id),
+                repo_id: Some(repo_id),
+                at: third,
+                kind: EventKind::VerifyCompleted { success: true },
+            },
+        ];
+
+        let filtered = filter_events_by_time(events, Some(second), None);
+        let ids: Vec<_> = filtered.iter().map(|event| event.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["E-REPLAY-SINCE-2", "E-REPLAY-SINCE-3"]);
+    }
+
+    #[test]
+    fn format_event_handles_all_kinds() {
+        let task_id = TaskId::new("T-FMT-ALL");
+        let repo_id = RepoId("repo-fmt-all".to_string());
+        let kinds = vec![
+            EventKind::TaskCreated,
+            EventKind::TaskStateChanged {
+                from: "CHATTING".to_string(),
+                to: "READY".to_string(),
+            },
+            EventKind::ParentHeadUpdated {
+                parent_task_id: TaskId::new("T-PARENT"),
+            },
+            EventKind::RestackStarted,
+            EventKind::RestackCompleted,
+            EventKind::RestackConflict,
+            EventKind::VerifyStarted,
+            EventKind::VerifyCompleted { success: true },
+            EventKind::ReadyReached,
+            EventKind::SubmitStarted {
+                mode: SubmitMode::Single,
+            },
+            EventKind::SubmitCompleted,
+            EventKind::NeedsHuman {
+                reason: "manual step".to_string(),
+            },
+            EventKind::Error {
+                code: "E-1".to_string(),
+                message: "boom".to_string(),
+            },
+            EventKind::RetryScheduled {
+                attempt: 2,
+                model: "claude".to_string(),
+                reason: "timeout".to_string(),
+            },
+            EventKind::AgentSpawned {
+                model: "claude".to_string(),
+            },
+            EventKind::AgentCompleted {
+                model: "claude".to_string(),
+                success: false,
+                duration_secs: 14,
+            },
+            EventKind::CancellationRequested {
+                reason: "requested by user".to_string(),
+            },
+            EventKind::ModelFallback {
+                from_model: "claude".to_string(),
+                to_model: "codex".to_string(),
+                reason: "timeout".to_string(),
+            },
+            EventKind::ContextRegenStarted,
+            EventKind::ContextRegenCompleted { success: true },
+            EventKind::ConfigReloaded {
+                changes: "enabled_models".to_string(),
+            },
+            EventKind::TaskFailed {
+                reason: "max retries".to_string(),
+                is_final: true,
+            },
+            EventKind::TestSpecValidated {
+                passed: true,
+                details: "ok".to_string(),
+            },
+            EventKind::OrchestratorDecomposed {
+                sub_task_ids: vec!["T-SUB-1".to_string(), "T-SUB-2".to_string()],
+            },
+            EventKind::QAStarted {
+                qa_type: "baseline".to_string(),
+            },
+            EventKind::QACompleted {
+                passed: 3,
+                failed: 1,
+                total: 4,
+            },
+            EventKind::QAFailed {
+                failures: vec!["test_x".to_string()],
+            },
+        ];
+
+        for (idx, kind) in kinds.into_iter().enumerate() {
+            let event = Event {
+                id: EventId(format!("E-FMT-{idx}")),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(repo_id.clone()),
+                at: Utc::now(),
+                kind,
+            };
+            let rendered = format_event(&event);
+            assert!(rendered.contains("T-FMT-ALL"));
+            assert!(rendered.contains(" | "));
+        }
     }
 
     fn mk_test_service() -> OrchdService {

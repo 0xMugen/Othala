@@ -476,11 +476,11 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         Ok(())
     }
 
-    pub fn list_events_for_task(&self, task_id: &TaskId) -> Result<Vec<Event>, PersistenceError> {
+    pub fn list_events_for_task(&self, task_id: &str) -> Result<Vec<Event>, PersistenceError> {
         let mut stmt = self.conn.prepare(
             "SELECT payload_json FROM events WHERE task_id = ?1 ORDER BY at ASC, event_id ASC",
         )?;
-        let rows = stmt.query_map(params![task_id.0], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
         let mut events = Vec::new();
         for row in rows {
             let payload = row?;
@@ -489,17 +489,61 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         Ok(events)
     }
 
-    pub fn list_events_global(&self) -> Result<Vec<Event>, PersistenceError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT payload_json FROM events ORDER BY at ASC, event_id ASC")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    pub fn list_all_events(
+        &self,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<Event>, PersistenceError> {
         let mut events = Vec::new();
-        for row in rows {
-            let payload = row?;
-            events.push(serde_json::from_str::<Event>(&payload)?);
+
+        match (since, until) {
+            (Some(since), Some(until)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT payload_json FROM events WHERE at >= ?1 AND at <= ?2 ORDER BY at ASC, event_id ASC",
+                )?;
+                let rows = stmt.query_map(params![since, until], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let payload = row?;
+                    events.push(serde_json::from_str::<Event>(&payload)?);
+                }
+            }
+            (Some(since), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT payload_json FROM events WHERE at >= ?1 ORDER BY at ASC, event_id ASC",
+                )?;
+                let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let payload = row?;
+                    events.push(serde_json::from_str::<Event>(&payload)?);
+                }
+            }
+            (None, Some(until)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT payload_json FROM events WHERE at <= ?1 ORDER BY at ASC, event_id ASC",
+                )?;
+                let rows = stmt.query_map(params![until], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let payload = row?;
+                    events.push(serde_json::from_str::<Event>(&payload)?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT payload_json FROM events ORDER BY at ASC, event_id ASC")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let payload = row?;
+                    events.push(serde_json::from_str::<Event>(&payload)?);
+                }
+            }
         }
+
         Ok(events)
+    }
+
+    pub fn list_events_global(&self) -> Result<Vec<Event>, PersistenceError> {
+        self.list_all_events(None, None)
     }
 
     pub fn task_count_by_state(&self) -> Result<Vec<(String, i64)>, PersistenceError> {
@@ -748,6 +792,7 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::QAStarted { .. } => "qa_started",
         EventKind::QACompleted { .. } => "qa_completed",
         EventKind::QAFailed { .. } => "qa_failed",
+        EventKind::BudgetExceeded => "budget_exceeded",
     }
 }
 
@@ -823,9 +868,57 @@ mod tests {
         assert!(store.delete_task(&task.id).expect("delete"));
         assert!(store.load_task(&task.id).expect("load").is_none());
         assert!(store
-            .list_events_for_task(&task.id)
+            .list_events_for_task(task.id.0.as_str())
             .expect("events")
             .is_empty());
+    }
+
+    #[test]
+    fn list_events_for_task_returns_correct_events() {
+        let store = mk_store();
+        let task_a = mk_task("T-EVENT-A", TaskState::Chatting);
+        let task_b = mk_task("T-EVENT-B", TaskState::Chatting);
+        store.upsert_task(&task_a).expect("upsert task a");
+        store.upsert_task(&task_b).expect("upsert task b");
+
+        let first_at = Utc::now();
+        let second_at = first_at + chrono::Duration::seconds(1);
+        let third_at = first_at + chrono::Duration::seconds(2);
+
+        store
+            .append_event(&Event {
+                id: EventId("E-EVENT-A-1".to_string()),
+                task_id: Some(task_a.id.clone()),
+                repo_id: Some(task_a.repo_id.clone()),
+                at: second_at,
+                kind: EventKind::TaskCreated,
+            })
+            .expect("append task a event 1");
+        store
+            .append_event(&Event {
+                id: EventId("E-EVENT-B-1".to_string()),
+                task_id: Some(task_b.id.clone()),
+                repo_id: Some(task_b.repo_id.clone()),
+                at: first_at,
+                kind: EventKind::TaskCreated,
+            })
+            .expect("append task b event");
+        store
+            .append_event(&Event {
+                id: EventId("E-EVENT-A-2".to_string()),
+                task_id: Some(task_a.id.clone()),
+                repo_id: Some(task_a.repo_id.clone()),
+                at: third_at,
+                kind: EventKind::VerifyStarted,
+            })
+            .expect("append task a event 2");
+
+        let events = store
+            .list_events_for_task(task_a.id.0.as_str())
+            .expect("list task events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id.0, "E-EVENT-A-1");
+        assert_eq!(events[1].id.0, "E-EVENT-A-2");
     }
 
     #[test]
