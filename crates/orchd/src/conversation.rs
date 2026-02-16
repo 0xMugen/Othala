@@ -30,7 +30,7 @@ pub struct ToolResult {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub id: String,
     pub role: MessageRole,
@@ -43,7 +43,7 @@ pub struct ConversationMessage {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
     pub task_id: String,
