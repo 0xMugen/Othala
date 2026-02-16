@@ -16,7 +16,7 @@ pub struct QATestDisplay {
 }
 
 /// Task overview row for the TUI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOverviewRow {
     pub task_id: TaskId,
     pub repo_id: RepoId,
@@ -38,6 +38,12 @@ pub struct TaskOverviewRow {
     /// Task-specific acceptance targets (what the QA hopes for).
     #[serde(default)]
     pub qa_targets: Vec<String>,
+    #[serde(default)]
+    pub estimated_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 impl TaskOverviewRow {
@@ -67,6 +73,9 @@ impl TaskOverviewRow {
             qa_status: None,
             qa_tests: Vec::new(),
             qa_targets: Vec::new(),
+            estimated_tokens: None,
+            estimated_cost_usd: None,
+            retry_count: task.retry_count,
         }
     }
 }
@@ -281,10 +290,21 @@ fn strip_terminal_sequences(input: &str) -> String {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelHealthDisplay {
+    pub model: String,
+    pub healthy: bool,
+    pub recent_failures: u32,
+    pub cooldown_until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
     pub panes: Vec<AgentPane>,
+    pub model_health: Vec<ModelHealthDisplay>,
+    pub filter_text: Option<String>,
+    pub filter_state: Option<TaskState>,
     pub selected_task_activity: Vec<String>,
     pub selected_task_idx: usize,
     pub selected_pane_idx: usize,
@@ -302,6 +322,9 @@ impl Default for DashboardState {
         Self {
             tasks: Vec::new(),
             panes: Vec::new(),
+            model_health: Vec::new(),
+            filter_text: None,
+            filter_state: None,
             selected_task_activity: Vec::new(),
             selected_task_idx: 0,
             selected_pane_idx: 0,
@@ -335,25 +358,113 @@ impl DashboardState {
         self.panes.get_mut(self.selected_pane_idx)
     }
 
-    pub fn move_task_selection_next(&mut self) {
+    pub fn filtered_tasks(&self) -> Vec<usize> {
+        let text_filter = self
+            .filter_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| {
+                let state_matches = match self.filter_state {
+                    Some(state) => task.state == state,
+                    None => true,
+                };
+                if !state_matches {
+                    return false;
+                }
+
+                match &text_filter {
+                    Some(query) => {
+                        task.title.to_lowercase().contains(query)
+                            || task.task_id.0.to_lowercase().contains(query)
+                    }
+                    None => true,
+                }
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn active_filter_label(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(state) = self.filter_state {
+            parts.push(format!("state={state:?}"));
+        }
+        if let Some(text) = self
+            .filter_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("text={text}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+
+    pub fn ensure_selected_task_visible(&mut self) {
         if self.tasks.is_empty() {
             self.selected_task_idx = 0;
             return;
         }
-        self.selected_task_idx = (self.selected_task_idx + 1) % self.tasks.len();
+
+        if self.selected_task_idx >= self.tasks.len() {
+            self.selected_task_idx = self.tasks.len().saturating_sub(1);
+        }
+
+        let filtered = self.filtered_tasks();
+        if filtered.is_empty() {
+            self.selected_task_idx = 0;
+            return;
+        }
+
+        if !filtered.contains(&self.selected_task_idx) {
+            self.selected_task_idx = filtered[0];
+        }
+
+        self.snap_pane_to_task();
+    }
+
+    pub fn move_task_selection_next(&mut self) {
+        let filtered = self.filtered_tasks();
+        if filtered.is_empty() {
+            self.selected_task_idx = 0;
+            return;
+        }
+
+        if let Some(position) = filtered.iter().position(|idx| *idx == self.selected_task_idx) {
+            let next_pos = (position + 1) % filtered.len();
+            self.selected_task_idx = filtered[next_pos];
+        } else {
+            self.selected_task_idx = filtered[0];
+        }
         self.snap_pane_to_task();
     }
 
     pub fn move_task_selection_previous(&mut self) {
-        if self.tasks.is_empty() {
+        let filtered = self.filtered_tasks();
+        if filtered.is_empty() {
             self.selected_task_idx = 0;
             return;
         }
-        self.selected_task_idx = if self.selected_task_idx == 0 {
-            self.tasks.len() - 1
+
+        if let Some(position) = filtered.iter().position(|idx| *idx == self.selected_task_idx) {
+            self.selected_task_idx = if position == 0 {
+                filtered[filtered.len() - 1]
+            } else {
+                filtered[position - 1]
+            };
         } else {
-            self.selected_task_idx - 1
-        };
+            self.selected_task_idx = filtered[0];
+        }
         self.snap_pane_to_task();
     }
 
@@ -574,12 +685,35 @@ mod tests {
         )
     }
 
+    fn mk_row(id: &str, title: &str, state: TaskState) -> TaskOverviewRow {
+        let mut task = mk_task(id);
+        task.state = state;
+        task.title = title.to_string();
+        TaskOverviewRow::from_task(&task)
+    }
+
     #[test]
     fn task_overview_row_from_task() {
         let task = mk_task("T1");
         let row = TaskOverviewRow::from_task(&task);
         assert_eq!(row.task_id.0, "T1");
         assert_eq!(row.display_state, "Chatting");
+        assert_eq!(row.retry_count, 0);
+    }
+
+    #[test]
+    fn task_row_with_cost() {
+        let mut row = TaskOverviewRow::from_task(&mk_task("T9"));
+        row.estimated_tokens = Some(40_000);
+        row.estimated_cost_usd = Some(0.12);
+        assert_eq!(row.estimated_tokens, Some(40_000));
+        assert_eq!(row.estimated_cost_usd, Some(0.12));
+    }
+
+    #[test]
+    fn dashboard_model_health_default() {
+        let state = DashboardState::default();
+        assert!(state.model_health.is_empty());
     }
 
     #[test]
@@ -590,6 +724,65 @@ mod tests {
         };
         let row = TaskOverviewRow::from_task(&task);
         assert_eq!(row.display_state, "VerifyFail");
+    }
+
+    #[test]
+    fn filter_by_text_matches_title() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Implement OAuth login", TaskState::Chatting),
+                mk_row("T2", "Fix panic on submit", TaskState::Ready),
+            ],
+            filter_text: Some("oauth".to_string()),
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.filtered_tasks(), vec![0]);
+    }
+
+    #[test]
+    fn filter_by_text_matches_id_case_insensitive() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T100", "Implement OAuth login", TaskState::Chatting),
+                mk_row("T200", "Fix panic on submit", TaskState::Ready),
+            ],
+            filter_text: Some("t100".to_string()),
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.filtered_tasks(), vec![0]);
+    }
+
+    #[test]
+    fn filter_by_state() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Implement OAuth login", TaskState::Chatting),
+                mk_row("T2", "Fix panic on submit", TaskState::Ready),
+                mk_row("T3", "Wire merge checks", TaskState::Ready),
+            ],
+            filter_state: Some(TaskState::Ready),
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.filtered_tasks(), vec![1, 2]);
+    }
+
+    #[test]
+    fn combined_filter() {
+        let state = DashboardState {
+            tasks: vec![
+                mk_row("T1", "Implement OAuth login", TaskState::Ready),
+                mk_row("T2", "OAuth UX polish", TaskState::Chatting),
+                mk_row("T3", "Merge queue checks", TaskState::Ready),
+            ],
+            filter_text: Some("oauth".to_string()),
+            filter_state: Some(TaskState::Ready),
+            ..DashboardState::default()
+        };
+
+        assert_eq!(state.filtered_tasks(), vec![0]);
     }
 
     #[test]

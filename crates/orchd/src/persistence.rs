@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{Task, TaskId};
+use orch_core::types::{Task, TaskId, TaskPriority};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
     repo_id TEXT NOT NULL,
     state_tag TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal',
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -99,6 +100,45 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at);
 "#,
         )?;
+
+        if let Err(err) = self.conn.execute(
+            "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+            [],
+        ) {
+            if !matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name: priority")
+            ) {
+                return Err(err.into());
+            }
+        }
+
+        if let Err(err) = self.conn.execute(
+            "ALTER TABLE runs ADD COLUMN estimated_tokens INTEGER DEFAULT NULL",
+            [],
+        ) {
+            if !matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name: estimated_tokens")
+            ) {
+                return Err(err.into());
+            }
+        }
+
+        if let Err(err) = self.conn.execute(
+            "ALTER TABLE runs ADD COLUMN duration_secs REAL DEFAULT NULL",
+            [],
+        ) {
+            if !matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name: duration_secs")
+            ) {
+                return Err(err.into());
+            }
+        }
         Ok(())
     }
 
@@ -108,11 +148,12 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at);
         let payload = serde_json::to_string(task)?;
         self.conn.execute(
             r#"
-INSERT INTO tasks (task_id, repo_id, state_tag, payload_json, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+INSERT INTO tasks (task_id, repo_id, state_tag, priority, payload_json, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT(task_id) DO UPDATE SET
   repo_id = excluded.repo_id,
   state_tag = excluded.state_tag,
+  priority = excluded.priority,
   payload_json = excluded.payload_json,
   updated_at = excluded.updated_at
 "#,
@@ -120,6 +161,7 @@ ON CONFLICT(task_id) DO UPDATE SET
                 task.id.0,
                 task.repo_id.0,
                 task_state_tag(task.state),
+                task.priority.as_str(),
                 payload,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
@@ -129,29 +171,36 @@ ON CONFLICT(task_id) DO UPDATE SET
     }
 
     pub fn load_task(&self, task_id: &TaskId) -> Result<Option<Task>, PersistenceError> {
-        let payload: Option<String> = self
+        let row: Option<(String, String)> = self
             .conn
             .query_row(
-                "SELECT payload_json FROM tasks WHERE task_id = ?1",
+                "SELECT payload_json, priority FROM tasks WHERE task_id = ?1",
                 params![task_id.0],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        payload
-            .map(|value| serde_json::from_str::<Task>(&value))
-            .transpose()
-            .map_err(PersistenceError::from)
+        row.map(|(payload, priority)| {
+            let mut task = serde_json::from_str::<Task>(&payload)?;
+            task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            Ok::<Task, serde_json::Error>(task)
+        })
+        .transpose()
+        .map_err(PersistenceError::from)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>, PersistenceError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT payload_json FROM tasks ORDER BY updated_at DESC, task_id ASC")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            .prepare("SELECT payload_json, priority FROM tasks ORDER BY updated_at DESC, task_id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let payload = row?;
-            tasks.push(serde_json::from_str::<Task>(&payload)?);
+            let (payload, priority) = row?;
+            let mut task = serde_json::from_str::<Task>(&payload)?;
+            task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            tasks.push(task);
         }
         Ok(tasks)
     }
@@ -178,15 +227,17 @@ ON CONFLICT(task_id) DO UPDATE SET
 
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<Task>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT payload_json FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
+            "SELECT payload_json, priority FROM tasks WHERE state_tag = ?1 ORDER BY updated_at DESC, task_id ASC",
         )?;
         let rows = stmt.query_map(params![task_state_tag(state)], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let payload = row?;
-            tasks.push(serde_json::from_str::<Task>(&payload)?);
+            let (payload, priority) = row?;
+            let mut task = serde_json::from_str::<Task>(&payload)?;
+            task.priority = priority.parse::<TaskPriority>().unwrap_or_default();
+            tasks.push(task);
         }
         Ok(tasks)
     }
@@ -244,8 +295,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         let payload = serde_json::to_string(run)?;
         self.conn.execute(
             r#"
-INSERT INTO runs (run_id, task_id, model, started_at, finished_at, stop_reason, exit_code, payload_json)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+INSERT INTO runs (run_id, task_id, model, started_at, finished_at, stop_reason, exit_code, estimated_tokens, duration_secs, payload_json)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 "#,
             params![
                 run.run_id,
@@ -255,10 +306,28 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 run.finished_at.map(|value| value.to_rfc3339()),
                 run.stop_reason,
                 run.exit_code,
+                run.estimated_tokens,
+                run.duration_secs,
                 payload
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_open_run_estimated_tokens(
+        &self,
+        task_id: &TaskId,
+        estimated_tokens: u64,
+    ) -> Result<usize, PersistenceError> {
+        let updated = self.conn.execute(
+            r#"
+UPDATE runs
+SET estimated_tokens = ?1
+WHERE task_id = ?2 AND finished_at IS NULL
+"#,
+            params![estimated_tokens, task_id.0],
+        )?;
+        Ok(updated)
     }
 
     pub fn finish_open_runs_for_task(
@@ -267,27 +336,50 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         finished_at: DateTime<Utc>,
         stop_reason: &str,
         exit_code: Option<i32>,
+        duration_secs: Option<f64>,
     ) -> Result<usize, PersistenceError> {
         let updated = self.conn.execute(
             r#"
 UPDATE runs
-SET finished_at = ?1, stop_reason = ?2, exit_code = ?3
-WHERE task_id = ?4 AND finished_at IS NULL
+SET finished_at = ?1, stop_reason = ?2, exit_code = ?3, duration_secs = ?4
+WHERE task_id = ?5 AND finished_at IS NULL
 "#,
-            params![finished_at.to_rfc3339(), stop_reason, exit_code, task_id.0],
+            params![
+                finished_at.to_rfc3339(),
+                stop_reason,
+                exit_code,
+                duration_secs,
+                task_id.0
+            ],
         )?;
         Ok(updated)
     }
 
     pub fn list_open_runs(&self) -> Result<Vec<TaskRunRecord>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT payload_json FROM runs WHERE finished_at IS NULL ORDER BY started_at ASC, run_id ASC",
+            "SELECT payload_json, finished_at, stop_reason, exit_code, estimated_tokens, duration_secs FROM runs WHERE finished_at IS NULL ORDER BY started_at ASC, run_id ASC",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i32>>(3)?,
+                row.get::<_, Option<u64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
         let mut runs = Vec::new();
         for row in rows {
-            let payload = row?;
-            runs.push(serde_json::from_str::<TaskRunRecord>(&payload)?);
+            let (payload, finished_at, stop_reason, exit_code, estimated_tokens, duration_secs) =
+                row?;
+            let mut run = serde_json::from_str::<TaskRunRecord>(&payload)?;
+            run.finished_at = parse_optional_rfc3339(finished_at)?;
+            run.stop_reason = stop_reason;
+            run.exit_code = exit_code;
+            run.estimated_tokens = estimated_tokens.or(run.estimated_tokens);
+            run.duration_secs = duration_secs.or(run.duration_secs);
+            runs.push(run);
         }
         Ok(runs)
     }
@@ -297,13 +389,29 @@ WHERE task_id = ?4 AND finished_at IS NULL
         task_id: &TaskId,
     ) -> Result<Vec<TaskRunRecord>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT payload_json FROM runs WHERE task_id = ?1 ORDER BY started_at ASC, run_id ASC",
+            "SELECT payload_json, finished_at, stop_reason, exit_code, estimated_tokens, duration_secs FROM runs WHERE task_id = ?1 ORDER BY started_at ASC, run_id ASC",
         )?;
-        let rows = stmt.query_map(params![task_id.0], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![task_id.0], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i32>>(3)?,
+                row.get::<_, Option<u64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
         let mut runs = Vec::new();
         for row in rows {
-            let payload = row?;
-            runs.push(serde_json::from_str::<TaskRunRecord>(&payload)?);
+            let (payload, finished_at, stop_reason, exit_code, estimated_tokens, duration_secs) =
+                row?;
+            let mut run = serde_json::from_str::<TaskRunRecord>(&payload)?;
+            run.finished_at = parse_optional_rfc3339(finished_at)?;
+            run.stop_reason = stop_reason;
+            run.exit_code = exit_code;
+            run.estimated_tokens = estimated_tokens.or(run.estimated_tokens);
+            run.duration_secs = duration_secs.or(run.duration_secs);
+            runs.push(run);
         }
         Ok(runs)
     }
@@ -365,6 +473,18 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     }
 }
 
+fn parse_optional_rfc3339(
+    value: Option<String>,
+) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+    value
+        .map(|raw| {
+            DateTime::parse_from_rfc3339(&raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|source| PersistenceError::TimestampParse { value: raw, source })
+        })
+        .transpose()
+}
+
 fn event_kind_tag(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::TaskCreated => "task_created",
@@ -399,7 +519,7 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use orch_core::types::{EventId, ModelKind, RepoId};
+    use orch_core::types::{EventId, ModelKind, RepoId, TaskPriority};
     use std::path::PathBuf;
 
     fn mk_store() -> SqliteStore {
@@ -495,6 +615,18 @@ mod tests {
     }
 
     #[test]
+    fn upsert_and_load_task_priority_round_trips() {
+        let store = mk_store();
+        let mut task = mk_task("TP1", TaskState::Chatting);
+        task.priority = TaskPriority::Critical;
+
+        store.upsert_task(&task).expect("upsert");
+        let loaded = store.load_task(&task.id).expect("load").expect("exists");
+
+        assert_eq!(loaded.priority, TaskPriority::Critical);
+    }
+
+    #[test]
     fn insert_and_list_open_runs() {
         let store = mk_store();
         let run = TaskRunRecord {
@@ -506,6 +638,8 @@ mod tests {
             finished_at: None,
             stop_reason: None,
             exit_code: None,
+            estimated_tokens: Some(42),
+            duration_secs: None,
         };
 
         store.insert_run(&run).expect("insert");
@@ -526,15 +660,52 @@ mod tests {
             finished_at: None,
             stop_reason: None,
             exit_code: None,
+            estimated_tokens: Some(88),
+            duration_secs: None,
         };
 
         store.insert_run(&run).expect("insert");
         let updated = store
-            .finish_open_runs_for_task(&TaskId("T1".to_string()), Utc::now(), "completed", Some(0))
+            .finish_open_runs_for_task(
+                &TaskId("T1".to_string()),
+                Utc::now(),
+                "completed",
+                Some(0),
+                Some(4.5),
+            )
             .expect("finish");
         assert_eq!(updated, 1);
 
         let runs = store.list_open_runs().expect("list");
         assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn set_open_run_estimated_tokens_updates_open_rows() {
+        let store = mk_store();
+        let run = TaskRunRecord {
+            run_id: "R2".to_string(),
+            task_id: TaskId("T2".to_string()),
+            repo_id: RepoId("example".to_string()),
+            model: ModelKind::Codex,
+            started_at: Utc::now(),
+            finished_at: None,
+            stop_reason: None,
+            exit_code: None,
+            estimated_tokens: None,
+            duration_secs: None,
+        };
+
+        store.insert_run(&run).expect("insert");
+        let updated = store
+            .set_open_run_estimated_tokens(&TaskId("T2".to_string()), 777)
+            .expect("update");
+        assert_eq!(updated, 1);
+
+        let runs = store
+            .list_runs_for_task(&TaskId("T2".to_string()))
+            .expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].estimated_tokens, Some(777));
     }
 }

@@ -1,7 +1,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::app::TuiApp;
+use crate::app::{InputMode, TuiApp};
+use crate::model::ModelHealthDisplay;
 use crate::ui_activity::footer_activity_indicator;
 use crate::ui_format::status_line_color;
 
@@ -21,13 +22,14 @@ pub(crate) struct FooterContent {
 }
 
 pub(crate) fn footer_height(app: &TuiApp, width: u16) -> u16 {
+    let model_health_lines = if app.state.model_health.is_empty() { 0 } else { 1 };
     // When in focused view with ChatInput, the inline box handles display
     let in_focused = app.state.focused_task || app.state.focused_pane_idx.is_some();
     if in_focused && app.chat_input_display().is_some() {
-        return FOOTER_DEFAULT_HEIGHT;
+        return FOOTER_DEFAULT_HEIGHT + model_health_lines;
     }
     let Some(prompt) = app.input_prompt() else {
-        return FOOTER_DEFAULT_HEIGHT;
+        return FOOTER_DEFAULT_HEIGHT + model_health_lines;
     };
     let content_width = width.saturating_sub(2).max(1);
     let prompt_visual_lines = wrapped_visual_line_count(prompt, content_width.saturating_sub(1));
@@ -38,7 +40,7 @@ pub(crate) fn footer_height(app: &TuiApp, width: u16) -> u16 {
     let total_height = prompt_visual_lines
         .saturating_add(controls_visual_lines)
         .saturating_add(3);
-    u16::try_from(total_height)
+    u16::try_from(total_height.saturating_add(model_health_lines as usize))
         .unwrap_or(FOOTER_PROMPT_MAX_HEIGHT)
         .clamp(FOOTER_PROMPT_MIN_HEIGHT, FOOTER_PROMPT_MAX_HEIGHT)
 }
@@ -129,10 +131,10 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
                 Style::default().fg(DIM),
             )));
             return FooterContent {
-                title: if app.chat_input_display().is_some() {
-                    "Chat Input"
-                } else {
-                    "New Chat"
+                title: match &app.input_mode {
+                    InputMode::ChatInput { .. } => "Chat Input",
+                    InputMode::FilterInput { .. } => "Filter",
+                    _ => "New Chat",
                 },
                 lines,
                 wrap_trim: false,
@@ -153,6 +155,8 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
         ("d", "delete"),
         ("q", "quick"),
         ("f", "full"),
+        ("/", "filter"),
+        ("F", "state-filter"),
         ("t", "restack/submit"),
         ("n", "human"),
         ("w", "web"),
@@ -197,9 +201,134 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
         ));
     }
 
+    let mut lines = vec![Line::from(spans)];
+    if !app.state.model_health.is_empty() {
+        lines.push(model_health_line(&app.state.model_health));
+    }
+
     FooterContent {
         title: "Actions",
-        lines: vec![Line::from(spans)],
+        lines,
         wrap_trim: true,
+    }
+}
+
+fn model_health_line(model_health: &[ModelHealthDisplay]) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" Models: ", Style::default().fg(DIM)),
+    ];
+
+    for (idx, entry) in model_health.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let symbol = if entry.healthy { "✓" } else { "✗" };
+        let color = if entry.healthy {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        spans.push(Span::styled(
+            format!("{}:{symbol}", entry.model),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use crate::model::ModelHealthDisplay;
+    use crate::TuiApp;
+
+    use super::build_footer_content;
+
+    #[test]
+    fn model_health_all_healthy() {
+        let mut app = TuiApp::default();
+        app.state.model_health = vec![
+            ModelHealthDisplay {
+                model: "claude".to_string(),
+                healthy: true,
+                recent_failures: 0,
+                cooldown_until: None,
+            },
+            ModelHealthDisplay {
+                model: "codex".to_string(),
+                healthy: true,
+                recent_failures: 0,
+                cooldown_until: None,
+            },
+            ModelHealthDisplay {
+                model: "gemini".to_string(),
+                healthy: true,
+                recent_failures: 0,
+                cooldown_until: None,
+            },
+        ];
+
+        let content = build_footer_content(&app);
+        let text: String = content
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+
+        assert!(text.contains("Models: claude:✓ codex:✓ gemini:✓"));
+        for line in &content.lines {
+            for span in &line.spans {
+                let content = span.content.as_ref();
+                if content.contains("claude:✓")
+                    || content.contains("codex:✓")
+                    || content.contains("gemini:✓")
+                {
+                    assert_eq!(span.style.fg, Some(Color::Green));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_health_mixed() {
+        let mut app = TuiApp::default();
+        app.state.model_health = vec![
+            ModelHealthDisplay {
+                model: "claude".to_string(),
+                healthy: true,
+                recent_failures: 0,
+                cooldown_until: None,
+            },
+            ModelHealthDisplay {
+                model: "codex".to_string(),
+                healthy: true,
+                recent_failures: 0,
+                cooldown_until: None,
+            },
+            ModelHealthDisplay {
+                model: "gemini".to_string(),
+                healthy: false,
+                recent_failures: 2,
+                cooldown_until: Some("2026-02-09T12:00:00Z".to_string()),
+            },
+        ];
+
+        let content = build_footer_content(&app);
+        let text: String = content
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(text.contains("Models: claude:✓ codex:✓ gemini:✗"));
+
+        let gemini_span = content
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("gemini:✗"))
+            .expect("gemini health span");
+        assert_eq!(gemini_span.style.fg, Some(Color::Red));
     }
 }

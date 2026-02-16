@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, SubmitMode, Task, TaskId};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::dependency_graph::{build_dependency_graph, restack_descendants_for_parent};
@@ -83,6 +84,11 @@ impl OrchdService {
     pub fn create_task(&self, task: &Task, created_event: &Event) -> Result<(), ServiceError> {
         self.store.upsert_task(task)?;
         self.record_event(created_event)?;
+        Ok(())
+    }
+
+    pub fn upsert_task(&self, task: &Task) -> Result<(), ServiceError> {
+        self.store.upsert_task(task)?;
         Ok(())
     }
 
@@ -342,6 +348,13 @@ impl OrchdService {
             });
         }
 
+        let all_task_states = self
+            .store
+            .list_tasks()?
+            .into_iter()
+            .map(|task| (task.id, task.state))
+            .collect::<HashMap<_, _>>();
+
         let running = self
             .store
             .list_open_runs()?
@@ -358,8 +371,9 @@ impl OrchdService {
             .map(|task| QueuedTask {
                 task_id: task.id.clone(),
                 repo_id: task.repo_id.clone(),
+                depends_on: task.depends_on.clone(),
                 preferred_model: task.preferred_model,
-                priority: 0,
+                priority: task.priority,
                 enqueued_at: task.created_at,
             })
             .collect::<Vec<_>>();
@@ -367,6 +381,7 @@ impl OrchdService {
         let plan = self.scheduler.plan(SchedulingInput {
             queued,
             running,
+            all_task_states,
             enabled_models: enabled_models.to_vec(),
             availability: availability.to_vec(),
         });
@@ -387,6 +402,8 @@ impl OrchdService {
                 finished_at: None,
                 stop_reason: None,
                 exit_code: None,
+                estimated_tokens: None,
+                duration_secs: None,
             };
             self.store.insert_run(&run)?;
         }

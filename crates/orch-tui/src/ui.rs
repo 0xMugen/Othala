@@ -3,11 +3,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use orch_core::types::ModelKind;
 
 use crate::app::{InputMode, TuiApp};
 use crate::chat_parse;
 use crate::chat_render;
-use crate::model::{AgentPane, PaneCategory};
+use crate::model::{AgentPane, PaneCategory, TaskOverviewRow};
 use crate::output_style::stylize_output_lines;
 use crate::ui_activity::pane_activity_indicator;
 #[cfg(test)]
@@ -30,6 +31,53 @@ const DIM: Color = Color::DarkGray;
 const MUTED: Color = Color::Gray;
 const BORDER_NORMAL: Color = Color::DarkGray;
 const BORDER_FOCUSED: Color = Color::Cyan;
+
+fn model_rate_per_token(model: ModelKind) -> f64 {
+    match model {
+        ModelKind::Claude => 3.0 / 1_000_000.0,
+        ModelKind::Codex => 2.0 / 1_000_000.0,
+        ModelKind::Gemini => 0.5 / 1_000_000.0,
+    }
+}
+
+fn estimate_task_cost_usd(task: &TaskOverviewRow, model: Option<ModelKind>) -> Option<f64> {
+    task.estimated_cost_usd.or_else(|| {
+        let tokens = task.estimated_tokens?;
+        let model = model?;
+        Some((tokens as f64) * model_rate_per_token(model))
+    })
+}
+
+fn format_cost_display(cost: Option<f64>) -> String {
+    match cost {
+        Some(value) => format!("${value:.2}"),
+        None => "-".to_string(),
+    }
+}
+
+fn format_with_commas(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn task_cost_summary(task: &TaskOverviewRow, model: Option<ModelKind>) -> String {
+    let tokens = task
+        .estimated_tokens
+        .map(|value| format!("~{}", format_with_commas(value)))
+        .unwrap_or_else(|| "-".to_string());
+    let cost = format_cost_display(estimate_task_cost_usd(task, model));
+    format!(
+        "Tokens: {tokens} | Est. Cost: {cost} | Retries: {}",
+        task.retry_count
+    )
+}
 
 fn normal_block(title: &str) -> Block<'_> {
     Block::default()
@@ -143,10 +191,11 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
+    let filtered_task_indices = app.state.filtered_tasks();
 
     let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
-        " repo | task | title | state | verify | activity",
+        " repo | task | title | state | verify | cost | activity",
         header_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -156,9 +205,18 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Style::default().fg(DIM),
     )));
 
-    for (idx, task) in app.state.tasks.iter().enumerate() {
-        let is_selected = idx == app.state.selected_task_idx;
-        lines.push(format_task_row(is_selected, task));
+    for idx in &filtered_task_indices {
+        let task = &app.state.tasks[*idx];
+        let is_selected = *idx == app.state.selected_task_idx;
+        let task_model = app
+            .state
+            .panes
+            .iter()
+            .rev()
+            .find(|pane| pane.task_id == task.task_id)
+            .map(|pane| pane.model);
+        let cost = format_cost_display(estimate_task_cost_usd(task, task_model));
+        lines.push(format_task_row(is_selected, task, cost));
     }
 
     if app.state.tasks.is_empty() {
@@ -166,10 +224,20 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             " no tasks",
             Style::default().fg(DIM),
         )));
+    } else if filtered_task_indices.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no matching tasks",
+            Style::default().fg(DIM),
+        )));
     }
 
+    let title = match app.state.active_filter_label() {
+        Some(label) => format!("Tasks [Filter: {label}]"),
+        None => "Tasks".to_string(),
+    };
+
     let widget = Paragraph::new(lines)
-        .block(normal_block("Tasks"))
+        .block(normal_block(&title))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -387,10 +455,24 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Left: task status checklist
     let status_title = format!("Status ({task_id_str})");
-    let status_widget = Paragraph::new(status_sidebar_lines(
-        selected_task,
-        &app.state.selected_task_activity,
-    ))
+    let mut status_lines = status_sidebar_lines(selected_task, &app.state.selected_task_activity);
+    if let Some(task) = selected_task {
+        let model_hint = task_pane
+            .map(|pane| pane.model)
+            .or_else(|| {
+                app.state
+                    .panes
+                    .iter()
+                    .rev()
+                    .find(|pane| pane.task_id == task.task_id)
+                    .map(|pane| pane.model)
+            });
+        status_lines.push(Line::from(""));
+        status_lines.push(Line::from(vec![
+            Span::styled(task_cost_summary(task, model_hint), Style::default().fg(MUTED)),
+        ]));
+    }
+    let status_widget = Paragraph::new(status_lines)
     .block(focused_block(&status_title))
     .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
@@ -514,6 +596,8 @@ fn render_help_overlay(frame: &mut Frame<'_>) {
         ("Left/Right", "Navigate panes"),
         ("Tab", "Toggle focus"),
         ("Enter", "Toggle task detail"),
+        ("/", "Filter text"),
+        ("F", "Cycle state filter"),
         ("c", "Create task"),
         ("a", "Approve task"),
         ("g", "Submit to Graphite"),
@@ -601,8 +685,9 @@ mod tests {
     use crate::TuiApp;
 
     use super::{
-        footer_height, format_pane_tabs, format_task_row, pane_status_tag, status_activity,
-        status_line_color, status_sidebar_lines, to_local_time, wrapped_visual_line_count,
+        footer_height, format_cost_display, format_pane_tabs, format_task_row, pane_status_tag,
+        status_activity, status_line_color, status_sidebar_lines, to_local_time,
+        wrapped_visual_line_count,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -619,6 +704,9 @@ mod tests {
             qa_status: None,
             qa_tests: Vec::new(),
             qa_targets: Vec::new(),
+            estimated_tokens: None,
+            estimated_cost_usd: None,
+            retry_count: 0,
         }
     }
 
@@ -670,7 +758,7 @@ mod tests {
     #[test]
     fn format_task_row_includes_expected_columns() {
         let row = mk_row("T9");
-        let line = format_task_row(true, &row);
+        let line = format_task_row(true, &row, "$0.12".to_string());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         let expected_ts = to_local_time(row.last_activity);
 
@@ -679,7 +767,23 @@ mod tests {
         assert!(text.contains("Title for T9"));
         assert!(text.contains("Chatting"));
         assert!(text.contains("not_run"));
+        assert!(text.contains("$0.12"));
         assert!(text.contains(&expected_ts));
+    }
+
+    #[test]
+    fn cost_display_formatting() {
+        let mut row = mk_row("T1");
+        row.estimated_tokens = Some(60_000);
+        let cost = estimate_task_cost_usd(&row, Some(ModelKind::Codex));
+        assert_eq!(format_cost_display(cost), "$0.12");
+    }
+
+    #[test]
+    fn cost_display_unknown() {
+        let row = mk_row("T1");
+        let cost = estimate_task_cost_usd(&row, Some(ModelKind::Claude));
+        assert_eq!(format_cost_display(cost), "-");
     }
 
     #[test]

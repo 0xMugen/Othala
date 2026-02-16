@@ -6,6 +6,51 @@ use std::path::PathBuf;
 
 use crate::state::{TaskState, VerifyStatus};
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Critical,
+}
+
+impl TaskPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskPriority::Low => "low",
+            TaskPriority::Normal => "normal",
+            TaskPriority::High => "high",
+            TaskPriority::Critical => "critical",
+        }
+    }
+}
+
+impl std::str::FromStr for TaskPriority {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_lowercase().as_str() {
+            "low" => Ok(TaskPriority::Low),
+            "normal" => Ok(TaskPriority::Normal),
+            "high" => Ok(TaskPriority::High),
+            "critical" => Ok(TaskPriority::Critical),
+            other => Err(format!(
+                "invalid task priority '{other}'. valid values: low, normal, high, critical"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
@@ -130,6 +175,8 @@ pub struct Task {
     pub title: String,
     pub state: TaskState,
     pub preferred_model: Option<ModelKind>,
+    #[serde(default)]
+    pub priority: TaskPriority,
     pub depends_on: Vec<TaskId>,
     pub submit_mode: SubmitMode,
     pub branch_name: Option<String>,
@@ -179,6 +226,7 @@ impl Task {
             title,
             state: TaskState::Chatting,
             preferred_model: None,
+            priority: TaskPriority::default(),
             depends_on: Vec::new(),
             submit_mode: SubmitMode::Single,
             branch_name: None,
@@ -326,5 +374,36 @@ preferred_model = "codex"
     fn model_kind_serializes_as_snake_case() {
         let json = serde_json::to_string(&ModelKind::Claude).unwrap();
         assert_eq!(json, "\"claude\"");
+    }
+
+    #[test]
+    fn task_priority_defaults_to_normal() {
+        let task = Task::new(
+            TaskId::new("T1"),
+            RepoId("repo".to_string()),
+            "Test".to_string(),
+            PathBuf::from(".orch/wt/T1"),
+        );
+        assert_eq!(task.priority, TaskPriority::Normal);
+    }
+
+    #[test]
+    fn task_priority_orders_critical_first_when_sorted_desc() {
+        let mut values = [
+            TaskPriority::Low,
+            TaskPriority::Critical,
+            TaskPriority::Normal,
+            TaskPriority::High,
+        ];
+        values.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            values,
+            [
+                TaskPriority::Critical,
+                TaskPriority::High,
+                TaskPriority::Normal,
+                TaskPriority::Low
+            ]
+        );
     }
 }

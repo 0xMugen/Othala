@@ -57,6 +57,7 @@ pub fn load_context_graph(repo_root: &Path, config: &ContextLoadConfig) -> Optio
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
     let mut nodes: Vec<ContextNode> = Vec::new();
     let mut total_chars: usize = 0;
+    let mut cycle_count: usize = 0;
 
     // Normalise entry to a repo-relative path for the visited set.
     let entry_rel = PathBuf::from(".othala/context/MAIN.md");
@@ -118,11 +119,14 @@ pub fn load_context_graph(repo_root: &Path, config: &ContextLoadConfig) -> Optio
                 .unwrap_or_else(|_| normalise_path(&link_abs));
 
             if visited.contains(&link_canonical) {
-                eprintln!(
-                    "warning: cycle detected in context graph: {} -> {}",
-                    rel_path.display(),
-                    link.display()
-                );
+                cycle_count += 1;
+                if cycle_count <= 3 {
+                    eprintln!(
+                        "warning: cycle detected in context graph: {} -> {}",
+                        rel_path.display(),
+                        link.display()
+                    );
+                }
                 continue;
             }
 
@@ -136,6 +140,13 @@ pub fn load_context_graph(repo_root: &Path, config: &ContextLoadConfig) -> Optio
             links,
             source_refs,
         });
+    }
+
+    if cycle_count > 3 {
+        eprintln!(
+            "warning: {} additional cycle(s) suppressed in context graph",
+            cycle_count - 3
+        );
     }
 
     Some(ContextGraph { nodes, total_chars })
