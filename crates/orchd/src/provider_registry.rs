@@ -75,6 +75,26 @@ impl ModelRegistry {
                 models: Vec::new(),
             },
         );
+        registry.providers.insert(
+            "xai".to_string(),
+            ProviderInfo {
+                name: "xai".to_string(),
+                display_name: "xAI".to_string(),
+                api_base: "https://api.x.ai/v1".to_string(),
+                auth_env_var: "XAI_API_KEY".to_string(),
+                models: Vec::new(),
+            },
+        );
+        registry.providers.insert(
+            "openrouter".to_string(),
+            ProviderInfo {
+                name: "openrouter".to_string(),
+                display_name: "OpenRouter".to_string(),
+                api_base: "https://openrouter.ai/api/v1".to_string(),
+                auth_env_var: "OPENROUTER_API_KEY".to_string(),
+                models: Vec::new(),
+            },
+        );
 
         registry.insert_model(ModelInfo {
             id: "claude-sonnet-4-20250514".to_string(),
@@ -149,6 +169,71 @@ impl ModelRegistry {
             max_output_tokens: 65_536,
             input_price_per_mtok: 0.15,
             output_price_per_mtok: 0.60,
+            supports_images: true,
+            supports_tools: true,
+            supports_streaming: true,
+            deprecated: false,
+        });
+        registry.insert_model(ModelInfo {
+            id: "grok-3-beta".to_string(),
+            provider: "xai".to_string(),
+            display_name: "Grok 3 Beta".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_price_per_mtok: 3.0,
+            output_price_per_mtok: 15.0,
+            supports_images: true,
+            supports_tools: true,
+            supports_streaming: true,
+            deprecated: false,
+        });
+        registry.insert_model(ModelInfo {
+            id: "grok-3-mini-fast-beta".to_string(),
+            provider: "xai".to_string(),
+            display_name: "Grok 3 Mini Fast Beta".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_price_per_mtok: 0.30,
+            output_price_per_mtok: 0.50,
+            supports_images: false,
+            supports_tools: true,
+            supports_streaming: true,
+            deprecated: false,
+        });
+        registry.insert_model(ModelInfo {
+            id: "openrouter/auto".to_string(),
+            provider: "openrouter".to_string(),
+            display_name: "OpenRouter Auto".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            input_price_per_mtok: 0.0,
+            output_price_per_mtok: 0.0,
+            supports_images: true,
+            supports_tools: true,
+            supports_streaming: true,
+            deprecated: false,
+        });
+        registry.insert_model(ModelInfo {
+            id: "openrouter/anthropic/claude-sonnet-4".to_string(),
+            provider: "openrouter".to_string(),
+            display_name: "OpenRouter Claude Sonnet 4".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            input_price_per_mtok: 3.0,
+            output_price_per_mtok: 15.0,
+            supports_images: true,
+            supports_tools: true,
+            supports_streaming: true,
+            deprecated: false,
+        });
+        registry.insert_model(ModelInfo {
+            id: "openrouter/google/gemini-2.5-pro".to_string(),
+            provider: "openrouter".to_string(),
+            display_name: "OpenRouter Gemini 2.5 Pro".to_string(),
+            context_window: 1_000_000,
+            max_output_tokens: 65_536,
+            input_price_per_mtok: 1.25,
+            output_price_per_mtok: 10.0,
             supports_images: true,
             supports_tools: true,
             supports_streaming: true,
@@ -564,5 +649,53 @@ mod tests {
         assert!(loaded.models.contains_key("codex"));
 
         fs::remove_file(path).expect("expected temp file cleanup to succeed");
+    }
+
+    #[test]
+    fn xai_provider_is_registered_with_models() {
+        let registry = ModelRegistry::new();
+        let provider = registry.get_provider("xai").expect("expected xai provider");
+        assert_eq!(provider.display_name, "xAI");
+        assert_eq!(provider.auth_env_var, "XAI_API_KEY");
+        assert!(provider.models.contains(&"grok-3-beta".to_string()));
+        assert!(provider
+            .models
+            .contains(&"grok-3-mini-fast-beta".to_string()));
+
+        let grok = registry.get_model("grok-3-beta").expect("expected grok-3-beta");
+        assert_eq!(grok.context_window, 128_000);
+        assert!((grok.input_price_per_mtok - 3.0).abs() < 1e-9);
+        assert!((grok.output_price_per_mtok - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn openrouter_provider_is_registered_with_models() {
+        let registry = ModelRegistry::new();
+        let provider = registry
+            .get_provider("openrouter")
+            .expect("expected openrouter provider");
+        assert_eq!(provider.display_name, "OpenRouter");
+        assert_eq!(provider.auth_env_var, "OPENROUTER_API_KEY");
+        assert!(provider.models.contains(&"openrouter/auto".to_string()));
+        assert!(provider
+            .models
+            .contains(&"openrouter/anthropic/claude-sonnet-4".to_string()));
+        assert!(provider
+            .models
+            .contains(&"openrouter/google/gemini-2.5-pro".to_string()));
+
+        let gemini = registry
+            .get_model("openrouter/google/gemini-2.5-pro")
+            .expect("expected openrouter gemini model");
+        assert_eq!(gemini.context_window, 1_000_000);
+        assert_eq!(gemini.provider, "openrouter");
+    }
+
+    #[test]
+    fn models_for_xai_provider_include_expected_variants() {
+        let registry = ModelRegistry::new();
+        let models = registry.models_for_provider("xai");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["grok-3-beta", "grok-3-mini-fast-beta"]);
     }
 }

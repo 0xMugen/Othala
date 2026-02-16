@@ -51,6 +51,26 @@ pub struct PromptResult {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommandError {
+    #[error("missing required argument: {0}")]
+    MissingArgument(String),
+    #[error("invalid template: {0}")]
+    InvalidTemplate(String),
+    #[error("command execution failed: {0}")]
+    ExecutionFailed(String),
+    #[error("command not found: {0}")]
+    NotFound(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgumentSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub default_value: Option<String>,
+    pub required: bool,
+}
+
 /// Extract argument names from template (matches $UPPER_CASE_NAME patterns)
 pub fn extract_arguments(template: &str) -> Vec<String> {
     let bytes = template.as_bytes();
@@ -81,6 +101,143 @@ pub fn extract_arguments(template: &str) -> Vec<String> {
     }
 
     out
+}
+
+pub fn parse_argument_specs(template: &str) -> Vec<ArgumentSpec> {
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                i += 2;
+                continue;
+            }
+
+            if i + 1 < bytes.len() && is_upper(bytes[i + 1]) {
+                let start = i + 1;
+                let mut end = start + 1;
+                while end < bytes.len() && is_arg_char(bytes[end]) {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end].is_ascii_lowercase() {
+                    i = end;
+                    continue;
+                }
+
+                let Some(name) = template.get(start..end) else {
+                    i = end;
+                    continue;
+                };
+
+                let mut default_value = None;
+                if end < bytes.len() && bytes[end] == b':' {
+                    let mut default_end = end + 1;
+                    while default_end < bytes.len() && !bytes[default_end].is_ascii_whitespace() {
+                        default_end += 1;
+                    }
+                    default_value = template.get(end + 1..default_end).map(ToString::to_string);
+                    end = default_end;
+                }
+
+                if seen.insert(name.to_string()) {
+                    out.push(ArgumentSpec {
+                        name: name.to_string(),
+                        description: None,
+                        required: default_value.is_none(),
+                        default_value,
+                    });
+                }
+
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    out
+}
+
+pub fn validate_arguments(
+    specs: &[ArgumentSpec],
+    provided: &HashMap<String, String>,
+) -> Result<(), CommandError> {
+    let missing: Vec<String> = specs
+        .iter()
+        .filter(|spec| spec.required && !provided.contains_key(&spec.name))
+        .map(|spec| spec.name.clone())
+        .collect();
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(CommandError::MissingArgument(missing.join(", ")))
+    }
+}
+
+pub fn render_template(template: &str, args: &HashMap<String, String>) -> Result<String, CommandError> {
+    let specs = parse_argument_specs(template);
+    validate_arguments(&specs, args)?;
+
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(template.len());
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+
+            if i + 1 < bytes.len() && is_upper(bytes[i + 1]) {
+                let start = i + 1;
+                let mut end = start + 1;
+                while end < bytes.len() && is_arg_char(bytes[end]) {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end].is_ascii_lowercase() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+
+                let name = template
+                    .get(start..end)
+                    .ok_or_else(|| CommandError::InvalidTemplate("failed to parse placeholder".to_string()))?;
+
+                let mut default_value = None;
+                if end < bytes.len() && bytes[end] == b':' {
+                    let mut default_end = end + 1;
+                    while default_end < bytes.len() && !bytes[default_end].is_ascii_whitespace() {
+                        default_end += 1;
+                    }
+                    default_value = template.get(end + 1..default_end).map(ToString::to_string);
+                    end = default_end;
+                }
+
+                if let Some(value) = args.get(name) {
+                    out.push_str(value);
+                } else if let Some(default) = default_value {
+                    out.push_str(&default);
+                } else {
+                    return Err(CommandError::MissingArgument(name.to_string()));
+                }
+
+                i = end;
+                continue;
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    Ok(out)
 }
 
 /// Parse the first line as description if it starts with "# " or "<!-- description: ... -->"
@@ -151,39 +308,7 @@ pub fn discover_all_commands(project_root: &Path) -> Vec<CustomCommand> {
 
 /// Render a command template with argument values
 pub fn render_command(command: &CustomCommand, args: &HashMap<String, String>) -> Result<String, String> {
-    for required in &command.arguments {
-        if !args.contains_key(required) {
-            return Err(format!("Missing required argument: {required}"));
-        }
-    }
-
-    let mut out = String::with_capacity(command.template.len());
-    let template = command.template.as_bytes();
-    let mut i = 0usize;
-    while i < template.len() {
-        if template[i] == b'$' && i + 1 < template.len() && is_upper(template[i + 1]) {
-            let start = i + 1;
-            let mut end = start + 1;
-            while end < template.len() && is_arg_char(template[end]) {
-                end += 1;
-            }
-            if end < template.len() && template[end].is_ascii_lowercase() {
-                out.push(template[i] as char);
-                i += 1;
-                continue;
-            }
-            if let Some(name) = command.template.get(start..end) {
-                if let Some(value) = args.get(name) {
-                    out.push_str(value);
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        out.push(template[i] as char);
-        i += 1;
-    }
-    Ok(out)
+    render_template(&command.template, args).map_err(|err| err.to_string())
 }
 
 /// Format commands as a display table
@@ -426,7 +551,7 @@ mod tests {
         };
         let args = HashMap::from([("PR".to_string(), "123".to_string())]);
         let err = render_command(&command, &args).expect_err("expected missing arg");
-        assert_eq!(err, "Missing required argument: ENV");
+        assert_eq!(err, "missing required argument: ENV");
     }
 
     #[test]
