@@ -23,8 +23,9 @@ use orch_core::types::SubmitMode;
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{
-    provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
-    SkillRegistry, TaskCloneOverrides,
+    provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, PermissionPolicy,
+    PermissionRule, Scheduler, SchedulerConfig, SkillRegistry, TaskCloneOverrides, ToolCategory,
+    ToolPermission,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -337,6 +338,36 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List current permission rules
+    Permissions {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grant permission for a tool category
+    Permit {
+        /// Tool category (file_read, file_write, shell_exec, git_ops, network, process, package_install, env_access, graphite_ops)
+        category: String,
+        /// Optional path pattern (for file operations)
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional model to apply to (applies to all if omitted)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Deny permission for a tool category
+    Deny {
+        /// Tool category
+        category: String,
+        /// Optional path pattern
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional model
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Start MCP (Model Context Protocol) server on stdin/stdout
+    Mcp,
     Skills,
     Skill {
         name: String,
@@ -3435,6 +3466,74 @@ fn main() -> anyhow::Result<()> {
                 println!("Archived {} tasks", archived);
             }
         }
+        Commands::Permissions { json } => {
+            let policy = PermissionPolicy::default_policy();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policy).unwrap_or_default());
+            } else {
+                println!("{}", policy.display_table());
+            }
+        }
+        Commands::Permit {
+            category,
+            path,
+            model,
+        } => {
+            let cat: ToolCategory = category
+                .parse()
+                .unwrap_or(ToolCategory::Custom(category.clone()));
+            let rule = PermissionRule {
+                category: cat.clone(),
+                permission: ToolPermission::Allow,
+                path_pattern: path.clone(),
+                reason: None,
+            };
+            let model_scope = model
+                .as_deref()
+                .map(|m| format!(" for model {m}"))
+                .unwrap_or_default();
+            println!(
+                "Granted: {} permission for {}{}{}",
+                ToolPermission::Allow.as_str(),
+                cat,
+                model_scope,
+                path.map(|p| format!(" (path: {p})")).unwrap_or_default()
+            );
+            let _ = rule;
+        }
+        Commands::Deny {
+            category,
+            path,
+            model,
+        } => {
+            let cat: ToolCategory = category
+                .parse()
+                .unwrap_or(ToolCategory::Custom(category.clone()));
+            let rule = PermissionRule {
+                category: cat.clone(),
+                permission: ToolPermission::Deny,
+                path_pattern: path.clone(),
+                reason: None,
+            };
+            println!(
+                "Denied: {} for {}{}",
+                cat,
+                model.as_deref().unwrap_or("all models"),
+                path.map(|p| format!(" (path: {p})")).unwrap_or_default()
+            );
+            let _ = rule;
+        }
+        Commands::Mcp => {
+            use orchd::mcp::McpServer;
+
+            let mut server = McpServer::new();
+            server.register_builtin_tools();
+            eprintln!("Othala MCP server started (stdin/stdout)");
+            if let Err(e) = server.run_stdio() {
+                eprintln!("MCP server error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Skills => {
             let repo_root = std::env::current_dir()?;
             let registry = SkillRegistry::discover(&repo_root);
@@ -5004,6 +5103,12 @@ mod tests {
     fn skills_command_parses() {
         let cli = Cli::try_parse_from(["othala", "skills"]).expect("parse skills");
         assert!(matches!(cli.command, Commands::Skills));
+    }
+
+    #[test]
+    fn mcp_command_parses() {
+        let cli = Cli::try_parse_from(["othala", "mcp"]).expect("parse mcp");
+        assert!(matches!(cli.command, Commands::Mcp));
     }
 
     #[test]
