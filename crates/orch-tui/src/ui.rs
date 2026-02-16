@@ -9,7 +9,7 @@ use orch_core::types::ModelKind;
 use crate::app::{InputMode, TuiApp};
 use crate::chat_parse;
 use crate::chat_render;
-use crate::model::{AgentPane, PaneCategory, TaskOverviewRow};
+use crate::model::{AgentPane, PaneCategory, TaskOverviewRow, TuiTheme};
 use crate::output_style::stylize_output_lines;
 use crate::ui_activity::pane_activity_indicator;
 #[cfg(test)]
@@ -23,16 +23,6 @@ use crate::ui_format::{
 };
 #[cfg(test)]
 use crate::ui_format::{format_pane_tabs, pane_status_tag, status_line_color};
-
-// -- Color palette ----------------------------------------------------------
-
-const ACCENT: Color = Color::Cyan;
-const HEADER_FG: Color = Color::White;
-const HEADER_TITLE: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-const MUTED: Color = Color::Gray;
-const BORDER_NORMAL: Color = Color::DarkGray;
-const BORDER_FOCUSED: Color = Color::Cyan;
 
 fn model_rate_per_token(model: ModelKind) -> f64 {
     match model {
@@ -101,27 +91,36 @@ pub fn format_dependency_chain(task: &TaskOverviewRow, all_tasks: &[TaskOverview
     }
 }
 
-fn dependency_chain_line(task: &TaskOverviewRow, all_tasks: &[TaskOverviewRow]) -> Line<'static> {
-    let mut spans = vec![Span::styled("Dependencies: ", Style::default().fg(DIM))];
+fn dependency_chain_line(
+    task: &TaskOverviewRow,
+    all_tasks: &[TaskOverviewRow],
+    theme: &TuiTheme,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "Dependencies: ",
+        Style::default().fg(theme.dim),
+    )];
 
     for (index, dep) in task.depends_on_display.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" → ", Style::default().fg(DIM)));
+            spans.push(Span::styled(" → ", Style::default().fg(theme.dim)));
         }
 
         let dep_style = match all_tasks.iter().find(|candidate| candidate.task_id.0 == *dep) {
             Some(found) if found.state == TaskState::Merged => Style::default().fg(Color::Green),
             Some(_) => Style::default().fg(Color::Yellow),
-            None => Style::default().fg(MUTED),
+            None => Style::default().fg(theme.muted),
         };
 
         spans.push(Span::styled(dep.clone(), dep_style));
     }
 
-    spans.push(Span::styled(" → ", Style::default().fg(DIM)));
+    spans.push(Span::styled(" → ", Style::default().fg(theme.dim)));
     spans.push(Span::styled(
         format!("{} (this task)", task.task_id.0),
-        Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.header_fg)
+            .add_modifier(Modifier::BOLD),
     ));
 
     Line::from(spans)
@@ -150,6 +149,7 @@ fn format_timeline_timestamp(timestamp: &str) -> String {
 }
 
 fn render_timeline_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     if area.height == 0 {
         return;
     }
@@ -161,16 +161,16 @@ fn render_timeline_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if events.is_empty() {
         lines.push(Line::from(Span::styled(
             "no timeline events",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )));
     } else {
         for event in events.into_iter().take(20) {
             let timestamp = format_timeline_timestamp(&event.timestamp);
             lines.push(Line::from(vec![
-                Span::styled(format!("[{timestamp}]"), Style::default().fg(DIM)),
+                Span::styled(format!("[{timestamp}]"), Style::default().fg(theme.dim)),
                 Span::styled(" ", Style::default()),
-                Span::styled(event.task_id, Style::default().fg(ACCENT)),
-                Span::styled(" | ", Style::default().fg(DIM)),
+                Span::styled(event.task_id, Style::default().fg(theme.accent)),
+                Span::styled(" | ", Style::default().fg(theme.dim)),
                 Span::styled(
                     event.description,
                     Style::default().fg(timeline_event_color(&event.event_type)),
@@ -180,7 +180,7 @@ fn render_timeline_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 
     let widget = Paragraph::new(lines)
-        .block(normal_block("Timeline (last 20)"))
+        .block(normal_block("Timeline (last 20)", theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -200,28 +200,30 @@ fn render_main_content(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 }
 
-fn normal_block(title: &str) -> Block<'_> {
+fn normal_block<'a>(title: &'a str, theme: &TuiTheme) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER_NORMAL))
+        .border_style(Style::default().fg(theme.border_normal))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ))
 }
 
-fn focused_block(title: &str) -> Block<'_> {
+fn focused_block<'a>(title: &'a str, theme: &TuiTheme) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(
             Style::default()
-                .fg(BORDER_FOCUSED)
+                .fg(theme.border_focused)
                 .add_modifier(Modifier::BOLD),
         )
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         ))
 }
@@ -229,8 +231,9 @@ fn focused_block(title: &str) -> Block<'_> {
 // -- Layout -----------------------------------------------------------------
 
 pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     if let Some((task_id, log_lines, scroll_offset)) = app.log_view_display() {
-        render_log_view(frame, task_id, log_lines, scroll_offset);
+        render_log_view(frame, task_id, log_lines, scroll_offset, theme);
         return;
     }
 
@@ -263,19 +266,25 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     render_footer(frame, root[3], app);
 
     if let Some((active_field, repo, title, model)) = app.new_task_dialog_display() {
-        render_new_task_dialog_modal(frame, active_field, repo, title, model);
+        render_new_task_dialog_modal(frame, active_field, repo, title, model, theme);
     }
 
     if let Some((task_id, branch)) = app.delete_confirm_display() {
-        render_delete_confirm_modal(frame, &task_id.0, branch);
+        render_delete_confirm_modal(frame, &task_id.0, branch, theme);
     }
 
     if matches!(&app.input_mode, InputMode::HelpOverlay) {
-        render_help_overlay(frame);
+        render_help_overlay(frame, theme);
     }
 }
 
-fn render_log_view(frame: &mut Frame<'_>, task_id: &str, log_lines: &[String], scroll_offset: usize) {
+fn render_log_view(
+    frame: &mut Frame<'_>,
+    task_id: &str,
+    log_lines: &[String],
+    scroll_offset: usize,
+    theme: &TuiTheme,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -298,18 +307,20 @@ fn render_log_view(frame: &mut Frame<'_>, task_id: &str, log_lines: &[String], s
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" Agent Log: {task_id}"),
-            Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_fg)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("   [{position}]"), Style::default().fg(DIM)),
+        Span::styled(format!("   [{position}]"), Style::default().fg(theme.dim)),
     ]))
-    .block(focused_block("Log"))
+    .block(focused_block("Log", theme))
     .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[0]);
 
     let body_lines: Vec<Line<'static>> = if log_lines.is_empty() {
         vec![Line::from(Span::styled(
             "No log output available.",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ))]
     } else {
         log_lines[start..end]
@@ -320,15 +331,15 @@ fn render_log_view(frame: &mut Frame<'_>, task_id: &str, log_lines: &[String], s
     };
 
     let body = Paragraph::new(body_lines)
-        .block(normal_block("Output"))
+        .block(normal_block("Output", theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(body, chunks[1]);
 
     let footer = Paragraph::new(Line::from(Span::styled(
         "[j/k] Scroll  [PgDn/PgUp] Page  [G] End  [g] Start  [Esc] Back",
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim),
     )))
-    .block(normal_block("Controls"))
+    .block(normal_block("Controls", theme))
     .wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[2]);
 }
@@ -336,6 +347,7 @@ fn render_log_view(frame: &mut Frame<'_>, task_id: &str, log_lines: &[String], s
 // -- Header -----------------------------------------------------------------
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let selected_task = app
         .state
         .selected_task()
@@ -357,29 +369,32 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::styled(
             " Othala ",
             Style::default()
-                .fg(HEADER_TITLE)
+                .fg(theme.header_title)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" tasks:", Style::default().fg(DIM)),
+        Span::styled(" tasks:", Style::default().fg(theme.dim)),
         Span::styled(
             format!("{}", app.state.tasks.len()),
-            Style::default().fg(HEADER_FG),
+            Style::default().fg(theme.header_fg),
         ),
-        Span::styled("  panes:", Style::default().fg(DIM)),
+        Span::styled("  panes:", Style::default().fg(theme.dim)),
         Span::styled(
             format!("{}", app.state.panes.len()),
-            Style::default().fg(HEADER_FG),
+            Style::default().fg(theme.header_fg),
         ),
-        Span::styled("  task:", Style::default().fg(DIM)),
-        Span::styled(selected_task, Style::default().fg(ACCENT)),
-        Span::styled("  pane:", Style::default().fg(DIM)),
-        Span::styled(selected_pane, Style::default().fg(ACCENT)),
-        Span::styled("  sort:", Style::default().fg(DIM)),
-        Span::styled(format!("{sort_direction} {sort_label}"), Style::default().fg(ACCENT)),
+        Span::styled("  task:", Style::default().fg(theme.dim)),
+        Span::styled(selected_task, Style::default().fg(theme.accent)),
+        Span::styled("  pane:", Style::default().fg(theme.dim)),
+        Span::styled(selected_pane, Style::default().fg(theme.accent)),
+        Span::styled("  sort:", Style::default().fg(theme.dim)),
+        Span::styled(
+            format!("{sort_direction} {sort_label}"),
+            Style::default().fg(theme.accent),
+        ),
     ]);
 
     let widget = Paragraph::new(line)
-        .block(normal_block("Overview"))
+        .block(normal_block("Overview", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
@@ -387,6 +402,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Task list --------------------------------------------------------------
 
 fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let mut lines = Vec::new();
     let selected_task_id = app.state.selected_task().map(|task| task.task_id.clone());
     let text_filter = app
@@ -397,7 +413,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
 
-    let header_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     lines.push(Line::from(Span::styled(
         " repo | task | title | state | verify | cost | activity",
         header_style,
@@ -406,7 +422,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         String::from_utf8(vec![b'\xe2', b'\x94', b'\x80'])
             .unwrap_or_else(|_| "-".to_string())
             .repeat(area.width.saturating_sub(2) as usize),
-        Style::default().fg(DIM),
+        Style::default().fg(theme.dim),
     )));
 
     let mut filtered_task_count = 0usize;
@@ -439,19 +455,19 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .find(|pane| pane.task_id == task.task_id)
             .map(|pane| pane.model);
         let cost = format_cost_display(estimate_task_cost_usd(task, task_model));
-        let state_style = Style::default().fg(state_color(task.state));
-        lines.push(format_task_row(is_selected, task, cost, state_style));
+        let state_style = Style::default().fg(state_color(task.state, theme));
+        lines.push(format_task_row(is_selected, task, cost, state_style, theme));
     }
 
     if app.state.tasks.is_empty() {
         lines.push(Line::from(Span::styled(
             " no tasks",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )));
     } else if filtered_task_count == 0 {
         lines.push(Line::from(Span::styled(
             " no matching tasks",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )));
     }
 
@@ -463,7 +479,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
 
     let widget = Paragraph::new(lines)
-        .block(normal_block(&title))
+        .block(normal_block(&title, theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -471,6 +487,7 @@ fn render_task_list(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Pane summary -----------------------------------------------------------
 
 fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
@@ -478,18 +495,18 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let pane_tabs = format_category_tabs(app);
     let tabs = Paragraph::new(pane_tabs)
-        .block(normal_block("Panes"))
+        .block(normal_block("Panes", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs, panes[0]);
 
     let (title, lines) = if let Some(pane) = app.state.selected_pane() {
-        let mut lines = pane_meta_lines(pane, None);
-        lines.push(divider_line(panes[1].width));
+        let mut lines = pane_meta_lines(pane, None, theme);
+        lines.push(divider_line(panes[1].width, theme));
         let tail = pane.tail(20);
         if tail.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no output yet",
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim),
             )));
         } else {
             lines.extend(stylize_output_lines(tail));
@@ -503,22 +520,22 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .unwrap_or_else(|| "-".to_string());
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(" task ", Style::default().fg(DIM)),
-                Span::styled(selected_task.clone(), Style::default().fg(ACCENT)),
-                Span::styled("  source ", Style::default().fg(DIM)),
-                Span::styled("activity log", Style::default().fg(MUTED)),
-                Span::styled("  lines ", Style::default().fg(DIM)),
+                Span::styled(" task ", Style::default().fg(theme.dim)),
+                Span::styled(selected_task.clone(), Style::default().fg(theme.accent)),
+                Span::styled("  source ", Style::default().fg(theme.dim)),
+                Span::styled("activity log", Style::default().fg(theme.muted)),
+                Span::styled("  lines ", Style::default().fg(theme.dim)),
                 Span::styled(
                     app.state.selected_task_activity.len().to_string(),
-                    Style::default().fg(HEADER_FG),
+                    Style::default().fg(theme.header_fg),
                 ),
             ]),
-            divider_line(panes[1].width),
+            divider_line(panes[1].width, theme),
         ];
         if app.state.selected_task_activity.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no task activity yet",
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim),
             )));
         } else {
             lines.extend(stylize_output_lines(
@@ -529,7 +546,7 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
 
     let output = Paragraph::new(lines)
-        .block(normal_block(&title))
+        .block(normal_block(&title, theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(output, panes[1]);
 }
@@ -537,30 +554,36 @@ fn render_pane_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Chat input box (inline in focused views) -------------------------------
 
 fn render_chat_input_box(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     if let Some((buffer, task_id)) = app.chat_input_display() {
         let title = format!("Chat \u{2192} {} (Enter=send Esc=cancel)", task_id.0);
         let line = Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
-            Span::styled("_", Style::default().fg(ACCENT)),
+            Span::styled("_", Style::default().fg(theme.accent)),
         ]);
         let widget = Paragraph::new(line)
-            .block(focused_block(&title))
+            .block(focused_block(&title, theme))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, area);
     } else {
         let line = Line::from(Span::styled(
             " i: send message  c: new chat",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ));
         let widget = Paragraph::new(line)
-            .block(normal_block("Chat"))
+            .block(normal_block("Chat", theme))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, area);
     }
 }
 
-fn render_activity_line(frame: &mut Frame<'_>, area: Rect, pane: Option<&AgentPane>) {
+fn render_activity_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: Option<&AgentPane>,
+    theme: &TuiTheme,
+) {
     let line = if let Some((activity, color)) = pane.and_then(pane_activity_indicator) {
         Line::from(vec![
             Span::styled(" \u{25CF} ", Style::default().fg(color)),
@@ -570,7 +593,7 @@ fn render_activity_line(frame: &mut Frame<'_>, area: Rect, pane: Option<&AgentPa
             ),
         ])
     } else {
-        Line::from(Span::styled(" \u{25CB} idle", Style::default().fg(DIM)))
+        Line::from(Span::styled(" \u{25CB} idle", Style::default().fg(theme.dim)))
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -581,7 +604,7 @@ fn extend_rendered_chat(lines: &mut Vec<Line<'static>>, window: &[String], width
     if window.is_empty() {
         lines.push(Line::from(Span::styled(
             "no output yet",
-            Style::default().fg(DIM),
+            Style::default().fg(Color::DarkGray),
         )));
         return;
     }
@@ -590,6 +613,7 @@ fn extend_rendered_chat(lines: &mut Vec<Line<'static>>, window: &[String], width
 }
 
 fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -609,8 +633,8 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let scroll_back = app.state.scroll_back;
 
     let (title, lines) = if let Some(pane) = pane {
-        let mut lines = pane_meta_lines(pane, Some(scroll_back));
-        lines.push(divider_line(chat_area.width));
+        let mut lines = pane_meta_lines(pane, Some(scroll_back), theme);
+        lines.push(divider_line(chat_area.width, theme));
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = pane_idx
             .map(|idx| {
@@ -628,15 +652,16 @@ fn render_focused_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
 
     let widget = Paragraph::new(lines)
-        .block(focused_block(&title))
+        .block(focused_block(&title, theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, chat_area);
 
-    render_activity_line(frame, activity_area, pane);
+    render_activity_line(frame, activity_area, pane, theme);
     render_chat_input_box(frame, input_area, app);
 }
 
 fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let selected_task = app.state.selected_task();
     let task_id_str = selected_task
         .map(|t| t.task_id.0.clone())
@@ -681,7 +706,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     // Left: task status checklist
     let status_title = format!("Status ({task_id_str})");
-    let mut status_lines = status_sidebar_lines(selected_task, &app.state.selected_task_activity);
+    let mut status_lines = status_sidebar_lines(selected_task, &app.state.selected_task_activity, theme);
     if let Some(task) = selected_task {
         let model_hint = task_pane
             .map(|pane| pane.model)
@@ -695,47 +720,47 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             });
         status_lines.push(Line::from(""));
         status_lines.push(Line::from(vec![
-            Span::styled(task_cost_summary(task, model_hint), Style::default().fg(MUTED)),
+            Span::styled(task_cost_summary(task, model_hint), Style::default().fg(theme.muted)),
         ]));
         let timestamp = to_local_time(task.last_activity);
         status_lines.push(Line::from(""));
         status_lines.push(Line::from(vec![
-            Span::styled("Branch: ", Style::default().fg(DIM)),
-            Span::styled(task.branch.clone(), Style::default().fg(HEADER_FG)),
+            Span::styled("Branch: ", Style::default().fg(theme.dim)),
+            Span::styled(task.branch.clone(), Style::default().fg(theme.header_fg)),
         ]));
         if !task.depends_on_display.is_empty() {
-            status_lines.push(dependency_chain_line(task, &app.state.tasks));
+            status_lines.push(dependency_chain_line(task, &app.state.tasks, theme));
         }
         if let Some(pr_url) = &task.pr_url {
             status_lines.push(Line::from(vec![
-                Span::styled("PR: ", Style::default().fg(DIM)),
-                Span::styled(pr_url.clone(), Style::default().fg(ACCENT)),
+                Span::styled("PR: ", Style::default().fg(theme.dim)),
+                Span::styled(pr_url.clone(), Style::default().fg(theme.accent)),
             ]));
         }
         if let Some(model) = &task.model_display {
             status_lines.push(Line::from(vec![
-                Span::styled("Model: ", Style::default().fg(DIM)),
-                Span::styled(model.clone(), Style::default().fg(HEADER_FG)),
+                Span::styled("Model: ", Style::default().fg(theme.dim)),
+                Span::styled(model.clone(), Style::default().fg(theme.header_fg)),
             ]));
         }
         status_lines.push(Line::from(vec![
-            Span::styled("Created: ", Style::default().fg(DIM)),
-            Span::styled(timestamp.clone(), Style::default().fg(MUTED)),
+            Span::styled("Created: ", Style::default().fg(theme.dim)),
+            Span::styled(timestamp.clone(), Style::default().fg(theme.muted)),
         ]));
         status_lines.push(Line::from(vec![
-            Span::styled("Updated: ", Style::default().fg(DIM)),
-            Span::styled(timestamp, Style::default().fg(MUTED)),
+            Span::styled("Updated: ", Style::default().fg(theme.dim)),
+            Span::styled(timestamp, Style::default().fg(theme.muted)),
         ]));
     }
     let status_widget = Paragraph::new(status_lines)
-    .block(focused_block(&status_title))
+    .block(focused_block(&status_title, theme))
     .wrap(Wrap { trim: false });
     frame.render_widget(status_widget, cols[0]);
 
     // Right top: category tabs
     let cat_tabs = format_category_tabs(app);
     let tabs_widget = Paragraph::new(cat_tabs)
-        .block(normal_block("Panes"))
+        .block(normal_block("Panes", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(tabs_widget, tab_area);
 
@@ -746,8 +771,8 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
 
     let (pty_title, pty_lines) = if let Some(pane) = task_pane {
-        let mut lines = pane_meta_lines(pane, Some(scroll_back));
-        lines.push(divider_line(chat_area.width));
+        let mut lines = pane_meta_lines(pane, Some(scroll_back), theme);
+        lines.push(divider_line(chat_area.width, theme));
         let output_cap = viewport_height.saturating_sub(lines.len());
         let window = task_pane_idx
             .map(|idx| {
@@ -793,7 +818,7 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ]);
         frame.render_widget(Paragraph::new(line), activity_area);
     } else {
-        render_activity_line(frame, activity_area, task_pane);
+        render_activity_line(frame, activity_area, task_pane, theme);
     }
     render_chat_input_box(frame, input_area, app);
 }
@@ -801,9 +826,10 @@ fn render_focused_task(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 // -- Footer -----------------------------------------------------------------
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     let content = build_footer_content(app);
     let widget = Paragraph::new(content.lines)
-        .block(normal_block(content.title))
+        .block(normal_block(content.title, theme))
         .wrap(Wrap {
             trim: content.wrap_trim,
         });
@@ -827,6 +853,7 @@ fn format_error_timestamp(timestamp: &str) -> String {
 }
 
 fn render_error_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let theme = &app.state.current_theme;
     if area.height == 0 || app.state.recent_errors.is_empty() {
         return;
     }
@@ -848,12 +875,17 @@ fn render_error_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 
     let widget = Paragraph::new(lines)
-        .block(normal_block("Recent Errors"))
+        .block(normal_block("Recent Errors", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
 
-fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Option<&str>) {
+fn render_delete_confirm_modal(
+    frame: &mut Frame<'_>,
+    task_id: &str,
+    branch: Option<&str>,
+    theme: &TuiTheme,
+) {
     let area = centered_rect(64, 36, frame.area());
     let branch_line = match branch {
         Some(value) => format!("Branch to delete: {value}"),
@@ -863,7 +895,7 @@ fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Opt
         Line::from(Span::styled(
             format!("Delete task {task_id}?"),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -873,12 +905,12 @@ fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Opt
         Line::from(""),
         Line::from(Span::styled(
             "Enter/Y = delete now    Esc = cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )),
     ];
 
     let widget = Paragraph::new(lines)
-        .block(focused_block("Are You Sure?"))
+        .block(focused_block("Are You Sure?", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
@@ -890,6 +922,7 @@ fn render_new_task_dialog_modal(
     repo: &str,
     title: &str,
     model: &str,
+    theme: &TuiTheme,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -899,13 +932,13 @@ fn render_new_task_dialog_modal(
 
     let selected_style = Style::default()
         .fg(Color::Black)
-        .bg(Color::Cyan)
+        .bg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let normal_style = Style::default().fg(Color::White);
+    let normal_style = Style::default().fg(theme.header_fg);
 
     let field_line = |label: &str, value: &str, idx: usize| {
         Line::from(vec![
-            Span::styled(format!("{label:<7}"), Style::default().fg(DIM)),
+            Span::styled(format!("{label:<7}"), Style::default().fg(theme.dim)),
             Span::styled(
                 if value.is_empty() {
                     " ".to_string()
@@ -933,27 +966,29 @@ fn render_new_task_dialog_modal(
         Line::from(""),
         Line::from(Span::styled(
             "[Tab] Next field  [Enter] Create  [Esc] Cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )),
     ];
 
     let widget = Paragraph::new(lines)
-        .block(focused_block("New Task"))
+        .block(focused_block("New Task", theme))
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>) {
+fn render_help_overlay(frame: &mut Frame<'_>, theme: &TuiTheme) {
     let area = centered_rect(72, 86, frame.area());
     let lines = vec![
         Line::from(Span::styled(
             "KEYBOARD SHORTCUTS",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "──────────────────",
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )),
         Line::from("Navigation:"),
         Line::from("  j/↓    Move down          k/↑    Move up"),
@@ -974,11 +1009,14 @@ fn render_help_overlay(frame: &mut Frame<'_>) {
         Line::from("  ?      This help           q      Quit"),
         Line::from("  Ctrl+C Force quit"),
         Line::from(""),
-        Line::from(Span::styled("Press ? or Esc to close", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "Press ? or Esc to close",
+            Style::default().fg(theme.dim),
+        )),
     ];
 
     let widget = Paragraph::new(lines)
-        .block(focused_block("Keyboard Shortcuts"))
+        .block(focused_block("Keyboard Shortcuts", theme))
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
@@ -1121,7 +1159,8 @@ mod tests {
             true,
             &row,
             "$0.12".to_string(),
-            Style::default().fg(state_color(row.state)),
+            Style::default().fg(state_color(row.state, &crate::model::default_theme())),
+            &crate::model::default_theme(),
         );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         let expected_ts = to_local_time(row.last_activity);
@@ -1240,7 +1279,7 @@ mod tests {
         row.state = TaskState::Chatting;
         row.display_state = "Chatting".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1263,7 +1302,7 @@ mod tests {
         row.state = TaskState::Merged;
         row.display_state = "Merged".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1280,7 +1319,7 @@ mod tests {
         row.state = TaskState::Submitting;
         row.display_state = "Submitting".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1299,7 +1338,7 @@ mod tests {
         row.state = TaskState::Chatting;
         row.display_state = "Verifying".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1315,7 +1354,7 @@ mod tests {
         row.state = TaskState::Chatting;
         row.display_state = "VerifyFail".to_string();
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1337,7 +1376,11 @@ mod tests {
             "some other log line".to_string(),
         ];
 
-        let rendered = status_sidebar_lines(Some(&row), &activity);
+        let rendered = status_sidebar_lines(
+            Some(&row),
+            &activity,
+            &crate::model::default_theme(),
+        );
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1377,7 +1420,11 @@ mod tests {
         let row = mk_row("T1");
         let activity: Vec<String> = (0..15).map(|i| format!("log line {i}")).collect();
 
-        let rendered = status_sidebar_lines(Some(&row), &activity);
+        let rendered = status_sidebar_lines(
+            Some(&row),
+            &activity,
+            &crate::model::default_theme(),
+        );
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1413,7 +1460,7 @@ mod tests {
         ];
         row.qa_targets = vec!["verify OAuth flow".to_string()];
 
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1442,7 +1489,7 @@ mod tests {
     #[test]
     fn status_sidebar_hides_qa_section_when_no_qa_data() {
         let row = mk_row("T1");
-        let rendered = status_sidebar_lines(Some(&row), &[]);
+        let rendered = status_sidebar_lines(Some(&row), &[], &crate::model::default_theme());
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())

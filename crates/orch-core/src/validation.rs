@@ -192,6 +192,7 @@ mod tests {
 
     fn valid_org_config() -> OrgConfig {
         OrgConfig {
+            profile: None,
             models: ModelsConfig {
                 enabled: vec![ModelKind::Claude, ModelKind::Codex],
                 default: Some(ModelKind::Claude),

@@ -1,6 +1,6 @@
 //! Configuration types for the MVP orchestrator.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,9 +49,54 @@ pub enum SetupApplyError {
     InvalidConcurrencyDefault,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigProfile {
+    Dev,
+    Staging,
+    Prod,
+    Custom(String),
+}
+
+impl ConfigProfile {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Dev => "dev",
+            Self::Staging => "staging",
+            Self::Prod => "prod",
+            Self::Custom(name) => name.as_str(),
+        }
+    }
+}
+
+impl Serialize for ConfigProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_lowercase().as_str() {
+            "dev" => Self::Dev,
+            "staging" => Self::Staging,
+            "prod" => Self::Prod,
+            _ => Self::Custom(value),
+        })
+    }
+}
+
 /// Organization-wide configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgConfig {
+    #[serde(default)]
+    pub profile: Option<ConfigProfile>,
     pub models: ModelsConfig,
     pub concurrency: ConcurrencyConfig,
     pub graphite: GraphiteOrgConfig,
@@ -62,6 +107,35 @@ pub struct OrgConfig {
     pub daemon: DaemonOrgConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+}
+
+impl Default for OrgConfig {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            models: ModelsConfig {
+                enabled: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
+                default: Some(ModelKind::Claude),
+            },
+            concurrency: ConcurrencyConfig {
+                per_repo: 10,
+                claude: 10,
+                codex: 10,
+                gemini: 10,
+            },
+            graphite: GraphiteOrgConfig {
+                auto_submit: true,
+                submit_mode_default: SubmitMode::Single,
+                allow_move: MovePolicy::Manual,
+            },
+            ui: UiConfig {
+                web_bind: "127.0.0.1:9842".to_string(),
+            },
+            notifications: NotificationConfig::default(),
+            daemon: DaemonOrgConfig::default(),
+            budget: BudgetConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +349,24 @@ pub fn apply_setup_selection_to_org_config(
     Ok(())
 }
 
+pub fn apply_profile_defaults(profile: &ConfigProfile, config: &mut OrgConfig) {
+    match profile {
+        ConfigProfile::Dev => {
+            config.concurrency.per_repo = 20;
+            config.concurrency.claude = 20;
+            config.concurrency.codex = 20;
+            config.concurrency.gemini = 20;
+        }
+        ConfigProfile::Staging => {
+            config.budget.enabled = true;
+        }
+        ConfigProfile::Prod => {
+            config.budget.enabled = true;
+        }
+        ConfigProfile::Custom(_) => {}
+    }
+}
+
 fn dedupe_models(models: &[ModelKind]) -> Vec<ModelKind> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -317,6 +409,12 @@ stdout = true
 "#,
         )
         .expect("parse org config")
+    }
+
+    fn sample_org_with_profile(profile: ConfigProfile) -> OrgConfig {
+        let mut config = sample_org();
+        config.profile = Some(profile);
+        config
     }
 
     fn sample_repo() -> &'static str {
@@ -503,5 +601,106 @@ tick_interval_secs = 11
         let err = load_repo_config(&invalid_path).expect_err("invalid config should fail");
         assert!(matches!(err, ConfigError::Parse { path, .. } if path == invalid_path));
         let _ = fs::remove_file(invalid_path);
+    }
+
+    #[test]
+    fn apply_profile_defaults_dev_increases_concurrency_limits() {
+        let mut config = sample_org();
+        apply_profile_defaults(&ConfigProfile::Dev, &mut config);
+
+        assert_eq!(config.concurrency.per_repo, 20);
+        assert_eq!(config.concurrency.claude, 20);
+        assert_eq!(config.concurrency.codex, 20);
+        assert_eq!(config.concurrency.gemini, 20);
+    }
+
+    #[test]
+    fn apply_profile_defaults_prod_enables_budget_enforcement() {
+        let mut config = sample_org();
+        assert!(!config.budget.enabled);
+
+        apply_profile_defaults(&ConfigProfile::Prod, &mut config);
+
+        assert!(config.budget.enabled);
+    }
+
+    #[test]
+    fn apply_profile_defaults_custom_does_not_override_values() {
+        let mut config = sample_org();
+        config.concurrency.per_repo = 13;
+        config.budget.enabled = false;
+
+        apply_profile_defaults(&ConfigProfile::Custom("team-a".to_string()), &mut config);
+
+        assert_eq!(config.concurrency.per_repo, 13);
+        assert!(!config.budget.enabled);
+    }
+
+    #[test]
+    fn parse_org_config_maps_profile_to_enum_variants() {
+        let dev = parse_org_config(
+            r#"
+profile = "dev"
+
+[models]
+enabled = ["claude"]
+
+[concurrency]
+per_repo = 5
+claude = 3
+codex = 1
+gemini = 1
+
+[graphite]
+auto_submit = false
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+"#,
+        )
+        .expect("parse dev profile");
+        assert_eq!(dev.profile, Some(ConfigProfile::Dev));
+
+        let custom = parse_org_config(
+            r#"
+profile = "team-a"
+
+[models]
+enabled = ["claude"]
+
+[concurrency]
+per_repo = 5
+claude = 3
+codex = 1
+gemini = 1
+
+[graphite]
+auto_submit = false
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+"#,
+        )
+        .expect("parse custom profile");
+        assert_eq!(custom.profile, Some(ConfigProfile::Custom("team-a".to_string())));
+    }
+
+    #[test]
+    fn serialize_org_config_writes_profile_as_string() {
+        let config = sample_org_with_profile(ConfigProfile::Staging);
+        let serialized = toml::to_string(&config).expect("serialize org config");
+        assert!(serialized.contains("profile = \"staging\""));
     }
 }

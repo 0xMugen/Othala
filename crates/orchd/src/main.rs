@@ -3,18 +3,19 @@
 //! Simplified CLI for managing AI coding sessions that auto-submit to Graphite.
 
 use chrono::{Datelike, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use orch_agents::setup::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupProbeConfig,
 };
 use orch_core::config::{
-    apply_setup_selection_to_org_config, load_org_config, save_org_config, BudgetConfig,
-    ConcurrencyConfig, DaemonOrgConfig, GraphiteOrgConfig, ModelsConfig, MovePolicy,
-    NotificationConfig, OrgConfig, UiConfig,
+    apply_profile_defaults, apply_setup_selection_to_org_config, load_org_config, save_org_config,
+    ConfigProfile, NotificationConfig, OrgConfig,
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId, TaskPriority};
+use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId, TaskPriority};
+#[cfg(test)]
+use orch_core::types::SubmitMode;
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
 use orchd::{
@@ -150,7 +151,10 @@ enum Commands {
         /// Run a single daemon tick then exit
         #[arg(long)]
         once: bool,
+        #[arg(long, value_enum)]
+        profile: Option<ConfigProfileArg>,
     },
+    Profiles,
     /// Interactive first-time setup wizard
     Wizard {
         /// Enable models non-interactively (comma-separated, e.g. claude,codex)
@@ -228,6 +232,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    DiffRetries {
+        /// Task/chat ID
+        task_id: String,
     },
     /// Show aggregate task and agent statistics
     Stats {
@@ -355,6 +363,25 @@ enum TemplateAction {
     Show {
         name: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ConfigProfileArg {
+    Dev,
+    Staging,
+    Prod,
+    Custom,
+}
+
+impl From<ConfigProfileArg> for ConfigProfile {
+    fn from(value: ConfigProfileArg) -> Self {
+        match value {
+            ConfigProfileArg::Dev => ConfigProfile::Dev,
+            ConfigProfileArg::Staging => ConfigProfile::Staging,
+            ConfigProfileArg::Prod => ConfigProfile::Prod,
+            ConfigProfileArg::Custom => ConfigProfile::Custom("custom".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +810,24 @@ fn parse_model_name(s: &str) -> Option<ModelKind> {
     }
 }
 
+fn profile_label(profile: &ConfigProfile) -> String {
+    match profile {
+        ConfigProfile::Dev => "dev".to_string(),
+        ConfigProfile::Staging => "staging".to_string(),
+        ConfigProfile::Prod => "prod".to_string(),
+        ConfigProfile::Custom(name) => format!("custom({name})"),
+    }
+}
+
+fn print_profiles() {
+    println!("{:<10} DEFAULT OVERRIDES", "PROFILE");
+    println!("{}", "-".repeat(72));
+    println!("{:<10} concurrency.per_repo=20, model concurrency=20", "dev");
+    println!("{:<10} budget.enabled=true", "staging");
+    println!("{:<10} budget.enabled=true", "prod");
+    println!("{:<10} no built-in overrides", "custom");
+}
+
 fn parse_task_priority(s: &str) -> anyhow::Result<TaskPriority> {
     s.parse::<TaskPriority>().map_err(|e| anyhow::anyhow!(e))
 }
@@ -1137,30 +1182,11 @@ fn parse_enable_models_csv(raw: &str) -> anyhow::Result<Vec<ModelKind>> {
 }
 
 fn default_org_config(enabled_models: Vec<ModelKind>) -> OrgConfig {
+    let mut config = OrgConfig::default();
     let default_model = enabled_models.first().copied();
-    OrgConfig {
-        models: ModelsConfig {
-            enabled: enabled_models,
-            default: default_model,
-        },
-        concurrency: ConcurrencyConfig {
-            per_repo: 10,
-            claude: 10,
-            codex: 10,
-            gemini: 10,
-        },
-        graphite: GraphiteOrgConfig {
-            auto_submit: true,
-            submit_mode_default: SubmitMode::Single,
-            allow_move: MovePolicy::Manual,
-        },
-        ui: UiConfig {
-            web_bind: "127.0.0.1:9842".to_string(),
-        },
-        notifications: NotificationConfig::default(),
-        daemon: DaemonOrgConfig::default(),
-        budget: BudgetConfig::default(),
-    }
+    config.models.enabled = enabled_models;
+    config.models.default = default_model;
+    config
 }
 
 fn build_notification_dispatcher(config: &NotificationConfig) -> Option<NotificationDispatcher> {
@@ -2283,16 +2309,25 @@ fn main() -> anyhow::Result<()> {
             verify_command,
             skip_qa,
             once,
+            profile,
         } => {
             print_banner();
 
             let repo_root = std::env::current_dir()?;
             let template_dir = PathBuf::from("templates/prompts");
+            let selected_cli_profile = profile.map(ConfigProfile::from);
 
             let config_path = PathBuf::from(".othala/config.toml");
             let (enabled_models, default_model, notification_dispatcher, daemon_org_config) =
                 if config_path.exists() {
-                let org_config = load_org_config(&config_path)?;
+                let mut org_config = load_org_config(&config_path)?;
+                let effective_profile = selected_cli_profile
+                    .clone()
+                    .or_else(|| org_config.profile.clone());
+                if let Some(profile) = &effective_profile {
+                    apply_profile_defaults(profile, &mut org_config);
+                    eprintln!("  Profile: {}", profile_label(profile));
+                }
                 use orch_core::validation::{Validate, ValidationLevel};
                 let issues = org_config.validate();
                 for issue in &issues {
@@ -2316,11 +2351,16 @@ fn main() -> anyhow::Result<()> {
                 )
             } else {
                 eprintln!("  \x1b[33mNo .othala/config.toml — using defaults (run `othala wizard` to configure)\x1b[0m");
+                let mut org_config = OrgConfig::default();
+                if let Some(profile) = &selected_cli_profile {
+                    apply_profile_defaults(profile, &mut org_config);
+                    eprintln!("  Profile: {}", profile_label(profile));
+                }
                 (
-                    vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
-                    ModelKind::Claude,
+                    org_config.models.enabled,
+                    org_config.models.default.unwrap_or(ModelKind::Claude),
                     None,
-                    DaemonOrgConfig::default(),
+                    org_config.daemon,
                 )
             };
             eprintln!(
@@ -2389,6 +2429,13 @@ fn main() -> anyhow::Result<()> {
                 if let Some(new_config) =
                     orchd::daemon_loop::check_config_reload(&config_path, &mut daemon_state)
                 {
+                    let mut new_config = new_config;
+                    let effective_profile = selected_cli_profile
+                        .clone()
+                        .or_else(|| new_config.profile.clone());
+                    if let Some(profile) = &effective_profile {
+                        apply_profile_defaults(profile, &mut new_config);
+                    }
                     let mut changes = Vec::new();
 
                     if daemon_config.enabled_models != new_config.models.enabled {
@@ -2529,6 +2576,9 @@ fn main() -> anyhow::Result<()> {
             let json =
                 serde_json::to_string_pretty(&final_tasks).unwrap_or_else(|_| "[]".to_string());
             println!("{json}");
+        }
+        Commands::Profiles => {
+            print_profiles();
         }
         Commands::SelfTest { json } => {
             let critical_ok = run_self_test(json);
@@ -2700,10 +2750,11 @@ fn main() -> anyhow::Result<()> {
                 service
                     .store
                     .list_all_events(since.as_deref(), until.as_deref())?
-            } else {
-                let task_id = task_id.expect("task id exists when not replaying all");
-                let events = service.store.list_events_for_task(task_id.as_str())?;
+            } else if let Some(ref tid) = task_id {
+                let events = service.store.list_events_for_task(tid.as_str())?;
                 filter_events_by_time(events, since_dt, until_dt)
+            } else {
+                vec![]
             };
 
             if json {
@@ -2818,6 +2869,37 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!("{}", format_retries_timeline(&task_id.0, &timeline));
             }
+        }
+        Commands::DiffRetries { task_id } => {
+            let repo_root = std::env::current_dir()?;
+            let task = TaskId::new(&task_id);
+            let log_dir = orchd::agent_log::agent_log_dir(&repo_root, &task);
+            let latest_path = log_dir.join("latest.log");
+            let previous_path = log_dir.join("latest.log.1");
+
+            let latest_content = fs::read_to_string(&latest_path).map_err(|err| {
+                anyhow::anyhow!("failed to read {}: {err}", latest_path.display())
+            })?;
+            let previous_content = fs::read_to_string(&previous_path).map_err(|err| {
+                anyhow::anyhow!("failed to read {}: {err}", previous_path.display())
+            })?;
+
+            let latest_lines: Vec<String> = latest_content.lines().map(String::from).collect();
+            let previous_lines: Vec<String> = previous_content.lines().map(String::from).collect();
+
+            let diff = orchd::agent_log::diff_agent_outputs(&previous_lines, &latest_lines);
+            let output = orchd::agent_log::format_diff(&diff);
+            if output.is_empty() {
+                println!("No differences between the last two retries for task: {task_id}");
+            } else {
+                println!("{output}");
+            }
+
+            let summary = orchd::agent_log::diff_summary(&diff);
+            println!(
+                "Summary: +{} -{} unchanged:{}",
+                summary.added, summary.removed, summary.unchanged
+            );
         }
         Commands::Stats { json } => {
             let tasks = service.list_tasks()?;
@@ -3462,6 +3544,39 @@ mod tests {
                 assert!(budget);
             }
             _ => panic!("expected costs command"),
+        }
+    }
+
+    #[test]
+    fn daemon_cli_parses_profile_flag() {
+        let cli = Cli::try_parse_from(["othala", "daemon", "--once", "--profile", "prod"])
+            .expect("parse daemon with profile");
+
+        match cli.command {
+            Commands::Daemon { once, profile, .. } => {
+                assert!(once);
+                assert_eq!(profile, Some(ConfigProfileArg::Prod));
+            }
+            _ => panic!("expected daemon command"),
+        }
+    }
+
+    #[test]
+    fn profiles_command_parses() {
+        let cli = Cli::try_parse_from(["othala", "profiles"]).expect("parse profiles command");
+        assert!(matches!(cli.command, Commands::Profiles));
+    }
+
+    #[test]
+    fn diff_retries_cli_parses_task_id() {
+        let cli = Cli::try_parse_from(["othala", "diff-retries", "T-77"])
+            .expect("parse diff-retries");
+
+        match cli.command {
+            Commands::DiffRetries { task_id } => {
+                assert_eq!(task_id, "T-77");
+            }
+            _ => panic!("expected diff-retries command"),
         }
     }
 
