@@ -68,8 +68,7 @@ pub fn is_transition_allowed(from: TaskState, to: TaskState) -> bool {
         (AwaitingMerge, Restacking) => true,
         // Any state can go back to Chatting (retry/fix)
         (_, Chatting) => true,
-        // Chatting can transition to Stopped (exhausted retries / manual stop)
-        (Chatting, Stopped) => true,
+        (Chatting, Stopped) | (Ready, Stopped) => true,
         _ => false,
     }
 }
@@ -166,6 +165,11 @@ mod tests {
             TaskState::Restacking,
             TaskState::Merged
         ));
+    }
+
+    #[test]
+    fn allows_cancellation_from_ready() {
+        assert!(is_transition_allowed(TaskState::Ready, TaskState::Stopped));
     }
 
     #[test]

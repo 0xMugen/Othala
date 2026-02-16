@@ -122,6 +122,104 @@ impl NotificationSink for WebhookSink {
     }
 }
 
+/// Slack webhook sink — posts notifications to a Slack channel via incoming webhook URL.
+///
+/// The webhook URL is expected to be set via the `SLACK_WEBHOOK_URL` environment variable
+/// or configured directly. Messages are formatted as Slack Block Kit payloads.
+#[derive(Debug, Clone)]
+pub struct SlackSink {
+    pub webhook_url: String,
+    pub channel: Option<String>,
+    pub timeout_secs: u64,
+}
+
+impl SlackSink {
+    /// Build a Slack-formatted payload from a notification message.
+    pub fn build_payload(
+        message: &NotificationMessage,
+        channel: Option<&str>,
+    ) -> serde_json::Value {
+        let severity_emoji = match message.severity {
+            crate::types::NotificationSeverity::Info => "ℹ️",
+            crate::types::NotificationSeverity::Warning => "⚠️",
+            crate::types::NotificationSeverity::Error => "🔴",
+        };
+
+        let task_label = message
+            .task_id
+            .as_ref()
+            .map(|t| format!(" | task: `{}`", t.0))
+            .unwrap_or_default();
+
+        let text = format!(
+            "{} *{}*{}\n{}",
+            severity_emoji, message.title, task_label, message.body
+        );
+
+        let mut payload = serde_json::json!({
+            "text": text,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": text
+                    }
+                }
+            ]
+        });
+
+        if let Some(ch) = channel {
+            payload["channel"] = serde_json::Value::String(ch.to_string());
+        }
+
+        payload
+    }
+}
+
+impl NotificationSink for SlackSink {
+    fn kind(&self) -> NotificationSinkKind {
+        NotificationSinkKind::Slack
+    }
+
+    fn send(&self, message: &NotificationMessage) -> Result<(), NotifyError> {
+        let payload = Self::build_payload(message, self.channel.as_deref());
+        let payload_str =
+            serde_json::to_string(&payload).map_err(|e| NotifyError::SinkFailed {
+                message: format!("failed to encode Slack payload: {e}"),
+            })?;
+
+        let output = Command::new("curl")
+            .arg("-sS")
+            .arg("-m")
+            .arg(self.timeout_secs.to_string())
+            .arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("-d")
+            .arg(payload_str)
+            .arg(&self.webhook_url)
+            .output()
+            .map_err(|e| NotifyError::SinkFailed {
+                message: format!("failed to execute curl for Slack sink: {e}"),
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(NotifyError::SinkFailed {
+            message: format!(
+                "Slack webhook request failed (status {:?}): {}",
+                output.status.code(),
+                stderr.trim()
+            ),
+        })
+    }
+}
+
 pub struct NotificationDispatcher {
     sinks: Vec<Box<dyn NotificationSink>>,
 }
@@ -138,6 +236,7 @@ impl NotificationDispatcher {
                 NotificationSinkKind::Stdout => sinks.push(Box::new(StdoutSink)),
                 NotificationSinkKind::Telegram => sinks.push(Box::new(TelegramSink::default())),
                 NotificationSinkKind::Webhook => {}
+                NotificationSinkKind::Slack => {}
             }
         }
         Self { sinks }
@@ -299,5 +398,57 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, NotificationSinkKind::Stdout);
         assert!(results[0].1.is_ok());
+    }
+
+    #[test]
+    fn slack_sink_kind_is_slack() {
+        let sink = super::SlackSink {
+            webhook_url: "https://hooks.slack.com/services/test".to_string(),
+            channel: None,
+            timeout_secs: 5,
+        };
+        assert_eq!(sink.kind(), NotificationSinkKind::Slack);
+    }
+
+    #[test]
+    fn slack_payload_includes_severity_emoji_and_task_id() {
+        let msg = mk_message();
+        let payload = super::SlackSink::build_payload(&msg, None);
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("🔴"), "should contain error emoji");
+        assert!(text.contains("T1"), "should contain task ID");
+        assert!(text.contains("verification failed"), "should contain title");
+    }
+
+    #[test]
+    fn slack_payload_includes_channel_when_set() {
+        let msg = mk_message();
+        let payload = super::SlackSink::build_payload(&msg, Some("#ops"));
+        assert_eq!(payload["channel"].as_str().unwrap(), "#ops");
+    }
+
+    #[test]
+    fn slack_payload_omits_channel_when_none() {
+        let msg = mk_message();
+        let payload = super::SlackSink::build_payload(&msg, None);
+        assert!(payload.get("channel").is_none());
+    }
+
+    #[test]
+    fn slack_payload_info_severity_uses_info_emoji() {
+        let mut msg = mk_message();
+        msg.severity = NotificationSeverity::Info;
+        let payload = super::SlackSink::build_payload(&msg, None);
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("ℹ️"));
+    }
+
+    #[test]
+    fn slack_payload_warning_severity_uses_warning_emoji() {
+        let mut msg = mk_message();
+        msg.severity = NotificationSeverity::Warning;
+        let payload = super::SlackSink::build_payload(&msg, None);
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("⚠️"));
     }
 }

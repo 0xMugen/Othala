@@ -462,6 +462,32 @@ pub(crate) fn status_sidebar_lines(
         }
     }
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Retry History:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    if task.retry_history.is_empty() {
+        lines.push(Line::from(Span::styled("No retries", Style::default().fg(DIM))));
+    } else {
+        for entry in &task.retry_history {
+            let reason = entry
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("success");
+            let timestamp = format_retry_timestamp(&entry.timestamp);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "#{} {:<7} — {} ({})",
+                    entry.attempt, entry.model, reason, timestamp
+                ),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
     if !activity.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -547,6 +573,12 @@ fn qa_test_lines(tests: &[QATestDisplay]) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn format_retry_timestamp(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
+        .unwrap_or_else(|_| timestamp.to_string())
 }
 
 pub(crate) fn to_local_time(value: DateTime<Utc>) -> String {

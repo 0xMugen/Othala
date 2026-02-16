@@ -4,6 +4,7 @@
 //! returns actions for the caller to execute.
 
 use chrono::{DateTime, Duration, Utc};
+use orch_core::config::{load_org_config, OrgConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
@@ -68,6 +69,7 @@ pub struct DaemonState {
     pub model_health: ModelHealthTracker,
     pub restack_retries: HashMap<String, RestackRetryState>,
     pub notification_dispatcher: Option<NotificationDispatcher>,
+    pub config_last_modified: Option<std::time::SystemTime>,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -123,6 +125,26 @@ impl DaemonState {
             model_health: ModelHealthTracker::new(),
             restack_retries: HashMap::new(),
             notification_dispatcher: None,
+            config_last_modified: None,
+        }
+    }
+}
+
+pub fn check_config_reload(config_path: &Path, daemon_state: &mut DaemonState) -> Option<OrgConfig> {
+    let metadata = std::fs::metadata(config_path).ok()?;
+    let mtime = metadata.modified().ok()?;
+    if daemon_state.config_last_modified == Some(mtime) {
+        return None;
+    }
+    daemon_state.config_last_modified = Some(mtime);
+    match load_org_config(config_path) {
+        Ok(config) => {
+            eprintln!("[daemon] Config reloaded from {}", config_path.display());
+            Some(config)
+        }
+        Err(e) => {
+            eprintln!("[daemon] Failed to reload config: {}", e);
+            None
         }
     }
 }
@@ -1620,6 +1642,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     fn mk_service() -> OrchdService {
         let store = SqliteStore::open_in_memory().expect("in-memory db");
@@ -1679,6 +1703,37 @@ mod tests {
             at: Utc::now(),
             kind: EventKind::TaskCreated,
         }
+    }
+
+    fn sample_org_config_toml(tick_interval_secs: u64, agent_timeout_secs: u64) -> String {
+        format!(
+            r#"
+[models]
+enabled = ["claude", "codex", "gemini"]
+
+[concurrency]
+per_repo = 10
+claude = 10
+codex = 10
+gemini = 10
+
+[graphite]
+auto_submit = true
+submit_mode_default = "single"
+allow_move = "manual"
+
+[ui]
+web_bind = "127.0.0.1:9842"
+
+[notifications]
+enabled = false
+stdout = true
+
+[daemon]
+tick_interval_secs = {tick_interval_secs}
+agent_timeout_secs = {agent_timeout_secs}
+"#
+        )
     }
 
     fn init_git_repo_with_commit() -> (PathBuf, String) {
@@ -1843,6 +1898,62 @@ mod tests {
         let state = DaemonState::default();
         assert!(state.pipelines.is_empty());
         assert!(state.restack_retries.is_empty());
+        assert!(state.config_last_modified.is_none());
+    }
+
+    #[test]
+    fn config_reload_detects_change() {
+        let mut daemon_state = DaemonState::new();
+        let config_dir = std::env::temp_dir().join(format!(
+            "othala-config-reload-detects-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("config.toml");
+
+        fs::write(&config_path, sample_org_config_toml(2, 1800)).expect("write initial config");
+        let first = check_config_reload(&config_path, &mut daemon_state);
+        assert!(first.is_some(), "initial load should reload config");
+
+        thread::sleep(StdDuration::from_millis(1100));
+        fs::write(&config_path, sample_org_config_toml(7, 90)).expect("write updated config");
+        let second = check_config_reload(&config_path, &mut daemon_state).expect("config reload");
+        assert_eq!(second.daemon.tick_interval_secs, 7);
+        assert_eq!(second.daemon.agent_timeout_secs, 90);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn config_reload_skips_unchanged() {
+        let mut daemon_state = DaemonState::new();
+        let config_dir = std::env::temp_dir().join(format!(
+            "othala-config-reload-unchanged-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("config.toml");
+
+        fs::write(&config_path, sample_org_config_toml(2, 1800)).expect("write initial config");
+        let first = check_config_reload(&config_path, &mut daemon_state);
+        assert!(first.is_some(), "first read should load config");
+
+        let second = check_config_reload(&config_path, &mut daemon_state);
+        assert!(second.is_none(), "unchanged mtime should skip reload");
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn config_reload_handles_missing_file() {
+        let mut daemon_state = DaemonState::new();
+        let missing_path = std::env::temp_dir().join(format!(
+            "othala-config-reload-missing-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let result = check_config_reload(&missing_path, &mut daemon_state);
+        assert!(result.is_none());
     }
 
     #[test]

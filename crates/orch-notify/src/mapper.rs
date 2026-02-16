@@ -57,11 +57,50 @@ pub fn notification_for_event(event: &Event) -> Option<NotificationMessage> {
             task_id: event.task_id.clone(),
             repo_id: event.repo_id.clone(),
         }),
-        EventKind::AgentSpawned { .. }
-        | EventKind::AgentCompleted { success: true, .. }
-        | EventKind::ModelFallback { .. }
-        | EventKind::ContextRegenStarted
-        | EventKind::ContextRegenCompleted { .. } => None,
+        EventKind::VerifyCompleted { success: true } => Some(NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::VerifyPassed,
+            severity: NotificationSeverity::Info,
+            title: "Verification passed".to_string(),
+            body: "All verification checks passed.".to_string(),
+            task_id: event.task_id.clone(),
+            repo_id: event.repo_id.clone(),
+        }),
+        EventKind::AgentSpawned { model } => Some(NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::AgentSpawned,
+            severity: NotificationSeverity::Info,
+            title: format!("Agent spawned ({model})"),
+            body: format!("Started agent run with {model}."),
+            task_id: event.task_id.clone(),
+            repo_id: event.repo_id.clone(),
+        }),
+        EventKind::AgentCompleted {
+            model,
+            success: true,
+            duration_secs,
+        } => Some(NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::AgentCompleted,
+            severity: NotificationSeverity::Info,
+            title: format!("Agent completed ({model})"),
+            body: format!("Agent run completed successfully in {duration_secs}s."),
+            task_id: event.task_id.clone(),
+            repo_id: event.repo_id.clone(),
+        }),
+        EventKind::ModelFallback {
+            from_model,
+            to_model,
+            reason,
+        } => Some(NotificationMessage {
+            at: Utc::now(),
+            topic: NotificationTopic::RetryScheduled,
+            severity: NotificationSeverity::Warning,
+            title: format!("Model fallback: {from_model} → {to_model}"),
+            body: format!("Retrying with {to_model}: {reason}"),
+            task_id: event.task_id.clone(),
+            repo_id: event.repo_id.clone(),
+        }),
         _ => None,
     }
 }
@@ -124,9 +163,11 @@ mod tests {
     }
 
     #[test]
-    fn ignores_successful_verify() {
+    fn maps_successful_verify_to_info() {
         let verify_ok = mk_event(EventKind::VerifyCompleted { success: true });
-        assert!(notification_for_event(&verify_ok).is_none());
+        let message = notification_for_event(&verify_ok).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::VerifyPassed);
+        assert_eq!(message.severity, NotificationSeverity::Info);
     }
 
     #[test]
@@ -158,5 +199,43 @@ mod tests {
         });
 
         assert!(notification_for_event(&event).is_some());
+    }
+
+    #[test]
+    fn maps_agent_spawned_to_info() {
+        let event = mk_event(EventKind::AgentSpawned {
+            model: "claude".to_string(),
+        });
+        let message = notification_for_event(&event).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::AgentSpawned);
+        assert_eq!(message.severity, NotificationSeverity::Info);
+        assert!(message.title.contains("claude"));
+    }
+
+    #[test]
+    fn maps_successful_agent_completion_to_info() {
+        let event = mk_event(EventKind::AgentCompleted {
+            model: "codex".to_string(),
+            success: true,
+            duration_secs: 42,
+        });
+        let message = notification_for_event(&event).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::AgentCompleted);
+        assert_eq!(message.severity, NotificationSeverity::Info);
+        assert!(message.body.contains("42s"));
+    }
+
+    #[test]
+    fn maps_model_fallback_to_retry_warning() {
+        let event = mk_event(EventKind::ModelFallback {
+            from_model: "claude".to_string(),
+            to_model: "codex".to_string(),
+            reason: "timeout".to_string(),
+        });
+        let message = notification_for_event(&event).expect("expected notification");
+        assert_eq!(message.topic, NotificationTopic::RetryScheduled);
+        assert_eq!(message.severity, NotificationSeverity::Warning);
+        assert!(message.title.contains("claude"));
+        assert!(message.title.contains("codex"));
     }
 }

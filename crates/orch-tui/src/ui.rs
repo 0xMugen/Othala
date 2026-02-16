@@ -135,6 +135,10 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
 
     render_footer(frame, root[2], app);
 
+    if let Some((active_field, repo, title, model)) = app.new_task_dialog_display() {
+        render_new_task_dialog_modal(frame, active_field, repo, title, model);
+    }
+
     if let Some((task_id, branch)) = app.delete_confirm_display() {
         render_delete_confirm_modal(frame, &task_id.0, branch);
     }
@@ -586,6 +590,62 @@ fn render_delete_confirm_modal(frame: &mut Frame<'_>, task_id: &str, branch: Opt
     frame.render_widget(widget, area);
 }
 
+fn render_new_task_dialog_modal(
+    frame: &mut Frame<'_>,
+    active_field: usize,
+    repo: &str,
+    title: &str,
+    model: &str,
+) {
+    let area = centered_rect(60, 36, frame.area());
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+
+    let field_line = |label: &str, value: &str, idx: usize| {
+        Line::from(vec![
+            Span::styled(format!("{label:<7}"), Style::default().fg(DIM)),
+            Span::styled(
+                if value.is_empty() {
+                    " ".to_string()
+                } else {
+                    value.to_string()
+                },
+                if active_field == idx {
+                    selected_style
+                } else {
+                    normal_style
+                },
+            ),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Create a new task",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        field_line("Repo:", repo, 0),
+        field_line("Title:", title, 1),
+        field_line("Model:", model, 2),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Tab] Next field  [Enter] Create  [Esc] Cancel",
+            Style::default().fg(DIM),
+        )),
+    ];
+
+    let widget = Paragraph::new(lines)
+        .block(focused_block("New Task"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
 fn render_help_overlay(frame: &mut Frame<'_>) {
     let area = centered_rect(60, 80, frame.area());
     let shortcuts = [
@@ -599,6 +659,7 @@ fn render_help_overlay(frame: &mut Frame<'_>) {
         ("/", "Filter text"),
         ("F", "Cycle state filter"),
         ("c", "Create task"),
+        ("N", "New task dialog"),
         ("a", "Approve task"),
         ("g", "Submit to Graphite"),
         ("s", "Start agent"),
@@ -685,9 +746,9 @@ mod tests {
     use crate::TuiApp;
 
     use super::{
-        footer_height, format_cost_display, format_pane_tabs, format_task_row, pane_status_tag,
-        status_activity, status_line_color, status_sidebar_lines, to_local_time,
-        wrapped_visual_line_count,
+        estimate_task_cost_usd, footer_height, format_cost_display, format_pane_tabs,
+        format_task_row, pane_status_tag, status_activity, status_line_color,
+        status_sidebar_lines, to_local_time, wrapped_visual_line_count,
     };
 
     fn mk_row(task_id: &str) -> TaskOverviewRow {
@@ -707,6 +768,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }
     }
 

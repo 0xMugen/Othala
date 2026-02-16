@@ -51,6 +51,9 @@ pub enum EventKind {
         success: bool,
         duration_secs: u64,
     },
+    CancellationRequested {
+        reason: String,
+    },
     /// Retry switched to a different model.
     ModelFallback {
         from_model: String,
@@ -62,6 +65,9 @@ pub enum EventKind {
     /// Context regeneration finished.
     ContextRegenCompleted {
         success: bool,
+    },
+    ConfigReloaded {
+        changes: String,
     },
     /// Task failed (final or non-final).
     TaskFailed {
@@ -176,6 +182,9 @@ mod tests {
                 success: false,
                 duration_secs: 42,
             },
+            EventKind::CancellationRequested {
+                reason: "user requested stop".to_string(),
+            },
             EventKind::ModelFallback {
                 from_model: "claude".to_string(),
                 to_model: "codex".to_string(),
@@ -183,6 +192,9 @@ mod tests {
             },
             EventKind::ContextRegenStarted,
             EventKind::ContextRegenCompleted { success: true },
+            EventKind::ConfigReloaded {
+                changes: "enabled_models, tick_interval_secs".to_string(),
+            },
             EventKind::TaskFailed {
                 reason: "max retries".to_string(),
                 is_final: true,
@@ -229,5 +241,16 @@ mod tests {
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.task_id, None);
         assert_eq!(decoded.repo_id, None);
+    }
+
+    #[test]
+    fn config_reloaded_event_created() {
+        let kind = EventKind::ConfigReloaded {
+            changes: "tick_interval_secs: 2->5".to_string(),
+        };
+        let encoded = serde_json::to_string(&kind).expect("serialize config reload event");
+        assert!(encoded.contains("config_reloaded"));
+        let decoded: EventKind = serde_json::from_str(&encoded).expect("deserialize config reload event");
+        assert_eq!(decoded, kind);
     }
 }

@@ -2,7 +2,9 @@ use chrono::Utc;
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
-use orch_tui::{run_tui_with_hook, AgentPaneStatus, QATestDisplay, TuiApp, TuiEvent, UiAction};
+use orch_tui::{
+    run_tui_with_hook, AgentPaneStatus, QATestDisplay, QueuedAction, TuiApp, TuiEvent, UiAction,
+};
 use orchd::qa_agent;
 use orchd::stack_pipeline::{self, PipelineState};
 use orchd::supervisor::AgentSupervisor;
@@ -659,10 +661,111 @@ fn run() -> Result<(), MainError> {
         // Process queued actions from the UI.
         let actions = app.drain_actions();
         for queued in actions {
-            match queued.action {
+            let (action, task_id, prompt, selected_model) = match queued {
+                QueuedAction::Dispatch {
+                    action,
+                    task_id,
+                    prompt,
+                    model,
+                } => (action, task_id, prompt, model),
+                QueuedAction::CreateTask { repo, title, model } => {
+                    let model_kind = match model.trim().to_ascii_lowercase().as_str() {
+                        "codex" => ModelKind::Codex,
+                        "gemini" => ModelKind::Gemini,
+                        _ => ModelKind::Claude,
+                    };
+                    let repo_id = if repo.trim().is_empty() {
+                        "default".to_string()
+                    } else {
+                        repo.trim().to_string()
+                    };
+                    let title = title.trim().to_string();
+                    let task_id = TaskId::new(format!("chat-{}", Utc::now().timestamp_millis()));
+                    let start_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+                    let base_branch = qa_stack_head
+                        .as_ref()
+                        .map(|(_, branch)| branch.as_str())
+                        .unwrap_or("main");
+                    let (worktree_path, branch_name) = match orchd::provision_chat_workspace_on_base(
+                        &start_path,
+                        &task_id,
+                        Some(base_branch),
+                    ) {
+                        Ok(ws) => (ws.worktree_path, Some(ws.branch_name)),
+                        Err(e) => {
+                            if base_branch != "main" {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!(
+                                        "workspace on `{base_branch}` failed ({e}); retrying on main"
+                                    ),
+                                });
+                                match orchd::provision_chat_workspace_on_base(
+                                    &start_path,
+                                    &task_id,
+                                    Some("main"),
+                                ) {
+                                    Ok(ws) => (ws.worktree_path, Some(ws.branch_name)),
+                                    Err(main_err) => {
+                                        app.apply_event(TuiEvent::StatusLine {
+                                            message: format!("workspace provision failed: {main_err}"),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                app.apply_event(TuiEvent::StatusLine {
+                                    message: format!("workspace provision failed: {e}"),
+                                });
+                                continue;
+                            }
+                        }
+                    };
+
+                    let mut task = Task::new(
+                        task_id.clone(),
+                        RepoId(repo_id.clone()),
+                        title,
+                        worktree_path,
+                    );
+                    task.preferred_model = Some(model_kind);
+                    task.submit_mode = SubmitMode::Stack;
+                    task.branch_name = branch_name.clone();
+                    let event = Event {
+                        id: EventId(format!("E-CREATE-{}", task_id.0)),
+                        task_id: Some(task.id.clone()),
+                        repo_id: Some(task.repo_id.clone()),
+                        at: Utc::now(),
+                        kind: EventKind::TaskCreated,
+                    };
+
+                    match service.create_task(&task, &event) {
+                        Ok(()) => {
+                            let detail = branch_name.as_deref().unwrap_or("(no branch)");
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!(
+                                    "created task {} repo={} model={:?} on {}",
+                                    task_id.0, repo_id, model_kind, detail
+                                ),
+                            });
+                            if let Ok(tasks) = service.list_top_level_tasks() {
+                                app.apply_event(TuiEvent::TasksReplaced { tasks });
+                            }
+                        }
+                        Err(e) => {
+                            app.apply_event(TuiEvent::StatusLine {
+                                message: format!("create failed: {e}"),
+                            });
+                        }
+                    }
+
+                    continue;
+                }
+            };
+            match action {
                 UiAction::CreateTask => {
-                    if let Some(prompt) = &queued.prompt {
-                        let model = queued.model.unwrap_or(ModelKind::Claude);
+                    if let Some(prompt) = &prompt {
+                        let model = selected_model.unwrap_or(ModelKind::Claude);
                         let task_id =
                             TaskId::new(format!("chat-{}", Utc::now().timestamp_millis()));
                         let start_path =
@@ -747,7 +850,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::DeleteTask => {
-                    if let Some(task_id) = &queued.task_id {
+                    if let Some(task_id) = &task_id {
                         supervisor.stop(task_id);
                         // Kill any running QA agents for this task.
                         for prefix in &["qa-", "qa-base-"] {
@@ -797,7 +900,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::StartAgent => {
-                    if let Some(task_id) = &queued.task_id {
+                    if let Some(task_id) = &task_id {
                         if let Ok(Some(task)) = service.task(task_id) {
                             // Validate/recover worktree before spawning.
                             if let Err(e) = orchd::ensure_worktree_exists(&repo_root, &task) {
@@ -849,7 +952,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::StopAgent => {
-                    if let Some(task_id) = &queued.task_id {
+                    if let Some(task_id) = &task_id {
                         supervisor.stop(task_id);
                         manually_stopped_tasks.insert(task_id.clone());
                         let instance_id = format!("agent-{}", task_id.0);
@@ -864,7 +967,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::SendChatMessage => {
-                    if let (Some(task_id), Some(message)) = (&queued.task_id, &queued.prompt) {
+                    if let (Some(task_id), Some(message)) = (&task_id, &prompt) {
                         // Auto-spawn interactive session if none exists.
                         if !supervisor.has_session(task_id) {
                             if let Ok(Some(task)) = service.task(task_id) {
@@ -956,7 +1059,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::ApproveTask => {
-                    if let Some(task_id) = &queued.task_id {
+                    if let Some(task_id) = &task_id {
                         let now = Utc::now();
                         let event_id = EventId(format!("E-READY-{}", task_id.0));
                         match service.mark_ready(task_id, event_id, now) {
@@ -985,7 +1088,7 @@ fn run() -> Result<(), MainError> {
                     }
                 }
                 UiAction::SubmitTask => {
-                    if let Some(task_id) = &queued.task_id {
+                    if let Some(task_id) = &task_id {
                         if let Ok(Some(task)) = service.task(task_id) {
                             if task.state == TaskState::Ready && !pipelines.contains_key(&task_id.0)
                             {
@@ -1039,7 +1142,7 @@ fn run() -> Result<(), MainError> {
                 }
                 _ => {
                     app.apply_event(TuiEvent::StatusLine {
-                        message: format!("action not yet implemented: {:?}", queued.action),
+                        message: format!("action not yet implemented: {:?}", action),
                     });
                 }
             }
