@@ -4,7 +4,7 @@ use std::fmt;
 
 const WARN_THRESHOLD_SECS: i64 = 5 * 60;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TimeoutConfig {
     pub default_timeout_secs: u64,
     pub max_timeout_secs: u64,

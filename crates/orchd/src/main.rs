@@ -484,6 +484,59 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage LSP language servers
+    Lsp {
+        #[command(subcommand)]
+        action: LspAction,
+    },
+    /// Show rate limit status
+    RateLimits {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show task timeout status
+    Timeouts {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show environment variable injection config
+    Env {
+        /// Task ID to show env for
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Model to show env for
+        #[arg(long)]
+        model: Option<String>,
+        /// Show redacted values
+        #[arg(long)]
+        redacted: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start MCP server with HTTP/SSE transport
+    McpHttp {
+        /// Bind address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Port number
+        #[arg(long, default_value = "9898")]
+        port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum LspAction {
+    /// List configured language servers
+    List,
+    /// Show LSP status and diagnostics cache
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3879,6 +3932,96 @@ fn main() -> anyhow::Result<()> {
                 println!("No results for: {query}");
             } else {
                 println!("{}", orchd::search::display_search_results(&results));
+            }
+        }
+        Commands::Lsp { action } => match action {
+            LspAction::List => {
+                let config = orchd::lsp::LspConfig::default();
+                for (lang_id, server_cfg) in &config.language_servers {
+                    println!("{lang_id}: {} {}", server_cfg.command, server_cfg.args.join(" "));
+                }
+            }
+            LspAction::Status { json } => {
+                let manager = orchd::lsp::LspManager::new(orchd::lsp::LspConfig::default());
+                let servers = manager.active_servers();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&servers).unwrap_or_default());
+                } else if servers.is_empty() {
+                    println!("No active LSP servers.");
+                } else {
+                    for (lang_id, initialized) in &servers {
+                        let status = if *initialized { "initialized" } else { "starting" };
+                        println!("{lang_id}: {status}");
+                    }
+                }
+            }
+        },
+        Commands::RateLimits { json } => {
+            let config = orchd::rate_limiter::RateLimitConfig::default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap_or_default());
+            } else {
+                println!("Rate Limits:");
+                println!("  Per-minute: {}", config.requests_per_minute);
+                println!("  Per-hour:   {}", config.requests_per_hour);
+                println!("  Burst:      {}", config.burst_size);
+            }
+        }
+        Commands::Timeouts { json } => {
+            let config = orchd::task_timeout::TimeoutConfig::default();
+            let tracker = orchd::task_timeout::TimeoutTracker::new(config.clone());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap_or_default());
+            } else {
+                println!("Timeout Config:");
+                println!("  Default:  {}s", config.default_timeout_secs);
+                println!("  Maximum:  {}s", config.max_timeout_secs);
+                println!("  Grace:    {}s", config.grace_period_secs);
+                println!("  Interval: {}s", config.check_interval_secs);
+                println!("  Tracked:  {}", tracker.active_count());
+            }
+        }
+        Commands::Env { task_id, model, redacted, json } => {
+            let config = orchd::env_inject::EnvConfig::default();
+            let injector = orchd::env_inject::EnvInjector::new(config);
+            let tid = task_id.as_deref().unwrap_or("example-task");
+            let mdl = model.as_deref().unwrap_or("claude");
+            let env_map = if redacted {
+                injector.redacted_env(tid, mdl)
+            } else {
+                injector.build_env(tid, mdl)
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&env_map).unwrap_or_default());
+            } else {
+                let mut keys: Vec<_> = env_map.keys().collect();
+                keys.sort();
+                for key in keys {
+                    println!("{}={}", key, env_map[key]);
+                }
+            }
+        }
+        Commands::McpHttp { bind, port } => {
+            let config = orchd::mcp_transport::TransportConfig {
+                kind: orchd::mcp_transport::TransportKind::Http {
+                    bind_addr: bind.clone(),
+                    port,
+                },
+                ..Default::default()
+            };
+            println!("Starting MCP HTTP/SSE server on {bind}:{port}");
+            let transport = orchd::mcp_transport::HttpTransport::new(&config);
+            match transport {
+                Ok(t) => {
+                    println!("MCP HTTP transport ready");
+                    println!("  POST {bind}:{port}/rpc  - JSON-RPC endpoint");
+                    println!("  GET  {bind}:{port}/sse  - SSE event stream");
+                    println!("  GET  {bind}:{port}/health - Health check");
+                    if let Err(e) = t.bind() {
+                        eprintln!("Transport bind error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("Failed to start MCP HTTP transport: {e}"),
             }
         }
     }
