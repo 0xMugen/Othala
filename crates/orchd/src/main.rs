@@ -4,6 +4,7 @@
 
 use chrono::{Datelike, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use orch_git::{discover_repo, list_change_snapshots, redo_snapshot, undo_to_snapshot, GitCli};
 use orch_agents::setup::{
     probe_models, summarize_setup, validate_setup_selection, ModelSetupSelection, SetupProbeConfig,
 };
@@ -13,7 +14,7 @@ use orch_core::config::{
 };
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, RepoId, Task, TaskId, TaskPriority};
+use orch_core::types::{EventId, ModelKind, RepoId, Session, Task, TaskId, TaskPriority};
 #[cfg(test)]
 use orch_core::types::SubmitMode;
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
@@ -100,6 +101,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Sessions {
+        /// Output as JSON (for scripting/E2E tests)
+        #[arg(long)]
+        json: bool,
+    },
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Show chat status
     Status {
         /// Chat/task ID
@@ -130,6 +140,12 @@ enum Commands {
         /// Show stat summary instead of full diff
         #[arg(long)]
         stat: bool,
+    },
+    Undo {
+        task_id: String,
+    },
+    Redo {
+        task_id: String,
     },
     /// Run the daemon (orchestration loop)
     Daemon {
@@ -211,6 +227,12 @@ enum Commands {
         /// Follow and print new lines
         #[arg(short, long)]
         follow: bool,
+    },
+    Compact {
+        /// Task/chat ID
+        task_id: String,
+        #[arg(long)]
+        max_lines: Option<usize>,
     },
     Watch {
         #[arg(long)]
@@ -330,6 +352,18 @@ enum ChatAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Fork { id: String },
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -791,6 +825,60 @@ fn print_task_list(tasks: &[Task], json: bool) {
 fn print_task_json(task: &Task) {
     let out = serde_json::to_string_pretty(task).unwrap_or_else(|_| "{}".to_string());
     println!("{out}");
+}
+
+fn print_session_list(sessions: &[Session], json: bool) {
+    if json {
+        let out = serde_json::to_string_pretty(sessions).unwrap_or_else(|_| "[]".to_string());
+        println!("{out}");
+        return;
+    }
+    if sessions.is_empty() {
+        println!("No sessions found.");
+    } else {
+        println!("{:<24} {:<12} {:<8} TITLE", "ID", "STATUS", "TASKS");
+        println!("{}", "-".repeat(96));
+        for session in sessions {
+            println!(
+                "{:<24} {:<12} {:<8} {}",
+                session.id,
+                session.status,
+                session.task_ids.len(),
+                session.title
+            );
+        }
+    }
+}
+
+fn print_session_details(session: &Session, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(session).unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+
+    println!("Session: {}", session.id);
+    println!("Title: {}", session.title);
+    println!("Status: {}", session.status);
+    if let Some(parent_session_id) = &session.parent_session_id {
+        println!("Parent: {parent_session_id}");
+    }
+    println!("Task IDs: {}", session.task_ids.len());
+    if !session.task_ids.is_empty() {
+        println!(
+            "Tasks: {}",
+            session
+                .task_ids
+                .iter()
+                .map(|task_id| task_id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("Created: {}", session.created_at);
+    println!("Updated: {}", session.updated_at);
 }
 
 fn parse_model(s: &str) -> ModelKind {
@@ -2203,6 +2291,36 @@ fn main() -> anyhow::Result<()> {
         Commands::List { json } => {
             print_task_list(&service.list_tasks()?, json);
         }
+        Commands::Sessions { json } => {
+            let sessions = service.store.list_sessions()?;
+            print_session_list(&sessions, json);
+        }
+        Commands::Session { action } => match action {
+            SessionAction::Show { id, json } => match service.store.get_session(&id)? {
+                Some(session) => print_session_details(&session, json),
+                None => {
+                    if json {
+                        println!("null");
+                    } else {
+                        println!("Session not found: {}", id);
+                    }
+                }
+            },
+            SessionAction::Fork { id } => {
+                let child = service.store.fork_session(&id)?;
+                println!("Forked session: {} -> {}", id, child.id);
+            }
+            SessionAction::External(args) => {
+                if args.len() != 1 {
+                    anyhow::bail!("expected `othala session <id>` or `othala session fork <id>`");
+                }
+                let id = &args[0];
+                match service.store.get_session(id)? {
+                    Some(session) => print_session_details(&session, false),
+                    None => println!("Session not found: {}", id),
+                }
+            }
+        },
         Commands::Status { id, json } => {
             let task_id = TaskId::new(&id);
             match service.task(&task_id)? {
@@ -2301,6 +2419,40 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("git diff failed: {stderr}");
             }
             print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        Commands::Undo { task_id } => {
+            let task = service
+                .store
+                .load_task(&TaskId::new(&task_id))?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let git = GitCli::default();
+            let repo = discover_repo(&task.worktree_path, &git)?;
+            let snapshots = list_change_snapshots(&repo, &git, &task_id)?;
+            let snapshot = snapshots
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("no snapshots found for task: {task_id}"))?;
+            undo_to_snapshot(&repo, &git, snapshot)?;
+            println!(
+                "Undo applied for {} ({} -> {})",
+                task_id, snapshot.commit_sha, snapshot.parent_sha
+            );
+        }
+        Commands::Redo { task_id } => {
+            let task = service
+                .store
+                .load_task(&TaskId::new(&task_id))?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            let git = GitCli::default();
+            let repo = discover_repo(&task.worktree_path, &git)?;
+            let snapshots = list_change_snapshots(&repo, &git, &task_id)?;
+            let snapshot = snapshots
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("no snapshots found for task: {task_id}"))?;
+            redo_snapshot(&repo, &git, snapshot)?;
+            println!(
+                "Redo applied for {} ({} -> {})",
+                task_id, snapshot.parent_sha, snapshot.commit_sha
+            );
         }
         Commands::Daemon {
             timeout,
@@ -2811,6 +2963,26 @@ fn main() -> anyhow::Result<()> {
 
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
+            }
+        }
+        Commands::Compact { task_id, max_lines } => {
+            let repo_root = std::env::current_dir()?;
+            let task = TaskId::new(&task_id);
+            let content = orchd::agent_log::read_agent_log(&repo_root, &task)
+                .map_err(|err| anyhow::anyhow!("failed to read latest agent output for {task_id}: {err}"))?;
+            let lines: Vec<String> = content.lines().map(String::from).collect();
+
+            let result = orchd::agent_log::compact_context(&lines, max_lines.unwrap_or(120));
+            let compacted_path =
+                orchd::agent_log::save_compacted_summary(&repo_root, &task, &result.summary)?;
+
+            println!(
+                "Compacted {task_id}: {} -> {} lines (ratio {:.3})",
+                result.original_lines, result.compacted_lines, result.compression_ratio
+            );
+            println!("Saved compacted summary: {}", compacted_path.display());
+            if !result.summary.is_empty() {
+                println!("{}", result.summary);
             }
         }
         Commands::Watch { task, lines } => {
@@ -3535,6 +3707,26 @@ mod tests {
     }
 
     #[test]
+    fn undo_cli_parses_task_id() {
+        let cli = Cli::try_parse_from(["othala", "undo", "T-42"]).expect("parse undo");
+
+        match cli.command {
+            Commands::Undo { task_id } => assert_eq!(task_id, "T-42"),
+            _ => panic!("expected undo command"),
+        }
+    }
+
+    #[test]
+    fn redo_cli_parses_task_id() {
+        let cli = Cli::try_parse_from(["othala", "redo", "T-42"]).expect("parse redo");
+
+        match cli.command {
+            Commands::Redo { task_id } => assert_eq!(task_id, "T-42"),
+            _ => panic!("expected redo command"),
+        }
+    }
+
+    #[test]
     fn costs_cli_parses_budget_flag() {
         let cli = Cli::try_parse_from(["othala", "costs", "--budget"]).expect("parse costs");
 
@@ -3568,6 +3760,56 @@ mod tests {
     }
 
     #[test]
+    fn sessions_command_parses_json_flag() {
+        let cli = Cli::try_parse_from(["othala", "sessions", "--json"]).expect("parse sessions");
+        match cli.command {
+            Commands::Sessions { json } => assert!(json),
+            _ => panic!("expected sessions command"),
+        }
+    }
+
+    #[test]
+    fn session_show_subcommand_parses() {
+        let cli = Cli::try_parse_from(["othala", "session", "show", "S-42", "--json"])
+            .expect("parse session show");
+        match cli.command {
+            Commands::Session { action } => match action {
+                SessionAction::Show { id, json } => {
+                    assert_eq!(id, "S-42");
+                    assert!(json);
+                }
+                _ => panic!("expected session show"),
+            },
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn session_fork_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["othala", "session", "fork", "S-42"]).expect("parse fork");
+        match cli.command {
+            Commands::Session { action } => match action {
+                SessionAction::Fork { id } => assert_eq!(id, "S-42"),
+                _ => panic!("expected session fork"),
+            },
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn session_external_form_parses_as_single_id() {
+        let cli = Cli::try_parse_from(["othala", "session", "S-88"]).expect("parse external show");
+        match cli.command {
+            Commands::Session { action } => match action {
+                SessionAction::External(args) => assert_eq!(args, vec!["S-88".to_string()]),
+                _ => panic!("expected external args for session"),
+            },
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
     fn diff_retries_cli_parses_task_id() {
         let cli = Cli::try_parse_from(["othala", "diff-retries", "T-77"])
             .expect("parse diff-retries");
@@ -3577,6 +3819,20 @@ mod tests {
                 assert_eq!(task_id, "T-77");
             }
             _ => panic!("expected diff-retries command"),
+        }
+    }
+
+    #[test]
+    fn compact_cli_parses_task_and_max_lines() {
+        let cli = Cli::try_parse_from(["othala", "compact", "T-88", "--max-lines", "64"])
+            .expect("parse compact");
+
+        match cli.command {
+            Commands::Compact { task_id, max_lines } => {
+                assert_eq!(task_id, "T-88");
+                assert_eq!(max_lines, Some(64));
+            }
+            _ => panic!("expected compact command"),
         }
     }
 

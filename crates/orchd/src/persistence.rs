@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{ModelKind, Task, TaskId, TaskPriority};
+use orch_core::types::{ModelKind, Session, SessionStatus, Task, TaskId, TaskPriority};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -47,12 +47,22 @@ pub enum PersistenceError {
     },
     #[error("task not found: {task_id}")]
     TaskNotFound { task_id: String },
+    #[error("session not found: {session_id}")]
+    SessionNotFound { session_id: String },
 }
 
 /// SQLite-based store for tasks and events.
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
+}
+
+pub trait SessionStore {
+    fn create_session(&self, session: &Session) -> Result<(), PersistenceError>;
+    fn get_session(&self, id: &str) -> Result<Option<Session>, PersistenceError>;
+    fn list_sessions(&self) -> Result<Vec<Session>, PersistenceError>;
+    fn update_session(&self, session: &Session) -> Result<(), PersistenceError>;
+    fn fork_session(&self, id: &str) -> Result<Session, PersistenceError>;
 }
 
 impl SqliteStore {
@@ -118,6 +128,19 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    task_ids_json TEXT NOT NULL DEFAULT '[]',
+    parent_session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 
 CREATE TABLE IF NOT EXISTS archived_tasks (
     task_id TEXT PRIMARY KEY,
@@ -215,6 +238,180 @@ ON CONFLICT(task_id) DO UPDATE SET
             ],
         )?;
         Ok(())
+    }
+
+    pub fn create_session(&self, session: &Session) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            r#"
+INSERT INTO sessions (session_id, title, created_at, updated_at, task_ids_json, parent_session_id, status)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+"#,
+            params![
+                session.id.as_str(),
+                session.title.as_str(),
+                session.created_at.to_rfc3339(),
+                session.updated_at.to_rfc3339(),
+                serde_json::to_string(&session.task_ids)?,
+                session.parent_session_id.as_deref(),
+                session.status.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session(&self, id: &str) -> Result<Option<Session>, PersistenceError> {
+        type SessionRow = (String, String, String, String, String, Option<String>, String);
+        let row: Option<SessionRow> = self
+            .conn
+            .query_row(
+                "SELECT session_id, title, created_at, updated_at, task_ids_json, parent_session_id, status FROM sessions WHERE session_id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        row.map(
+            |(session_id, title, created_at_raw, updated_at_raw, task_ids_json, parent_id, status)| {
+                let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|source| PersistenceError::TimestampParse {
+                        value: created_at_raw,
+                        source,
+                    })?;
+                let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|source| PersistenceError::TimestampParse {
+                        value: updated_at_raw,
+                        source,
+                    })?;
+                let task_ids = serde_json::from_str::<Vec<TaskId>>(&task_ids_json)?;
+
+                Ok(Session {
+                    id: session_id,
+                    title,
+                    created_at,
+                    updated_at,
+                    task_ids,
+                    parent_session_id: parent_id,
+                    status: status.parse::<SessionStatus>().unwrap_or_default(),
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<Session>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, title, created_at, updated_at, task_ids_json, parent_session_id, status FROM sessions ORDER BY updated_at DESC, session_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (session_id, title, created_at_raw, updated_at_raw, task_ids_json, parent_id, status) =
+                row?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|source| PersistenceError::TimestampParse {
+                    value: created_at_raw,
+                    source,
+                })?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|source| PersistenceError::TimestampParse {
+                    value: updated_at_raw,
+                    source,
+                })?;
+            let task_ids = serde_json::from_str::<Vec<TaskId>>(&task_ids_json)?;
+            sessions.push(Session {
+                id: session_id,
+                title,
+                created_at,
+                updated_at,
+                task_ids,
+                parent_session_id: parent_id,
+                status: status.parse::<SessionStatus>().unwrap_or_default(),
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    pub fn update_session(&self, session: &Session) -> Result<(), PersistenceError> {
+        let updated = self.conn.execute(
+            r#"
+UPDATE sessions
+SET title = ?2,
+    created_at = ?3,
+    updated_at = ?4,
+    task_ids_json = ?5,
+    parent_session_id = ?6,
+    status = ?7
+WHERE session_id = ?1
+"#,
+            params![
+                session.id.as_str(),
+                session.title.as_str(),
+                session.created_at.to_rfc3339(),
+                session.updated_at.to_rfc3339(),
+                serde_json::to_string(&session.task_ids)?,
+                session.parent_session_id.as_deref(),
+                session.status.as_str(),
+            ],
+        )?;
+
+        if updated == 0 {
+            return Err(PersistenceError::SessionNotFound {
+                session_id: session.id.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn fork_session(&self, id: &str) -> Result<Session, PersistenceError> {
+        let parent = self
+            .get_session(id)?
+            .ok_or_else(|| PersistenceError::SessionNotFound {
+                session_id: id.to_string(),
+            })?;
+        let now = Utc::now();
+
+        let child = Session {
+            id: format!(
+                "S-{}",
+                now.timestamp_nanos_opt().unwrap_or(now.timestamp_millis() * 1_000_000)
+            ),
+            title: format!("{} (fork)", parent.title),
+            created_at: now,
+            updated_at: now,
+            task_ids: parent.task_ids,
+            parent_session_id: Some(parent.id),
+            status: SessionStatus::Active,
+        };
+
+        self.create_session(&child)?;
+        Ok(child)
     }
 
     pub fn load_task(&self, task_id: &TaskId) -> Result<Option<Task>, PersistenceError> {
@@ -751,6 +948,28 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     }
 }
 
+impl SessionStore for SqliteStore {
+    fn create_session(&self, session: &Session) -> Result<(), PersistenceError> {
+        SqliteStore::create_session(self, session)
+    }
+
+    fn get_session(&self, id: &str) -> Result<Option<Session>, PersistenceError> {
+        SqliteStore::get_session(self, id)
+    }
+
+    fn list_sessions(&self) -> Result<Vec<Session>, PersistenceError> {
+        SqliteStore::list_sessions(self)
+    }
+
+    fn update_session(&self, session: &Session) -> Result<(), PersistenceError> {
+        SqliteStore::update_session(self, session)
+    }
+
+    fn fork_session(&self, id: &str) -> Result<Session, PersistenceError> {
+        SqliteStore::fork_session(self, id)
+    }
+}
+
 fn parse_optional_rfc3339(
     value: Option<String>,
 ) -> Result<Option<DateTime<Utc>>, PersistenceError> {
@@ -800,7 +1019,7 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use orch_core::types::{EventId, ModelKind, RepoId, TaskPriority};
+    use orch_core::types::{EventId, ModelKind, RepoId, Session, SessionStatus, TaskPriority};
     use std::path::PathBuf;
 
     fn mk_store() -> SqliteStore {
@@ -818,6 +1037,118 @@ mod tests {
         );
         task.state = state;
         task
+    }
+
+    fn mk_session(id: &str) -> Session {
+        let now = Utc::now();
+        Session {
+            id: id.to_string(),
+            title: format!("Session {id}"),
+            created_at: now,
+            updated_at: now,
+            task_ids: vec![TaskId::new("T1")],
+            parent_session_id: None,
+            status: SessionStatus::Active,
+        }
+    }
+
+    #[test]
+    fn sessions_table_created() {
+        let store = mk_store();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn create_and_get_session_round_trip() {
+        let store = mk_store();
+        let session = mk_session("S-1");
+
+        store.create_session(&session).expect("create session");
+        let loaded = store
+            .get_session(&session.id)
+            .expect("get session")
+            .expect("session exists");
+
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.title, session.title);
+        assert_eq!(loaded.task_ids, session.task_ids);
+        assert_eq!(loaded.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn list_sessions_orders_by_updated_at_desc() {
+        let store = mk_store();
+        let mut s1 = mk_session("S-2");
+        let mut s2 = mk_session("S-3");
+        s1.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        s2.updated_at = Utc::now();
+
+        store.create_session(&s1).expect("create s1");
+        store.create_session(&s2).expect("create s2");
+
+        let sessions = store.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "S-3");
+        assert_eq!(sessions[1].id, "S-2");
+    }
+
+    #[test]
+    fn update_session_persists_changes() {
+        let store = mk_store();
+        let mut session = mk_session("S-4");
+        store.create_session(&session).expect("create session");
+
+        session.title = "Renamed Session".to_string();
+        session.status = SessionStatus::Completed;
+        session.task_ids.push(TaskId::new("T2"));
+        session.updated_at = Utc::now();
+        store.update_session(&session).expect("update session");
+
+        let loaded = store
+            .get_session(&session.id)
+            .expect("get session")
+            .expect("session exists");
+        assert_eq!(loaded.title, "Renamed Session");
+        assert_eq!(loaded.status, SessionStatus::Completed);
+        assert_eq!(loaded.task_ids, vec![TaskId::new("T1"), TaskId::new("T2")]);
+    }
+
+    #[test]
+    fn fork_session_creates_child_with_parent_link() {
+        let store = mk_store();
+        let mut parent = mk_session("S-5");
+        parent.task_ids = vec![TaskId::new("T-A"), TaskId::new("T-B")];
+        parent.status = SessionStatus::Completed;
+        store.create_session(&parent).expect("create parent");
+
+        let child = store.fork_session(&parent.id).expect("fork session");
+        assert!(child.id.starts_with("S-"));
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.task_ids, parent.task_ids);
+        assert_eq!(child.status, SessionStatus::Active);
+
+        let loaded = store
+            .get_session(&child.id)
+            .expect("get child")
+            .expect("child exists");
+        assert_eq!(loaded.parent_session_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    #[test]
+    fn fork_session_fails_for_missing_parent() {
+        let store = mk_store();
+        let err = store
+            .fork_session("S-DOES-NOT-EXIST")
+            .expect_err("missing parent should fail");
+        assert!(matches!(err, PersistenceError::SessionNotFound { .. }));
     }
 
     #[test]
