@@ -322,6 +322,8 @@ pub struct ModelHealthDisplay {
 pub struct DashboardState {
     pub tasks: Vec<TaskOverviewRow>,
     pub panes: Vec<AgentPane>,
+    #[serde(default)]
+    pub log_root: Option<String>,
     pub model_health: Vec<ModelHealthDisplay>,
     pub filter_text: Option<String>,
     pub filter_state: Option<TaskState>,
@@ -342,6 +344,7 @@ impl Default for DashboardState {
         Self {
             tasks: Vec::new(),
             panes: Vec::new(),
+            log_root: None,
             model_health: Vec::new(),
             filter_text: None,
             filter_state: None,
@@ -834,6 +837,7 @@ mod tests {
                 mk_row("T6", "Task 6", TaskState::Merged),
                 mk_row("T7", "Task 7", TaskState::Stopped),
             ],
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -867,6 +871,7 @@ mod tests {
                 mk_row("T2", "Fix panic on submit", TaskState::Ready),
             ],
             filter_text: Some("oauth".to_string()),
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -881,6 +886,7 @@ mod tests {
                 mk_row("T200", "Fix panic on submit", TaskState::Ready),
             ],
             filter_text: Some("t100".to_string()),
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -896,6 +902,7 @@ mod tests {
                 mk_row("T3", "Wire merge checks", TaskState::Ready),
             ],
             filter_state: Some(TaskState::Ready),
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -912,6 +919,7 @@ mod tests {
             ],
             filter_text: Some("oauth".to_string()),
             filter_state: Some(TaskState::Ready),
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -956,6 +964,7 @@ mod tests {
                 pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1", "new 2"]),
             ],
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -970,6 +979,7 @@ mod tests {
                 pane_with_lines("A1", "T1", ModelKind::Claude, &["old 1", "old 2"]),
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
             ],
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -989,6 +999,7 @@ mod tests {
                 pane_with_lines("A2", "T2", ModelKind::Codex, &["new 1"]),
             ],
             focused_pane_idx: Some(1),
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1036,6 +1047,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::Agent,
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1058,6 +1070,7 @@ mod tests {
                 pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
                 pane_with_lines("agent-T2", "T2", ModelKind::Codex, &["agent2"]),
             ],
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1077,6 +1090,7 @@ mod tests {
                 pane_with_lines("agent-T1", "T1", ModelKind::Claude, &["agent"]),
                 pane_with_lines("qa-T1", "T1", ModelKind::Claude, &["qa"]),
             ],
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1105,6 +1119,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::QA,
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1131,6 +1146,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 1, // qa-T1
             selected_pane_category: PaneCategory::QA,
+            log_root: None,
             ..DashboardState::default()
         };
 
@@ -1152,6 +1168,7 @@ mod tests {
             selected_task_idx: 0,
             selected_pane_idx: 0,
             selected_pane_category: PaneCategory::Agent,
+            log_root: None,
             ..DashboardState::default()
         };
 

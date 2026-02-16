@@ -386,6 +386,27 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         Ok(events)
     }
 
+    pub fn task_count_by_state(&self) -> Result<Vec<(String, i64)>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state_tag, COUNT(*) FROM tasks GROUP BY state_tag")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = Vec::new();
+        for row in rows {
+            counts.push(row?);
+        }
+        Ok(counts)
+    }
+
+    pub fn total_event_count(&self) -> Result<i64, PersistenceError> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
     // --- Runs ---
 
     pub fn insert_run(&self, run: &TaskRunRecord) -> Result<(), PersistenceError> {
@@ -837,5 +858,26 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].task_id, task.id);
         assert_eq!(archived[0].state_tag, "MERGED");
+    }
+
+    #[test]
+    fn total_event_count_returns_correct_count() {
+        let store = mk_store();
+        let task = mk_task("T-EVENT-COUNT", TaskState::Chatting);
+        store.upsert_task(&task).expect("upsert");
+
+        for idx in 0..3 {
+            let event = Event {
+                id: EventId(format!("E-EVENT-COUNT-{idx}")),
+                task_id: Some(task.id.clone()),
+                repo_id: Some(task.repo_id.clone()),
+                at: Utc::now(),
+                kind: EventKind::TaskCreated,
+            };
+            store.append_event(&event).expect("append event");
+        }
+
+        let count = store.total_event_count().expect("count events");
+        assert_eq!(count, 3);
     }
 }

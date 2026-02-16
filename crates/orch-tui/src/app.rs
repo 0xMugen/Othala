@@ -57,6 +57,11 @@ pub enum InputMode {
         /// `None` means showing the draft; `Some(i)` means showing `history[len - 1 - i]`.
         history_index: Option<usize>,
     },
+    LogView {
+        task_id: String,
+        log_lines: Vec<String>,
+        scroll_offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +182,31 @@ impl TuiApp {
 
         if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('N') {
             self.begin_new_task_dialog();
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal)
+            && self.state.focused_task
+            && key.code == KeyCode::Char('l')
+        {
+            let Some(task_id) = self.state.selected_task().map(|task| task.task_id.0.clone()) else {
+                self.state.status_line = "no task selected for log view".to_string();
+                return;
+            };
+
+            let log_lines = self
+                .state
+                .log_root
+                .as_deref()
+                .map(|root| load_agent_log(root, &task_id))
+                .unwrap_or_else(|| vec!["No log output available.".to_string()]);
+
+            self.input_mode = InputMode::LogView {
+                task_id: task_id.clone(),
+                log_lines,
+                scroll_offset: 0,
+            };
+            self.state.status_line = format!("agent log view: {task_id}");
             return;
         }
 
@@ -567,6 +597,42 @@ impl TuiApp {
         }
     }
 
+    fn handle_log_view_key(&mut self, key: KeyEvent) {
+        let visible_height = log_view_visible_height();
+        let mut close_requested = false;
+
+        if let InputMode::LogView {
+            log_lines,
+            scroll_offset,
+            ..
+        } = &mut self.input_mode
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    close_requested = true;
+                }
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                    *scroll_offset = (*scroll_offset + 1).min(log_lines.len());
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                    *scroll_offset = scroll_offset.saturating_sub(1);
+                }
+                KeyCode::Char('G') => {
+                    *scroll_offset = log_lines.len().saturating_sub(visible_height);
+                }
+                KeyCode::Char('g') => {
+                    *scroll_offset = 0;
+                }
+                _ => {}
+            }
+        }
+
+        if close_requested {
+            self.input_mode = InputMode::Normal;
+            self.state.status_line = "agent log view closed".to_string();
+        }
+    }
+
     fn begin_delete_task_confirmation(&mut self) {
         let Some(task) = self.state.selected_task() else {
             self.state.status_line = "no task selected to delete".to_string();
@@ -597,6 +663,18 @@ impl TuiApp {
             InputMode::ModelSelect { prompt, .. } => Some(prompt.as_str()),
             InputMode::DeleteTaskConfirm { .. } => None,
             InputMode::HelpOverlay => None,
+            InputMode::LogView { .. } => None,
+        }
+    }
+
+    pub fn log_view_display(&self) -> Option<(&str, &[String], usize)> {
+        match &self.input_mode {
+            InputMode::LogView {
+                task_id,
+                log_lines,
+                scroll_offset,
+            } => Some((task_id.as_str(), log_lines.as_slice(), *scroll_offset)),
+            _ => None,
         }
     }
 
@@ -645,9 +723,14 @@ impl TuiApp {
             self.handle_new_task_dialog_key(key);
             return true;
         }
+        if matches!(self.input_mode, InputMode::LogView { .. }) {
+            self.handle_log_view_key(key);
+            return true;
+        }
         match &mut self.input_mode {
             InputMode::Normal => return false,
             InputMode::NewTaskDialog { .. } => unreachable!(),
+            InputMode::LogView { .. } => unreachable!(),
             InputMode::HelpOverlay => match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {
                     self.input_mode = InputMode::Normal;
@@ -881,6 +964,25 @@ impl TuiApp {
 
 fn normalize_paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+const LOG_VIEW_DEFAULT_VISIBLE_HEIGHT: usize = 20;
+
+fn log_view_visible_height() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, height)| height.saturating_sub(4) as usize)
+        .ok()
+        .filter(|height| *height > 0)
+        .unwrap_or(LOG_VIEW_DEFAULT_VISIBLE_HEIGHT)
+}
+
+fn load_agent_log(log_root: &str, task_id: &str) -> Vec<String> {
+    let path = format!("{log_root}/{task_id}/latest.log");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| "No log output available.".to_string())
+        .lines()
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2900,6 +3002,122 @@ mod tests {
             pr_url: None,
             model_display: None,
         }
+    }
+
+    fn make_log_root(task_id: &str, content: &str) -> String {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for temp path")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("othala-log-view-{unique}"));
+        let task_dir = root.join(task_id);
+        std::fs::create_dir_all(&task_dir).expect("create task log directory");
+        std::fs::write(task_dir.join("latest.log"), content).expect("write latest.log");
+        root.to_string_lossy().to_string()
+    }
+
+    fn log_view_scroll_offset(app: &TuiApp) -> usize {
+        match &app.input_mode {
+            super::InputMode::LogView { scroll_offset, .. } => *scroll_offset,
+            _ => panic!("expected log view mode"),
+        }
+    }
+
+    #[test]
+    fn l_key_enters_log_view_mode() {
+        let mut app = TuiApp::default();
+        app.state.tasks = vec![make_task_row("T1")];
+        app.state.focused_task = true;
+        let log_root = make_log_root("T1", "line one\nline two\nline three\n");
+        app.state.log_root = Some(log_root.clone());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+
+        match &app.input_mode {
+            super::InputMode::LogView {
+                task_id,
+                log_lines,
+                scroll_offset,
+            } => {
+                assert_eq!(task_id, "T1");
+                assert_eq!(
+                    log_lines,
+                    &vec![
+                        "line one".to_string(),
+                        "line two".to_string(),
+                        "line three".to_string(),
+                    ]
+                );
+                assert_eq!(*scroll_offset, 0);
+            }
+            _ => panic!("expected log view mode"),
+        }
+
+        std::fs::remove_dir_all(log_root).expect("cleanup temp log root");
+    }
+
+    #[test]
+    fn log_view_scroll_down() {
+        let mut app = TuiApp {
+            input_mode: super::InputMode::LogView {
+                task_id: "T1".to_string(),
+                log_lines: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                scroll_offset: 0,
+            },
+            ..Default::default()
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(log_view_scroll_offset(&app), 1);
+    }
+
+    #[test]
+    fn log_view_scroll_up() {
+        let mut app = TuiApp {
+            input_mode: super::InputMode::LogView {
+                task_id: "T1".to_string(),
+                log_lines: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                scroll_offset: 2,
+            },
+            ..Default::default()
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(log_view_scroll_offset(&app), 1);
+    }
+
+    #[test]
+    fn log_view_esc_returns_to_normal() {
+        let mut app = TuiApp {
+            input_mode: super::InputMode::LogView {
+                task_id: "T1".to_string(),
+                log_lines: vec!["a".to_string()],
+                scroll_offset: 0,
+            },
+            ..Default::default()
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+    }
+
+    #[test]
+    fn log_view_jump_to_end() {
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let expected = lines.len().saturating_sub(super::log_view_visible_height());
+        let mut app = TuiApp {
+            input_mode: super::InputMode::LogView {
+                task_id: "T1".to_string(),
+                log_lines: lines,
+                scroll_offset: 0,
+            },
+            ..Default::default()
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+
+        assert_eq!(log_view_scroll_offset(&app), expected);
     }
 
     #[test]

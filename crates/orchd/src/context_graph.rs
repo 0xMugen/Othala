@@ -3,6 +3,9 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const CMD_OUTPUT_LINE_LIMIT: usize = 1000;
 
 /// A single node in the context graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,15 +92,18 @@ pub fn load_context_graph(repo_root: &Path, config: &ContextLoadConfig) -> Optio
             Err(_) => continue,
         };
 
+        let (expanded_content, directive_links) = expand_directives(&content, &rel_path, repo_root);
+
         // Respect budget: truncate if the remaining budget is smaller than the file.
         let remaining = config.max_total_chars.saturating_sub(total_chars);
-        let content = if content.len() > remaining {
-            content[..remaining].to_string()
+        let content = if expanded_content.len() > remaining {
+            expanded_content[..remaining].to_string()
         } else {
-            content
+            expanded_content
         };
 
-        let (links, source_refs) = extract_links(&content, &rel_path);
+        let (mut links, source_refs) = extract_links(&content, &rel_path);
+        links.extend(directive_links);
         total_chars += content.len();
 
         // Enqueue links for next depth level.
@@ -303,6 +309,224 @@ fn extract_links(content: &str, current_path: &Path) -> (Vec<PathBuf>, Vec<PathB
     }
 
     (context_links, source_refs)
+}
+
+fn expand_directives(content: &str, current_path: &Path, repo_root: &Path) -> (String, Vec<PathBuf>) {
+    let mut expanded = String::with_capacity(content.len());
+    let mut links = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if let Some(pattern) = trimmed.strip_prefix("@glob:") {
+            let pattern = pattern.trim();
+            if !pattern.is_empty() {
+                let matches = expand_glob_pattern(pattern, current_path, repo_root);
+                if matches.is_empty() {
+                    eprintln!(
+                        "warning: @glob pattern matched no files in {}: {}",
+                        current_path.display(),
+                        pattern
+                    );
+                } else {
+                    links.extend(matches);
+                }
+            }
+        }
+
+        expanded.push_str(line);
+        expanded.push('\n');
+
+        if let Some(command) = trimmed.strip_prefix("@cmd:") {
+            let command = command.trim();
+            if !command.is_empty() {
+                expanded.push_str(&run_command_directive(command, repo_root));
+                if !expanded.ends_with('\n') {
+                    expanded.push('\n');
+                }
+            }
+        }
+    }
+
+    if !content.ends_with('\n') && expanded.ends_with('\n') {
+        expanded.pop();
+    }
+
+    (expanded, links)
+}
+
+fn expand_glob_pattern(pattern: &str, current_path: &Path, repo_root: &Path) -> Vec<PathBuf> {
+    let parent = current_path.parent().unwrap_or(Path::new("."));
+    let mut patterns = Vec::new();
+
+    patterns.push(normalise_path(Path::new(pattern)));
+    patterns.push(normalise_path(&parent.join(pattern)));
+
+    let mut files = Vec::new();
+    collect_repo_files(repo_root, repo_root, &mut files);
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in files {
+        let candidate_norm = normalise_path(&candidate);
+        let candidate_s = path_to_slash_string(&candidate_norm);
+        if patterns.iter().any(|p| glob_match_path(p, &candidate_s)) && seen.insert(candidate_norm.clone()) {
+            out.push(candidate_norm);
+        }
+    }
+
+    out.sort();
+    out
+}
+
+fn collect_repo_files(root: &Path, current: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if metadata.is_dir() {
+            collect_repo_files(root, &path, out);
+            continue;
+        }
+
+        if metadata.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(normalise_path(rel));
+            }
+        }
+    }
+}
+
+fn glob_match_path(pattern: &Path, candidate: &str) -> bool {
+    let pattern_s = path_to_slash_string(pattern);
+    let pattern_parts: Vec<&str> = if pattern_s.is_empty() {
+        Vec::new()
+    } else {
+        pattern_s.split('/').collect()
+    };
+    let candidate_parts: Vec<&str> = if candidate.is_empty() {
+        Vec::new()
+    } else {
+        candidate.split('/').collect()
+    };
+
+    glob_match_components(&pattern_parts, &candidate_parts)
+}
+
+fn glob_match_components(pattern: &[&str], candidate: &[&str]) -> bool {
+    fn inner(pattern: &[&str], candidate: &[&str], pi: usize, ci: usize) -> bool {
+        if pi == pattern.len() {
+            return ci == candidate.len();
+        }
+
+        if pattern[pi] == "**" {
+            return inner(pattern, candidate, pi + 1, ci)
+                || (ci < candidate.len() && inner(pattern, candidate, pi, ci + 1));
+        }
+
+        if ci >= candidate.len() {
+            return false;
+        }
+
+        if !glob_match_segment(pattern[pi], candidate[ci]) {
+            return false;
+        }
+
+        inner(pattern, candidate, pi + 1, ci + 1)
+    }
+
+    inner(pattern, candidate, 0, 0)
+}
+
+fn glob_match_segment(pattern: &str, candidate: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let c: Vec<char> = candidate.chars().collect();
+
+    let mut pi = 0usize;
+    let mut ci = 0usize;
+    let mut star_idx: Option<usize> = None;
+    let mut match_ci = 0usize;
+
+    while ci < c.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == c[ci]) {
+            pi += 1;
+            ci += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_idx = Some(pi);
+            match_ci = ci;
+            pi += 1;
+        } else if let Some(star) = star_idx {
+            pi = star + 1;
+            match_ci += 1;
+            ci = match_ci;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == p.len()
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn run_command_directive(command: &str, repo_root: &Path) -> String {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(repo_root)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            truncate_command_output(&stdout)
+        }
+        Ok(output) => {
+            let status = output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                format!("[command failed: `{command}` (exit status {status})]\n")
+            } else {
+                format!("[command failed: `{command}` (exit status {status})] {stderr}\n")
+            }
+        }
+        Err(err) => format!("[command execution error: `{command}`] {err}\n"),
+    }
+}
+
+fn truncate_command_output(stdout: &str) -> String {
+    let lines: Vec<&str> = stdout.lines().collect();
+    if lines.len() <= CMD_OUTPUT_LINE_LIMIT {
+        return stdout.to_string();
+    }
+
+    let mut out = lines[..CMD_OUTPUT_LINE_LIMIT].join("\n");
+    out.push('\n');
+    out.push_str(&format!(
+        "[... truncated {} lines]",
+        lines.len() - CMD_OUTPUT_LINE_LIMIT
+    ));
+    out.push('\n');
+    out
 }
 
 /// Simple path normalisation — resolve `..` and `.` components without hitting
@@ -664,6 +888,58 @@ mod tests {
         );
         assert_eq!(graph.nodes[1].path, PathBuf::from(".othala/context/A.md"));
         assert_eq!(graph.nodes[2].path, PathBuf::from(".othala/context/B.md"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_graph_parses_glob_directive() {
+        let tmp = std::env::temp_dir().join(format!("othala-ctx-glob-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+        fs::create_dir_all(tmp.join("src/nested")).unwrap();
+
+        fs::write(ctx.join("MAIN.md"), "@glob:src/**/*.rs\n").unwrap();
+        fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(tmp.join("src/nested/mod.rs"), "pub fn b() {}\n").unwrap();
+
+        let graph = load_context_graph(&tmp, &ContextLoadConfig::default()).expect("load graph");
+        let loaded: Vec<PathBuf> = graph.nodes.iter().map(|n| n.path.clone()).collect();
+
+        assert!(loaded.contains(&PathBuf::from("src/lib.rs")));
+        assert!(loaded.contains(&PathBuf::from("src/nested/mod.rs")));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_graph_parses_cmd_directive() {
+        let tmp = std::env::temp_dir().join(format!("othala-ctx-cmd-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+        fs::write(ctx.join("MAIN.md"), "@cmd:printf 'cmd-ok\\n'\n").unwrap();
+
+        let graph = load_context_graph(&tmp, &ContextLoadConfig::default()).expect("load graph");
+        assert!(graph.nodes[0].content.contains("cmd-ok"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_graph_cmd_truncates_long_output() {
+        let tmp = std::env::temp_dir().join(format!("othala-ctx-cmd-trunc-{}", std::process::id()));
+        let ctx = tmp.join(".othala/context");
+        fs::create_dir_all(&ctx).unwrap();
+        fs::write(
+            ctx.join("MAIN.md"),
+            "@cmd:i=0; while [ $i -lt 1005 ]; do printf '%s\\n' \"$i\"; i=$((i+1)); done\n",
+        )
+        .unwrap();
+
+        let graph = load_context_graph(&tmp, &ContextLoadConfig::default()).expect("load graph");
+        let content = &graph.nodes[0].content;
+
+        assert!(content.contains("[... truncated 5 lines]"));
 
         fs::remove_dir_all(&tmp).ok();
     }

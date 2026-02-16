@@ -21,14 +21,14 @@ use orchd::{
     provision_chat_workspace_on_base, AgentCostEstimate, OrchdService, Scheduler, SchedulerConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Parser)]
 #[command(name = "othala")]
@@ -177,7 +177,16 @@ enum Commands {
         json: bool,
     },
     /// Show aggregate task and agent statistics
-    Stats,
+    Stats {
+        #[arg(long)]
+        json: bool,
+    },
+    Gc {
+        #[arg(long, default_value = "30")]
+        older_than_days: u64,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop a running chat (agent will be killed)
     Stop {
         /// Task/chat ID
@@ -1651,6 +1660,241 @@ fn archive_old_tasks(service: &OrchdService, older_than_days: i64) -> anyhow::Re
     Ok(archived)
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct StatsSummary {
+    total_tasks: usize,
+    tasks_by_state: BTreeMap<String, i64>,
+    tasks_by_model: BTreeMap<String, i64>,
+    avg_time_to_merge_seconds: Option<f64>,
+    success_rate: Option<f64>,
+    total_events: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcSummary {
+    deleted_event_files: usize,
+    deleted_agent_output_dirs: usize,
+    bytes_freed: u64,
+}
+
+fn compute_stats_summary(tasks: &[Task], state_counts: Vec<(String, i64)>, total_events: i64) -> StatsSummary {
+    const STATE_TAGS: [&str; 7] = [
+        "CHATTING",
+        "READY",
+        "SUBMITTING",
+        "RESTACKING",
+        "AWAITING_MERGE",
+        "MERGED",
+        "STOPPED",
+    ];
+
+    let mut tasks_by_state = BTreeMap::new();
+    for state in STATE_TAGS {
+        tasks_by_state.insert(state.to_string(), 0);
+    }
+    for (state, count) in state_counts {
+        tasks_by_state.insert(state, count);
+    }
+
+    let mut tasks_by_model = BTreeMap::new();
+    for task in tasks {
+        let model = task
+            .preferred_model
+            .map(|model| model.as_str().to_string())
+            .unwrap_or_else(|| "unspecified".to_string());
+        *tasks_by_model.entry(model).or_insert(0) += 1;
+    }
+
+    let merged = *tasks_by_state.get("MERGED").unwrap_or(&0);
+    let stopped = *tasks_by_state.get("STOPPED").unwrap_or(&0);
+    let denominator = merged + stopped;
+    let success_rate = if denominator > 0 {
+        Some((merged as f64 / denominator as f64) * 100.0)
+    } else {
+        None
+    };
+
+    let merged_durations: Vec<f64> = tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Merged)
+        .map(|task| (task.updated_at - task.created_at).num_milliseconds() as f64 / 1000.0)
+        .collect();
+    let avg_time_to_merge_seconds = if merged_durations.is_empty() {
+        None
+    } else {
+        Some(merged_durations.iter().sum::<f64>() / merged_durations.len() as f64)
+    };
+
+    StatsSummary {
+        total_tasks: tasks.len(),
+        tasks_by_state,
+        tasks_by_model,
+        avg_time_to_merge_seconds,
+        success_rate,
+        total_events,
+    }
+}
+
+fn print_stats_table(summary: &StatsSummary) {
+    println!("{:<28} VALUE", "METRIC");
+    println!("{}", "-".repeat(48));
+    println!("{:<28} {}", "total_tasks", summary.total_tasks);
+    println!("{:<28} {}", "total_events", summary.total_events);
+    println!(
+        "{:<28} {}",
+        "avg_time_to_merge_secs",
+        summary
+            .avg_time_to_merge_seconds
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!(
+        "{:<28} {}",
+        "success_rate_percent",
+        summary
+            .success_rate
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!();
+
+    println!("{:<20} COUNT", "TASK_STATE");
+    println!("{}", "-".repeat(32));
+    for (state, count) in &summary.tasks_by_state {
+        println!("{:<20} {}", state, count);
+    }
+    println!();
+
+    println!("{:<20} COUNT", "PREFERRED_MODEL");
+    println!("{}", "-".repeat(32));
+    if summary.tasks_by_model.is_empty() {
+        println!("{:<20} {}", "(none)", 0);
+    } else {
+        for (model, count) in &summary.tasks_by_model {
+            println!("{:<20} {}", model, count);
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    let kib = bytes as f64 / 1024.0;
+    if kib < 1024.0 {
+        return format!("{kib:.1} KiB");
+    }
+    let mib = kib / 1024.0;
+    if mib < 1024.0 {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{:.1} GiB", mib / 1024.0)
+}
+
+fn collect_old_jsonl_files(root: &Path, cutoff: SystemTime, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_old_jsonl_files(&path, cutoff, out)?;
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        if metadata.modified().map(|modified| modified < cutoff).unwrap_or(false) {
+            out.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_old_agent_dirs(root: &Path, cutoff: SystemTime) -> std::io::Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        if metadata.modified().map(|modified| modified < cutoff).unwrap_or(false) {
+            candidates.push(path);
+        }
+    }
+    Ok(candidates)
+}
+
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+fn gc_logs(repo_root: &Path, older_than_days: u64, dry_run: bool) -> anyhow::Result<GcSummary> {
+    let age = Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60));
+    let cutoff = SystemTime::now()
+        .checked_sub(age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    let events_root = repo_root.join(".othala/events");
+    let agent_output_root = repo_root.join(".othala/agent-output");
+
+    let mut old_event_files = Vec::new();
+    collect_old_jsonl_files(&events_root, cutoff, &mut old_event_files)?;
+    let old_agent_dirs = collect_old_agent_dirs(&agent_output_root, cutoff)?;
+
+    let mut bytes_freed = 0u64;
+    for event_file in &old_event_files {
+        bytes_freed += fs::metadata(event_file).map(|m| m.len()).unwrap_or(0);
+    }
+    for dir in &old_agent_dirs {
+        bytes_freed += dir_size(dir).unwrap_or(0);
+    }
+
+    if dry_run {
+        for event_file in &old_event_files {
+            println!("[dry-run] would delete file {}", event_file.display());
+        }
+        for dir in &old_agent_dirs {
+            println!("[dry-run] would delete dir  {}", dir.display());
+        }
+    } else {
+        for event_file in &old_event_files {
+            fs::remove_file(event_file)?;
+        }
+        for dir in &old_agent_dirs {
+            fs::remove_dir_all(dir)?;
+        }
+    }
+
+    Ok(GcSummary {
+        deleted_event_files: old_event_files.len(),
+        deleted_agent_output_dirs: old_agent_dirs.len(),
+        bytes_freed,
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -2302,36 +2546,31 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", format_retries_timeline(&task_id.0, &timeline));
             }
         }
-        Commands::Stats => {
+        Commands::Stats { json } => {
             let tasks = service.list_tasks()?;
-            let total = tasks.len();
-            let by_state = |s: TaskState| tasks.iter().filter(|t| t.state == s).count();
+            let state_counts = service.store.task_count_by_state()?;
+            let total_events = service.store.total_event_count()?;
+            let summary = compute_stats_summary(&tasks, state_counts, total_events);
 
-            println!("Othala Statistics");
-            println!("=================");
-            println!();
-            println!("Tasks:");
-            println!("  Total:          {total}");
-            println!("  Chatting:       {}", by_state(TaskState::Chatting));
-            println!("  Ready:          {}", by_state(TaskState::Ready));
-            println!("  Submitting:     {}", by_state(TaskState::Submitting));
-            println!("  Restacking:     {}", by_state(TaskState::Restacking));
-            println!("  Awaiting Merge: {}", by_state(TaskState::AwaitingMerge));
-            println!("  Merged:         {}", by_state(TaskState::Merged));
-            println!("  Stopped:        {}", by_state(TaskState::Stopped));
-            println!();
-
-            let model_counts = service.runs_by_model()?;
-            if !model_counts.is_empty() {
-                println!("Agent Runs by Model:");
-                for (model, count) in &model_counts {
-                    println!("  {model:<10} {count}");
-                }
-                println!();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print_stats_table(&summary);
             }
-
-            let events = service.global_events()?;
-            println!("Events:           {}", events.len());
+        }
+        Commands::Gc {
+            older_than_days,
+            dry_run,
+        } => {
+            let repo_root = std::env::current_dir()?;
+            let summary = gc_logs(&repo_root, older_than_days, dry_run)?;
+            let action = if dry_run { "Would delete" } else { "Deleted" };
+            println!(
+                "{action} {} event files, {} agent output dirs (freed ~{})",
+                summary.deleted_event_files,
+                summary.deleted_agent_output_dirs,
+                format_bytes(summary.bytes_freed)
+            );
         }
         Commands::Stop { id } => {
             let task_id = TaskId::new(&id);
@@ -2746,6 +2985,99 @@ mod tests {
             }
             _ => panic!("expected set-priority command"),
         }
+    }
+
+    #[test]
+    fn stats_command_counts_by_state() {
+        let mut chatting = mk_task("T-STATS-1", TaskState::Chatting);
+        chatting.preferred_model = Some(ModelKind::Claude);
+        let mut merged = mk_task("T-STATS-2", TaskState::Merged);
+        merged.preferred_model = Some(ModelKind::Codex);
+        let stopped = mk_task("T-STATS-3", TaskState::Stopped);
+        let tasks = vec![chatting, merged, stopped];
+
+        let summary = compute_stats_summary(
+            &tasks,
+            vec![
+                ("CHATTING".to_string(), 1),
+                ("MERGED".to_string(), 1),
+                ("STOPPED".to_string(), 1),
+            ],
+            9,
+        );
+
+        assert_eq!(summary.total_tasks, 3);
+        assert_eq!(summary.tasks_by_state.get("CHATTING"), Some(&1));
+        assert_eq!(summary.tasks_by_state.get("MERGED"), Some(&1));
+        assert_eq!(summary.tasks_by_state.get("STOPPED"), Some(&1));
+        assert_eq!(summary.tasks_by_model.get("claude"), Some(&1));
+        assert_eq!(summary.tasks_by_model.get("codex"), Some(&1));
+        assert_eq!(summary.tasks_by_model.get("unspecified"), Some(&1));
+    }
+
+    #[test]
+    fn stats_command_computes_success_rate() {
+        let merged = mk_task("T-STATS-SR-1", TaskState::Merged);
+        let stopped_a = mk_task("T-STATS-SR-2", TaskState::Stopped);
+        let stopped_b = mk_task("T-STATS-SR-3", TaskState::Stopped);
+        let tasks = vec![merged, stopped_a, stopped_b];
+
+        let summary = compute_stats_summary(
+            &tasks,
+            vec![("MERGED".to_string(), 1), ("STOPPED".to_string(), 2)],
+            0,
+        );
+
+        let rate = summary.success_rate.expect("success rate exists");
+        assert!((rate - 33.3333).abs() < 0.01);
+    }
+
+    #[test]
+    fn gc_dry_run_does_not_delete() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-gc-dry-run-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let event_file = root.join(".othala/events/tasks/T-GC-1.jsonl");
+        let agent_dir = root.join(".othala/agent-output/T-GC-1");
+        fs::create_dir_all(event_file.parent().expect("event parent")).expect("create event dir");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::write(&event_file, "{}\n").expect("write event file");
+        fs::write(agent_dir.join("latest.log"), "hello\n").expect("write agent log");
+
+        let summary = gc_logs(&root, 0, true).expect("dry run gc");
+        assert_eq!(summary.deleted_event_files, 1);
+        assert_eq!(summary.deleted_agent_output_dirs, 1);
+        assert!(event_file.exists());
+        assert!(agent_dir.exists());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn gc_deletes_old_files() {
+        let root = std::env::temp_dir().join(format!(
+            "othala-gc-delete-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let event_file = root.join(".othala/events/tasks/T-GC-2.jsonl");
+        let ignored_file = root.join(".othala/events/keep.txt");
+        let agent_dir = root.join(".othala/agent-output/T-GC-2");
+        fs::create_dir_all(event_file.parent().expect("event parent")).expect("create event dir");
+        fs::create_dir_all(agent_dir.parent().expect("agent parent")).expect("create agent parent");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::write(&event_file, "{}\n").expect("write event file");
+        fs::write(&ignored_file, "keep\n").expect("write ignored file");
+        fs::write(agent_dir.join("latest.log"), "hello\n").expect("write agent log");
+
+        let summary = gc_logs(&root, 0, false).expect("gc delete");
+        assert_eq!(summary.deleted_event_files, 1);
+        assert_eq!(summary.deleted_agent_output_dirs, 1);
+        assert!(!event_file.exists());
+        assert!(ignored_file.exists());
+        assert!(!agent_dir.exists());
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
