@@ -46,6 +46,12 @@ pub fn head_sha(repo: &RepoHandle, git: &GitCli) -> Result<String, GitError> {
     Ok(output.stdout.trim().to_string())
 }
 
+/// Check if the worktree has uncommitted changes (staged or unstaged).
+pub fn has_uncommitted_changes(repo: &RepoHandle, git: &GitCli) -> Result<bool, GitError> {
+    let output = git.run(&repo.root, ["status", "--porcelain"])?;
+    Ok(!output.stdout.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

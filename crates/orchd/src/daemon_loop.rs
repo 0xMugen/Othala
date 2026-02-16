@@ -8,6 +8,7 @@ use orch_core::config::{load_org_config, BudgetConfig, OrgConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, ModelKind, Task, TaskId};
+use orch_git::{discover_repo, has_uncommitted_changes, GitCli};
 use orch_graphite::GraphiteClient;
 use orch_notify::{notification_for_event, NotificationDispatcher};
 
@@ -856,6 +857,32 @@ fn handle_agent_completion(
             reason: "Agent requested human assistance".to_string(),
         });
         return actions;
+    }
+
+    // Check for uncommitted changes as fallback success indicator.
+    // If the agent made code changes but didn't signal [patch_ready], treat as success.
+    if let Ok(Some(task)) = service.task(&outcome.task_id) {
+        let git = GitCli::default();
+        if let Ok(repo) = discover_repo(&task.worktree_path, &git) {
+            if let Ok(true) = has_uncommitted_changes(&repo, &git) {
+                eprintln!(
+                    "[daemon] {} has uncommitted changes — treating as success despite missing [patch_ready]",
+                    outcome.task_id.0
+                );
+                daemon_state.model_health.record_success(outcome.model);
+                if !config.skip_qa && load_baseline(&config.repo_root).is_some() {
+                    actions.push(DaemonAction::SpawnQA {
+                        task_id: outcome.task_id.clone(),
+                        qa_type: QAType::Validation,
+                    });
+                } else {
+                    actions.push(DaemonAction::MarkReady {
+                        task_id: outcome.task_id.clone(),
+                    });
+                }
+                return actions;
+            }
+        }
     }
 
     // Agent failed — evaluate retry.
