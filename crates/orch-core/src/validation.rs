@@ -31,8 +31,37 @@ impl Validate for OrgConfig {
             issues.push(ValidationIssue {
                 level: ValidationLevel::Error,
                 code: "models.enabled.empty",
-                message: "at least one model must be enabled".to_string(),
+                message: "no models enabled — daemon cannot spawn agents".to_string(),
             });
+        }
+
+        if !self.models.enabled.is_empty() {
+            if let Some(default) = &self.models.default {
+                if !self.models.enabled.contains(default) {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Warning,
+                        code: "models.default.not_enabled",
+                        message: format!("default model {default:?} is not in the enabled list"),
+                    });
+                }
+            }
+        }
+
+        for model in &self.models.enabled {
+            let concurrency = match model {
+                crate::types::ModelKind::Claude => self.concurrency.claude,
+                crate::types::ModelKind::Codex => self.concurrency.codex,
+                crate::types::ModelKind::Gemini => self.concurrency.gemini,
+            };
+            if concurrency == 0 {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Error,
+                    code: "concurrency.model.zero",
+                    message: format!(
+                        "concurrency is 0 for enabled model {model:?} — it can never be scheduled"
+                    ),
+                });
+            }
         }
 
         if self.concurrency.per_repo == 0 {
@@ -41,6 +70,45 @@ impl Validate for OrgConfig {
                 code: "concurrency.per_repo.zero",
                 message: "per_repo concurrency must be greater than zero".to_string(),
             });
+        }
+
+        if self.daemon.tick_interval_secs == 0 {
+            issues.push(ValidationIssue {
+                level: ValidationLevel::Error,
+                code: "daemon.tick_interval.zero",
+                message: "tick interval cannot be 0".to_string(),
+            });
+        }
+
+        if self.daemon.agent_timeout_secs > 0 && self.daemon.agent_timeout_secs < 30 {
+            issues.push(ValidationIssue {
+                level: ValidationLevel::Warning,
+                code: "daemon.agent_timeout.low",
+                message: format!(
+                    "agent timeout {}s is very low — agents may be killed before producing useful output",
+                    self.daemon.agent_timeout_secs
+                ),
+            });
+        }
+
+        if self.notifications.slack_channel.is_some()
+            && self.notifications.slack_webhook_url.is_none()
+        {
+            issues.push(ValidationIssue {
+                level: ValidationLevel::Warning,
+                code: "notifications.slack.incomplete",
+                message: "slack_channel is set but slack_webhook_url is missing".to_string(),
+            });
+        }
+
+        if let Some(url) = &self.notifications.webhook_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Warning,
+                    code: "notifications.webhook_url.invalid",
+                    message: "webhook URL should start with http:// or https://".to_string(),
+                });
+            }
         }
 
         issues
