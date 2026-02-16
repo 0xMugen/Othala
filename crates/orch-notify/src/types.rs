@@ -13,11 +13,19 @@ pub enum NotificationSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationTopic {
+    TaskCreated,
+    TaskCompleted,
+    TaskCancelled,
     VerifyFailed,
+    VerifyPassed,
     RestackConflict,
     WaitingReviewCapacity,
     NeedsHuman,
     TaskError,
+    AgentSpawned,
+    AgentCompleted,
+    RetryScheduled,
+    ConfigReloaded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +45,7 @@ pub enum NotificationSinkKind {
     Stdout,
     Telegram,
     Webhook,
+    Slack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +94,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&NotificationSinkKind::Webhook).expect("serialize sink kind"),
             "\"webhook\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationSinkKind::Slack).expect("serialize sink kind"),
+            "\"slack\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationTopic::AgentSpawned).expect("serialize topic"),
+            "\"agent_spawned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationTopic::RetryScheduled).expect("serialize topic"),
+            "\"retry_scheduled\""
         );
     }
 

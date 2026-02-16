@@ -91,6 +91,10 @@ impl Default for DaemonOrgConfig {
 pub struct NotificationConfig {
     pub enabled: bool,
     pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub slack_webhook_url: Option<String>,
+    #[serde(default)]
+    pub slack_channel: Option<String>,
     pub stdout: bool,
 }
 
@@ -99,6 +103,8 @@ impl Default for NotificationConfig {
         Self {
             enabled: false,
             webhook_url: None,
+            slack_webhook_url: None,
+            slack_channel: None,
             stdout: true,
         }
     }

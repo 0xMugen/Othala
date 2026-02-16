@@ -146,6 +146,7 @@ pub(crate) fn build_footer_content(app: &TuiApp) -> FooterContent {
     spans.push(Span::raw(" "));
     let keys: &[(&str, &str)] = &[
         ("c", "chat"),
+        ("N", "new-task"),
         ("i", "interact"),
         ("a", "approve"),
         ("g", "submit"),

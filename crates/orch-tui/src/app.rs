@@ -9,16 +9,30 @@ use crate::event::TuiEvent;
 use crate::model::{pane_category_of, AgentPane, AgentPaneStatus, DashboardState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedAction {
-    pub action: UiAction,
-    pub task_id: Option<TaskId>,
-    pub prompt: Option<String>,
-    pub model: Option<ModelKind>,
+pub enum QueuedAction {
+    Dispatch {
+        action: UiAction,
+        task_id: Option<TaskId>,
+        prompt: Option<String>,
+        model: Option<ModelKind>,
+    },
+    CreateTask {
+        repo: String,
+        title: String,
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
+    NewTaskDialog {
+        /// Which field is active: 0=repo, 1=title, 2=model
+        active_field: usize,
+        repo: String,
+        title: String,
+        model: String,
+    },
     NewChatPrompt {
         buffer: String,
     },
@@ -135,7 +149,7 @@ impl TuiApp {
             Some(task_id) => format!("queued action={} task={}", action_label(action), task_id.0),
             None => format!("queued action={}", action_label(action)),
         };
-        self.action_queue.push_back(QueuedAction {
+        self.action_queue.push_back(QueuedAction::Dispatch {
             action,
             task_id,
             prompt: None,
@@ -158,6 +172,11 @@ impl TuiApp {
         }
 
         if self.handle_input_mode_key(key) {
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('N') {
+            self.begin_new_task_dialog();
             return;
         }
 
@@ -276,6 +295,19 @@ impl TuiApp {
             | InputMode::ChatInput { buffer, .. } => {
                 buffer.push_str(&normalize_paste_text(text));
             }
+            InputMode::NewTaskDialog {
+                active_field,
+                repo,
+                title,
+                model,
+            } => {
+                let normalized = normalize_paste_text(text);
+                match *active_field {
+                    0 => repo.push_str(&normalized),
+                    1 => title.push_str(&normalized),
+                    _ => model.push_str(&normalized),
+                }
+            }
             _ => {}
         }
     }
@@ -286,6 +318,17 @@ impl TuiApp {
         };
         self.state.status_line =
             "new chat prompt: type feature request, Enter=submit Esc=cancel".to_string();
+    }
+
+    fn begin_new_task_dialog(&mut self) {
+        self.input_mode = InputMode::NewTaskDialog {
+            active_field: 0,
+            repo: "default".to_string(),
+            title: String::new(),
+            model: "claude".to_string(),
+        };
+        self.state.status_line =
+            "new task dialog: Tab=next field Enter=create Esc=cancel".to_string();
     }
 
     fn begin_chat_input(&mut self) {
@@ -353,7 +396,7 @@ impl TuiApp {
                     .entry(task_id.clone())
                     .or_default()
                     .push(message.clone());
-                self.action_queue.push_back(QueuedAction {
+                self.action_queue.push_back(QueuedAction::Dispatch {
                     action: UiAction::SendChatMessage,
                     task_id: Some(task_id.clone()),
                     prompt: Some(message),
@@ -441,6 +484,89 @@ impl TuiApp {
         }
     }
 
+    fn handle_new_task_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.state.status_line = "new task dialog canceled".to_string();
+            }
+            KeyCode::Tab => {
+                if let InputMode::NewTaskDialog { active_field, .. } = &mut self.input_mode {
+                    *active_field = (*active_field + 1) % 3;
+                }
+            }
+            KeyCode::Backspace => {
+                if let InputMode::NewTaskDialog {
+                    active_field,
+                    repo,
+                    title,
+                    model,
+                } = &mut self.input_mode
+                {
+                    match *active_field {
+                        0 => {
+                            repo.pop();
+                        }
+                        1 => {
+                            title.pop();
+                        }
+                        _ => {
+                            model.pop();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return;
+                }
+                if let InputMode::NewTaskDialog {
+                    active_field,
+                    repo,
+                    title,
+                    model,
+                } = &mut self.input_mode
+                {
+                    match *active_field {
+                        0 => repo.push(ch),
+                        1 => title.push(ch),
+                        _ => model.push(ch),
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let (repo_raw, title, model_raw) = match &self.input_mode {
+                    InputMode::NewTaskDialog {
+                        repo, title, model, ..
+                    } => (
+                        repo.trim().to_string(),
+                        title.trim().to_string(),
+                        model.trim().to_string(),
+                    ),
+                    _ => return,
+                };
+                let repo = if repo_raw.is_empty() {
+                    "default".to_string()
+                } else {
+                    repo_raw
+                };
+                let model = if model_raw.is_empty() {
+                    "claude".to_string()
+                } else {
+                    model_raw
+                };
+                self.action_queue.push_back(QueuedAction::CreateTask {
+                    repo: repo.clone(),
+                    title,
+                    model: model.clone(),
+                });
+                self.input_mode = InputMode::Normal;
+                self.state.status_line = format!("queued create_task repo={repo} model={model}");
+            }
+            _ => {}
+        }
+    }
+
     fn begin_delete_task_confirmation(&mut self) {
         let Some(task) = self.state.selected_task() else {
             self.state.status_line = "no task selected to delete".to_string();
@@ -464,6 +590,7 @@ impl TuiApp {
     pub fn input_prompt(&self) -> Option<&str> {
         match &self.input_mode {
             InputMode::Normal => None,
+            InputMode::NewTaskDialog { .. } => None,
             InputMode::NewChatPrompt { buffer } => Some(buffer.as_str()),
             InputMode::FilterInput { buffer } => Some(buffer.as_str()),
             InputMode::ChatInput { buffer, .. } => Some(buffer.as_str()),
@@ -496,14 +623,31 @@ impl TuiApp {
         }
     }
 
+    pub fn new_task_dialog_display(&self) -> Option<(usize, &str, &str, &str)> {
+        match &self.input_mode {
+            InputMode::NewTaskDialog {
+                active_field,
+                repo,
+                title,
+                model,
+            } => Some((*active_field, repo.as_str(), title.as_str(), model.as_str())),
+            _ => None,
+        }
+    }
+
     fn handle_input_mode_key(&mut self, key: KeyEvent) -> bool {
         // Handle ChatInput before the match to avoid double &mut self borrow.
         if matches!(self.input_mode, InputMode::ChatInput { .. }) {
             self.handle_chat_input_key(key);
             return true;
         }
+        if matches!(self.input_mode, InputMode::NewTaskDialog { .. }) {
+            self.handle_new_task_dialog_key(key);
+            return true;
+        }
         match &mut self.input_mode {
             InputMode::Normal => return false,
+            InputMode::NewTaskDialog { .. } => unreachable!(),
             InputMode::HelpOverlay => match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {
                     self.input_mode = InputMode::Normal;
@@ -587,7 +731,7 @@ impl TuiApp {
                     let chosen_model = models[*selected];
                     let prompt_value = prompt.clone();
                     let task_id = self.state.selected_task().map(|task| task.task_id.clone());
-                    self.action_queue.push_back(QueuedAction {
+                    self.action_queue.push_back(QueuedAction::Dispatch {
                         action: UiAction::CreateTask,
                         task_id,
                         prompt: Some(prompt_value),
@@ -607,7 +751,7 @@ impl TuiApp {
                 }
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let confirmed_task_id = task_id.clone();
-                    self.action_queue.push_back(QueuedAction {
+                    self.action_queue.push_back(QueuedAction::Dispatch {
                         action: UiAction::DeleteTask,
                         task_id: Some(confirmed_task_id.clone()),
                         prompt: None,
@@ -747,7 +891,32 @@ mod tests {
     use orch_core::types::RepoId;
     use orch_core::types::{ModelKind, TaskId};
 
-    use crate::{AgentPane, AgentPaneStatus, TaskOverviewRow, TuiApp, TuiEvent, UiAction};
+    use crate::{
+        AgentPane, AgentPaneStatus, QueuedAction, TaskOverviewRow, TuiApp, TuiEvent, UiAction,
+    };
+
+    fn assert_dispatch_action(
+        queued: &QueuedAction,
+        expected_action: UiAction,
+        expected_task_id: Option<TaskId>,
+        expected_prompt: Option<&str>,
+        expected_model: Option<ModelKind>,
+    ) {
+        match queued {
+            QueuedAction::Dispatch {
+                action,
+                task_id,
+                prompt,
+                model,
+            } => {
+                assert_eq!(*action, expected_action);
+                assert_eq!(task_id, &expected_task_id);
+                assert_eq!(prompt.as_deref(), expected_prompt);
+                assert_eq!(*model, expected_model);
+            }
+            QueuedAction::CreateTask { .. } => panic!("expected dispatch action"),
+        }
+    }
 
     #[test]
     fn apply_event_agent_output_creates_and_updates_pane() {
@@ -871,6 +1040,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -888,6 +1058,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
         ];
         app.state.selected_task_idx = 1;
@@ -895,9 +1066,13 @@ mod tests {
         app.push_action(UiAction::RunVerifyQuick);
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
-        assert_eq!(drained[0].task_id, Some(TaskId("T2".to_string())));
-        assert_eq!(drained[0].prompt, None);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::RunVerifyQuick,
+            Some(TaskId("T2".to_string())),
+            None,
+            None,
+        );
         assert_eq!(
             app.state.status_line,
             "queued action=run_verify_quick task=T2"
@@ -911,9 +1086,7 @@ mod tests {
 
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::TriggerRestack);
-        assert_eq!(drained[0].task_id, None);
-        assert_eq!(drained[0].prompt, None);
+        assert_dispatch_action(&drained[0], UiAction::TriggerRestack, None, None, None);
         assert_eq!(app.state.status_line, "queued action=trigger_restack");
     }
 
@@ -951,14 +1124,19 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::RunVerifyQuick);
-        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
-        assert_eq!(drained[0].prompt, None);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::RunVerifyQuick,
+            Some(TaskId("T1".to_string())),
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -1102,6 +1280,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.state.focused_task = true;
 
@@ -1192,6 +1371,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -1225,10 +1405,102 @@ mod tests {
         assert!(matches!(app.input_mode, super::InputMode::Normal));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::CreateTask);
-        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
-        assert_eq!(drained[0].prompt.as_deref(), Some("Build OAuth login"));
-        assert_eq!(drained[0].model, Some(ModelKind::Claude));
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::CreateTask,
+            Some(TaskId("T1".to_string())),
+            Some("Build OAuth login"),
+            Some(ModelKind::Claude),
+        );
+    }
+
+    #[test]
+    fn n_key_opens_new_task_dialog() {
+        let mut app = TuiApp::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+
+        assert!(matches!(app.input_mode, super::InputMode::NewTaskDialog { .. }));
+        let display = app
+            .new_task_dialog_display()
+            .expect("new task dialog display");
+        assert_eq!(display.0, 0);
+        assert_eq!(display.1, "default");
+        assert_eq!(display.2, "");
+        assert_eq!(display.3, "claude");
+    }
+
+    #[test]
+    fn tab_cycles_dialog_fields() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.new_task_dialog_display().expect("dialog").0, 0);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.new_task_dialog_display().expect("dialog").0, 1);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.new_task_dialog_display().expect("dialog").0, 2);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.new_task_dialog_display().expect("dialog").0, 0);
+    }
+
+    #[test]
+    fn esc_cancels_dialog() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        assert!(app.drain_actions().is_empty());
+    }
+
+    #[test]
+    fn enter_creates_task() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+
+        for _ in 0..7 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for ch in "repo-x".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "Implement OAuth".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for _ in 0..6 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for ch in "codex".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, super::InputMode::Normal));
+        let drained = app.drain_actions();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            &drained[0],
+            QueuedAction::CreateTask { repo, title, model }
+                if repo == "repo-x" && title == "Implement OAuth" && model == "codex"
+        ));
+    }
+
+    #[test]
+    fn backspace_deletes_char_in_dialog() {
+        let mut app = TuiApp::default();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        let display = app.new_task_dialog_display().expect("dialog");
+        assert_eq!(display.1, "defaul");
     }
 
     #[test]
@@ -1265,6 +1537,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -1283,10 +1556,13 @@ mod tests {
 
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::DeleteTask);
-        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
-        assert_eq!(drained[0].prompt, None);
-        assert_eq!(drained[0].model, None);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::DeleteTask,
+            Some(TaskId("T1".to_string())),
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -1308,6 +1584,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
@@ -1351,7 +1628,13 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].model, Some(ModelKind::Gemini));
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::CreateTask,
+            None,
+            Some("test prompt"),
+            Some(ModelKind::Gemini),
+        );
     }
 
     #[test]
@@ -1373,6 +1656,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         // Set a focused pane to verify it gets cleared
@@ -1441,6 +1725,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.apply_event(TuiEvent::QAUpdate {
@@ -1502,6 +1787,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         // Press 'i' to enter chat input mode
@@ -1535,10 +1821,13 @@ mod tests {
 
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::SendChatMessage);
-        assert_eq!(drained[0].task_id, Some(TaskId("T1".to_string())));
-        assert_eq!(drained[0].prompt.as_deref(), Some("fix the bug"));
-        assert_eq!(drained[0].model, None);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::SendChatMessage,
+            Some(TaskId("T1".to_string())),
+            Some("fix the bug"),
+            None,
+        );
     }
 
     #[test]
@@ -1560,6 +1849,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1592,6 +1882,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1626,6 +1917,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1662,6 +1954,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1700,6 +1993,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1741,6 +2035,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -1782,6 +2077,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
 
         // Simulate a TasksReplaced event (same task, fresh data from DB).
@@ -1882,6 +2178,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.state.focused_task = true;
         assert_eq!(
@@ -1927,6 +2224,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -1996,6 +2294,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.state.focused_pane_idx = Some(0);
 
@@ -2028,6 +2327,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2079,6 +2379,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2117,6 +2418,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -2134,6 +2436,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
         ];
         app.apply_event(TuiEvent::AgentPaneOutput {
@@ -2197,6 +2500,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
             TaskOverviewRow {
                 task_id: TaskId("T2".to_string()),
@@ -2214,6 +2518,7 @@ mod tests {
                 estimated_tokens: None,
                 estimated_cost_usd: None,
                 retry_count: 0,
+                retry_history: Vec::new(),
             },
         ];
         // No panes at all
@@ -2246,6 +2551,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2330,6 +2636,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2368,6 +2675,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.apply_event(TuiEvent::AgentPaneOutput {
             instance_id: "agent-T1".to_string(),
@@ -2424,6 +2732,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }];
         app.state.focused_task = true;
 
@@ -2431,7 +2740,13 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::StartAgent);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::StartAgent,
+            Some(TaskId("T1".to_string())),
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -2481,6 +2796,7 @@ mod tests {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: 0,
+            retry_history: Vec::new(),
         }
     }
 
@@ -2696,8 +3012,13 @@ mod tests {
 
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::SendChatMessage);
-        assert_eq!(drained[0].prompt.as_deref(), Some("reusable command"));
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::SendChatMessage,
+            Some(TaskId("T1".to_string())),
+            Some("reusable command"),
+            None,
+        );
 
         // History should now have the same message twice
         assert_eq!(
@@ -2767,7 +3088,13 @@ mod tests {
 
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].prompt.as_deref(), Some("hello"));
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::SendChatMessage,
+            Some(TaskId("T1".to_string())),
+            Some("hello"),
+            None,
+        );
 
         // Stored in history trimmed
         assert_eq!(
@@ -2832,7 +3159,13 @@ mod tests {
         assert!(matches!(app.input_mode, super::InputMode::Normal));
         let drained = app.drain_actions();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].action, UiAction::DeleteTask);
+        assert_dispatch_action(
+            &drained[0],
+            UiAction::DeleteTask,
+            Some(TaskId("T1".to_string())),
+            None,
+            None,
+        );
     }
 
     #[test]

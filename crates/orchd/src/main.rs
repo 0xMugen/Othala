@@ -22,6 +22,8 @@ use orchd::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -145,8 +147,21 @@ enum Commands {
         #[arg(short, long)]
         follow: bool,
     },
+    Watch {
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(short = 'n', long, default_value = "10")]
+        lines: usize,
+    },
     /// Show agent run history for a task
     Runs {
+        /// Task/chat ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    Retries {
         /// Task/chat ID
         id: String,
         /// Output as JSON
@@ -157,6 +172,10 @@ enum Commands {
     Stats,
     /// Stop a running chat (agent will be killed)
     Stop {
+        /// Task/chat ID
+        id: String,
+    },
+    Cancel {
         /// Task/chat ID
         id: String,
     },
@@ -391,6 +410,123 @@ fn aggregate_cost_estimates(runs: &[orchd::TaskRunRecord]) -> Vec<AgentCostEstim
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetryTimelineEntry {
+    attempt: u32,
+    model: String,
+    started_at: String,
+    status: String,
+    finished_at: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetryHistoryOutput {
+    task_id: String,
+    retry_events: Vec<Event>,
+    timeline: Vec<RetryTimelineEntry>,
+}
+
+fn is_retry_related_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::AgentSpawned { .. }
+            | EventKind::RetryScheduled { .. }
+            | EventKind::AgentCompleted { success: false, .. }
+    )
+}
+
+fn collect_retry_events(events: &[Event]) -> Vec<Event> {
+    let mut filtered: Vec<Event> = events
+        .iter()
+        .filter(|event| is_retry_related_event(&event.kind))
+        .cloned()
+        .collect();
+    filtered.sort_by_key(|event| event.at);
+    filtered
+}
+
+fn build_retry_timeline(events: &[Event], runs: &[orchd::TaskRunRecord]) -> Vec<RetryTimelineEntry> {
+    let retry_events = collect_retry_events(events);
+    let mut retry_reasons: HashMap<u32, String> = HashMap::new();
+    for event in &retry_events {
+        if let EventKind::RetryScheduled { attempt, reason, .. } = &event.kind {
+            retry_reasons.insert(*attempt, reason.clone());
+        }
+    }
+
+    let mut sorted_runs = runs.to_vec();
+    sorted_runs.sort_by_key(|run| run.started_at);
+
+    sorted_runs
+        .iter()
+        .enumerate()
+        .map(|(index, run)| {
+            let attempt = (index + 1) as u32;
+            let started_at = run.started_at.format("%H:%M:%S").to_string();
+            let finished_at = run.finished_at.map(|at| at.format("%H:%M:%S").to_string());
+
+            let status = if run.finished_at.is_none() {
+                "running".to_string()
+            } else if run.stop_reason.as_deref() == Some("completed") || run.exit_code == Some(0) {
+                "completed".to_string()
+            } else {
+                "failed".to_string()
+            };
+
+            let reason = if status == "failed" {
+                run.stop_reason
+                    .clone()
+                    .filter(|r| r != "failed")
+                    .or_else(|| retry_reasons.get(&attempt).cloned())
+                    .or_else(|| run.stop_reason.clone())
+            } else {
+                None
+            };
+
+            RetryTimelineEntry {
+                attempt,
+                model: run.model.as_str().to_string(),
+                started_at,
+                status,
+                finished_at,
+                reason,
+            }
+        })
+        .collect()
+}
+
+fn format_retries_timeline(task_id: &str, timeline: &[RetryTimelineEntry]) -> String {
+    if timeline.is_empty() {
+        return format!("No retry history for task: {task_id}");
+    }
+
+    let mut lines = vec![format!("Retry History for {task_id}:")];
+    for entry in timeline {
+        let end = entry.finished_at.as_deref().unwrap_or("-");
+        let line = if entry.status == "failed" {
+            let reason = entry.reason.as_deref().unwrap_or("unknown");
+            format!(
+                "#{:<2} {:<8} started {}  failed {}  reason: \"{}\"",
+                entry.attempt, entry.model, entry.started_at, end, reason
+            )
+        } else if entry.status == "completed" {
+            format!(
+                "#{:<2} {:<8} started {}  completed {}",
+                entry.attempt, entry.model, entry.started_at, end
+            )
+        } else {
+            format!(
+                "#{:<2} {:<8} started {}  running",
+                entry.attempt, entry.model, entry.started_at
+            )
+        };
+        lines.push(line);
+    }
+
+    lines.join("\n")
 }
 
 fn print_banner() {
@@ -671,6 +807,16 @@ fn build_notification_dispatcher(config: &NotificationConfig) -> Option<Notifica
         if !url.trim().is_empty() {
             sinks.push(Box::new(WebhookSink {
                 url: url.clone(),
+                timeout_secs: 10,
+            }));
+        }
+    }
+
+    if let Some(url) = &config.slack_webhook_url {
+        if !url.trim().is_empty() {
+            sinks.push(Box::new(orch_notify::SlackSink {
+                webhook_url: url.clone(),
+                channel: config.slack_channel.clone(),
                 timeout_secs: 10,
             }));
         }
@@ -1104,6 +1250,162 @@ fn run_self_test(json: bool) -> bool {
     critical_ok
 }
 
+const WATCH_PREFIX_COLORS: [&str; 6] = [
+    "\x1b[31m",
+    "\x1b[32m",
+    "\x1b[33m",
+    "\x1b[34m",
+    "\x1b[36m",
+    "\x1b[35m",
+];
+
+fn format_watch_line(task_id: &str, color: &str, line: &str) -> String {
+    format!("[{color}{task_id}\x1b[0m] {line}")
+}
+
+fn read_all_log_lines_and_position(path: &Path) -> std::io::Result<(Vec<String>, u64)> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut buf = String::new();
+
+    loop {
+        let bytes_read = reader.read_line(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        lines.push(buf.trim_end_matches(&['\r', '\n'][..]).to_string());
+        buf.clear();
+    }
+
+    let position = reader.stream_position()?;
+    Ok((lines, position))
+}
+
+fn read_new_log_lines(path: &Path, position: &mut u64) -> std::io::Result<Vec<String>> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() < *position {
+        *position = 0;
+    }
+
+    file.seek(SeekFrom::Start(*position))?;
+    let mut reader = BufReader::new(file);
+    let mut new_lines = Vec::new();
+    let mut buf = String::new();
+
+    loop {
+        let bytes_read = reader.read_line(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        *position += bytes_read as u64;
+        new_lines.push(buf.trim_end_matches(&['\r', '\n'][..]).to_string());
+        buf.clear();
+    }
+
+    Ok(new_lines)
+}
+
+fn run_watch_command(service: &OrchdService, task_filter: Option<String>, lines: usize) -> anyhow::Result<()> {
+    let repo_root = std::env::current_dir()?;
+    let mut tasks = service.list_tasks_by_state(TaskState::Chatting)?;
+
+    if let Some(task_id) = task_filter {
+        tasks.retain(|task| task.id.0 == task_id);
+    }
+
+    if tasks.is_empty() {
+        println!("No active chatting tasks to watch.");
+        return Ok(());
+    }
+
+    tasks.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+    let mut watch_state: HashMap<String, (PathBuf, u64, &'static str)> = HashMap::new();
+    let mut order = Vec::new();
+
+    for (idx, task) in tasks.iter().enumerate() {
+        let color = WATCH_PREFIX_COLORS[idx % WATCH_PREFIX_COLORS.len()];
+        let log_path = orchd::agent_log::agent_log_dir(&repo_root, &task.id).join("latest.log");
+        let mut position = 0u64;
+
+        match read_all_log_lines_and_position(&log_path) {
+            Ok((all_lines, end_position)) => {
+                let start = all_lines.len().saturating_sub(lines);
+                for line in &all_lines[start..] {
+                    println!("{}", format_watch_line(&task.id.0, color, line));
+                }
+                position = end_position;
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+            }
+        }
+
+        order.push(task.id.0.clone());
+        watch_state.insert(task.id.0.clone(), (log_path, position, color));
+    }
+
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone())?;
+
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        for task_id in &order {
+            if let Some((log_path, position, color)) = watch_state.get_mut(task_id) {
+                match read_new_log_lines(log_path, position) {
+                    Ok(new_lines) => {
+                        for line in new_lines {
+                            println!("{}", format_watch_line(task_id, color, &line));
+                        }
+                    }
+                    Err(err) => {
+                        if err.kind() != ErrorKind::NotFound {
+                            return Err(err.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    Ok(())
+}
+
+fn cancel_task(service: &OrchdService, task_id: &TaskId, reason: &str) -> anyhow::Result<TaskState> {
+    let Some(task) = service.task(task_id)? else {
+        anyhow::bail!("task not found: {}", task_id.0);
+    };
+
+    if !matches!(task.state, TaskState::Chatting | TaskState::Ready) {
+        anyhow::bail!("cannot cancel task in state {}", task.state);
+    }
+
+    let now = Utc::now();
+    service.record_event(&Event {
+        id: EventId(format!("E-CANCEL-{}-{}", task_id.0, now.timestamp_millis())),
+        task_id: Some(task_id.clone()),
+        repo_id: Some(task.repo_id.clone()),
+        at: now,
+        kind: EventKind::CancellationRequested {
+            reason: reason.to_string(),
+        },
+    })?;
+
+    let from_state = task.state;
+    service.transition_task_state(
+        task_id,
+        TaskState::Stopped,
+        EventId(format!("E-CANCEL-STATE-{}-{}", task_id.0, now.timestamp_millis())),
+        now,
+    )?;
+
+    Ok(from_state)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1127,7 +1429,7 @@ fn main() -> anyhow::Result<()> {
         .collect::<HashMap<_, _>>(),
     });
 
-    let service = OrchdService::open(&db_path, &event_log_path, scheduler)?;
+    let mut service = OrchdService::open(&db_path, &event_log_path, scheduler)?;
 
     match cli.command {
         Commands::CreateTask {
@@ -1303,7 +1605,7 @@ fn main() -> anyhow::Result<()> {
             let verify_cmd = verify_command
                 .unwrap_or_else(|| "cargo check && cargo test --workspace".to_string());
 
-            let daemon_config = orchd::daemon_loop::DaemonConfig {
+            let mut daemon_config = orchd::daemon_loop::DaemonConfig {
                 repo_root,
                 template_dir,
                 enabled_models,
@@ -1315,6 +1617,7 @@ fn main() -> anyhow::Result<()> {
                 dry_run: false,
                 agent_timeout_secs: daemon_org_config.agent_timeout_secs,
             };
+            let mut tick_interval_secs = daemon_org_config.tick_interval_secs;
 
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
@@ -1329,6 +1632,55 @@ fn main() -> anyhow::Result<()> {
             let mut prev_states: HashMap<String, TaskState> = HashMap::new();
 
             loop {
+                if let Some(new_config) =
+                    orchd::daemon_loop::check_config_reload(&config_path, &mut daemon_state)
+                {
+                    let mut changes = Vec::new();
+
+                    if daemon_config.enabled_models != new_config.models.enabled {
+                        changes.push("enabled_models".to_string());
+                        daemon_config.enabled_models = new_config.models.enabled.clone();
+                    }
+
+                    let scheduler_config = SchedulerConfig::from_org_config(&new_config);
+                    if service.scheduler.config != scheduler_config {
+                        changes.push("scheduler".to_string());
+                        service.scheduler.config = scheduler_config;
+                    }
+
+                    if daemon_config.agent_timeout_secs != new_config.daemon.agent_timeout_secs {
+                        changes.push("agent_timeout_secs".to_string());
+                        daemon_config.agent_timeout_secs = new_config.daemon.agent_timeout_secs;
+                    }
+
+                    if tick_interval_secs != new_config.daemon.tick_interval_secs {
+                        changes.push("tick_interval_secs".to_string());
+                        tick_interval_secs = new_config.daemon.tick_interval_secs;
+                    }
+
+                    let now = Utc::now();
+                    let change_summary = if changes.is_empty() {
+                        "no effective changes".to_string()
+                    } else {
+                        changes.join(", ")
+                    };
+                    let event = Event {
+                        id: EventId(format!(
+                            "E-CONFIG-RELOADED-{}",
+                            now.timestamp_nanos_opt().unwrap_or_default()
+                        )),
+                        task_id: None,
+                        repo_id: None,
+                        at: now,
+                        kind: EventKind::ConfigReloaded {
+                            changes: change_summary,
+                        },
+                    };
+                    if let Err(err) = service.record_event(&event) {
+                        eprintln!("[daemon] Failed to record config reload event: {err}");
+                    }
+                }
+
                 orchd::daemon_loop::run_tick(
                     &service,
                     &mut supervisor,
@@ -1415,7 +1767,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 std::thread::sleep(std::time::Duration::from_secs(
-                    daemon_org_config.tick_interval_secs,
+                    tick_interval_secs,
                 ));
             }
 
@@ -1626,6 +1978,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Watch { task, lines } => {
+            run_watch_command(&service, task, lines)?;
+        }
         Commands::Runs { id, json } => {
             let runs = service.task_runs(&TaskId::new(&id))?;
             if json {
@@ -1660,6 +2015,24 @@ fn main() -> anyhow::Result<()> {
                         stop_reason
                     );
                 }
+            }
+        }
+        Commands::Retries { id, json } => {
+            let task_id = TaskId::new(&id);
+            let events = service.task_events(&task_id)?;
+            let runs = service.task_runs(&task_id)?;
+            let retry_events = collect_retry_events(&events);
+            let timeline = build_retry_timeline(&events, &runs);
+
+            if json {
+                let payload = RetryHistoryOutput {
+                    task_id: id,
+                    retry_events,
+                    timeline,
+                };
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!("{}", format_retries_timeline(&task_id.0, &timeline));
             }
         }
         Commands::Stats => {
@@ -1701,6 +2074,16 @@ fn main() -> anyhow::Result<()> {
                 Ok(task) => println!("Stopped: {} (was {})", id, task.state),
                 Err(e) => {
                     eprintln!("Failed to stop {id}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Cancel { id } => {
+            let task_id = TaskId::new(&id);
+            match cancel_task(&service, &task_id, "requested by user") {
+                Ok(from_state) => println!("Cancelled: {id} ({from_state} -> STOPPED)"),
+                Err(e) => {
+                    eprintln!("Failed to cancel {id}: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1993,6 +2376,9 @@ fn format_event_kind(kind: &EventKind) -> String {
                 format!("\x1b[31magent_failed\x1b[0m ({model}, {duration_secs}s)")
             }
         }
+        EventKind::CancellationRequested { reason } => {
+            format!("\x1b[33mcancellation_requested\x1b[0m: {reason}")
+        }
         EventKind::ModelFallback {
             from_model,
             to_model,
@@ -2006,6 +2392,7 @@ fn format_event_kind(kind: &EventKind) -> String {
                 "\x1b[31mcontext_regen_failed\x1b[0m".to_string()
             }
         }
+        EventKind::ConfigReloaded { changes } => format!("config_reloaded: {changes}"),
         EventKind::TaskFailed { reason, is_final } => {
             let label = if *is_final { "FINAL_FAILURE" } else { "failed" };
             format!("\x1b[31m{label}\x1b[0m: {reason}")
@@ -2038,7 +2425,10 @@ fn format_event_kind(kind: &EventKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
+    use orchd::event_log::JsonlEventLog;
+    use orchd::persistence::SqliteStore;
+    use orchd::scheduler::SchedulerConfig;
     use orchd::TaskRunRecord;
     use serde_json::Value;
     use std::fs;
@@ -2254,5 +2644,207 @@ mod tests {
         assert_eq!(value.get("all_ok").and_then(Value::as_bool), Some(true));
         assert_eq!(value["checks"][0]["name"], "model_claude");
         assert_eq!(value["checks"][0]["status"], "ok");
+    }
+
+    #[test]
+    fn retries_formats_timeline() {
+        let task_id = TaskId::new("chat-123");
+        let started_1 = Utc
+            .with_ymd_and_hms(2026, 2, 16, 10, 30, 0)
+            .single()
+            .expect("valid timestamp");
+        let failed_1 = Utc
+            .with_ymd_and_hms(2026, 2, 16, 10, 35, 22)
+            .single()
+            .expect("valid timestamp");
+        let started_2 = Utc
+            .with_ymd_and_hms(2026, 2, 16, 10, 35, 25)
+            .single()
+            .expect("valid timestamp");
+        let completed_2 = Utc
+            .with_ymd_and_hms(2026, 2, 16, 10, 40, 11)
+            .single()
+            .expect("valid timestamp");
+
+        let events = vec![
+            Event {
+                id: EventId("E-R-1".to_string()),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(RepoId("repo-1".to_string())),
+                at: failed_1,
+                kind: EventKind::RetryScheduled {
+                    attempt: 1,
+                    model: "codex".to_string(),
+                    reason: "verify failed".to_string(),
+                },
+            },
+            Event {
+                id: EventId("E-R-2".to_string()),
+                task_id: Some(task_id.clone()),
+                repo_id: Some(RepoId("repo-1".to_string())),
+                at: started_2,
+                kind: EventKind::AgentSpawned {
+                    model: "codex".to_string(),
+                },
+            },
+        ];
+
+        let runs = vec![
+            TaskRunRecord {
+                run_id: "RUN-1".to_string(),
+                task_id: task_id.clone(),
+                repo_id: RepoId("repo-1".to_string()),
+                model: ModelKind::Claude,
+                started_at: started_1,
+                finished_at: Some(failed_1),
+                stop_reason: Some("failed".to_string()),
+                exit_code: Some(1),
+                estimated_tokens: None,
+                duration_secs: Some(322.0),
+            },
+            TaskRunRecord {
+                run_id: "RUN-2".to_string(),
+                task_id,
+                repo_id: RepoId("repo-1".to_string()),
+                model: ModelKind::Codex,
+                started_at: started_2,
+                finished_at: Some(completed_2),
+                stop_reason: Some("completed".to_string()),
+                exit_code: Some(0),
+                estimated_tokens: None,
+                duration_secs: Some(286.0),
+            },
+        ];
+
+        let timeline = build_retry_timeline(&events, &runs);
+        let rendered = format_retries_timeline("chat-123", &timeline);
+
+        assert!(rendered.contains("Retry History for chat-123:"));
+        assert!(rendered.contains("#1"));
+        assert!(rendered.contains("claude"));
+        assert!(rendered.contains("failed 10:35:22"));
+        assert!(rendered.contains("reason: \"verify failed\""));
+        assert!(rendered.contains("codex"));
+        assert!(rendered.contains("completed 10:40:11"));
+    }
+
+    fn mk_test_service() -> OrchdService {
+        let store = SqliteStore::open_in_memory().expect("in-memory db");
+        let dir = std::env::temp_dir().join(format!(
+            "othala-main-cancel-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let service = OrchdService::new(
+            store,
+            JsonlEventLog::new(dir),
+            Scheduler::new(SchedulerConfig {
+                per_repo_limit: 10,
+                per_model_limit: vec![
+                    (ModelKind::Claude, 10),
+                    (ModelKind::Codex, 10),
+                    (ModelKind::Gemini, 10),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+        );
+        service.bootstrap().expect("bootstrap");
+        service
+    }
+
+    fn mk_task(id: &str, state: TaskState) -> Task {
+        let mut task = Task::new(
+            TaskId::new(id),
+            RepoId("repo-test".to_string()),
+            format!("Task {id}"),
+            PathBuf::from(format!(".orch/wt/{id}")),
+        );
+        task.state = state;
+        task
+    }
+
+    fn mk_created_event(task: &Task) -> Event {
+        Event {
+            id: EventId(format!("E-CREATE-{}", task.id.0)),
+            task_id: Some(task.id.clone()),
+            repo_id: Some(task.repo_id.clone()),
+            at: Utc::now(),
+            kind: EventKind::TaskCreated,
+        }
+    }
+
+    #[test]
+    fn cancel_transitions_chatting_to_stopped() {
+        let service = mk_test_service();
+        let task = mk_task("T-CANCEL-1", TaskState::Chatting);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let from_state = cancel_task(&service, &task.id, "requested by user").expect("cancel task");
+        assert_eq!(from_state, TaskState::Chatting);
+        let updated = service
+            .task(&task.id)
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(updated.state, TaskState::Stopped);
+    }
+
+    #[test]
+    fn cancel_rejects_merged_task() {
+        let service = mk_test_service();
+        let task = mk_task("T-CANCEL-2", TaskState::Merged);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let result = cancel_task(&service, &task.id, "requested by user");
+        assert!(result.is_err());
+        let err = result.expect_err("error").to_string();
+        assert!(err.contains("cannot cancel task in state MERGED"));
+    }
+
+    #[test]
+    fn cancellation_event_created() {
+        let service = mk_test_service();
+        let task = mk_task("T-CANCEL-3", TaskState::Chatting);
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        cancel_task(&service, &task.id, "requested by user").expect("cancel task");
+        let events = service.task_events(&task.id).expect("task events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::CancellationRequested { reason } if reason == "requested by user"
+            )
+        }));
+    }
+
+    #[test]
+    fn watch_formats_output_with_prefix() {
+        let line = format_watch_line("task-1", "\x1b[31m", "hello world");
+        assert_eq!(line, "[\x1b[31mtask-1\x1b[0m] hello world");
+    }
+
+    #[test]
+    fn watch_and_cancel_cli_parse() {
+        let watch = Cli::try_parse_from(["othala", "watch", "--task", "task-1", "-n", "5"])
+            .expect("parse watch");
+        match watch.command {
+            Commands::Watch { task, lines } => {
+                assert_eq!(task.as_deref(), Some("task-1"));
+                assert_eq!(lines, 5);
+            }
+            _ => panic!("expected watch command"),
+        }
+
+        let cancel = Cli::try_parse_from(["othala", "cancel", "task-2"]).expect("parse cancel");
+        match cancel.command {
+            Commands::Cancel { id } => assert_eq!(id, "task-2"),
+            _ => panic!("expected cancel command"),
+        }
     }
 }

@@ -44,6 +44,16 @@ pub struct TaskOverviewRow {
     pub estimated_cost_usd: Option<f64>,
     #[serde(default)]
     pub retry_count: u32,
+    #[serde(default)]
+    pub retry_history: Vec<RetryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetryEntry {
+    pub attempt: u32,
+    pub model: String,
+    pub reason: Option<String>,
+    pub timestamp: String,
 }
 
 impl TaskOverviewRow {
@@ -76,6 +86,7 @@ impl TaskOverviewRow {
             estimated_tokens: None,
             estimated_cost_usd: None,
             retry_count: task.retry_count,
+            retry_history: Vec::new(),
         }
     }
 }
@@ -699,6 +710,25 @@ mod tests {
         assert_eq!(row.task_id.0, "T1");
         assert_eq!(row.display_state, "Chatting");
         assert_eq!(row.retry_count, 0);
+    }
+
+    #[test]
+    fn retry_history_default_empty() {
+        let value = serde_json::json!({
+            "task_id": "T1",
+            "repo_id": "example",
+            "title": "Task T1",
+            "branch": "task/T1",
+            "stack_position": null,
+            "state": "chatting",
+            "display_state": "Chatting",
+            "verify_summary": "not_run",
+            "last_activity": "2026-02-01T00:00:00Z",
+            "retry_count": 0
+        });
+
+        let row: TaskOverviewRow = serde_json::from_value(value).expect("deserialize task row");
+        assert!(row.retry_history.is_empty());
     }
 
     #[test]
