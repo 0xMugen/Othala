@@ -109,6 +109,11 @@ fn focused_block(title: &str) -> Block<'_> {
 // -- Layout -----------------------------------------------------------------
 
 pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
+    if let Some((task_id, log_lines, scroll_offset)) = app.log_view_display() {
+        render_log_view(frame, task_id, log_lines, scroll_offset);
+        return;
+    }
+
     let footer_height = footer_height(app, frame.area().width);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -147,6 +152,64 @@ pub fn render_dashboard(frame: &mut Frame<'_>, app: &TuiApp) {
     if matches!(&app.input_mode, InputMode::HelpOverlay) {
         render_help_overlay(frame);
     }
+}
+
+fn render_log_view(frame: &mut Frame<'_>, task_id: &str, log_lines: &[String], scroll_offset: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let visible_height = chunks[1].height.saturating_sub(2) as usize;
+    let max_start = log_lines.len().saturating_sub(visible_height);
+    let start = scroll_offset.min(max_start);
+    let end = (start + visible_height).min(log_lines.len());
+    let position = if log_lines.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}-{}/{}", start.saturating_add(1), end, log_lines.len())
+    };
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" Agent Log: {task_id}"),
+            Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("   [{position}]"), Style::default().fg(DIM)),
+    ]))
+    .block(focused_block("Log"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(header, chunks[0]);
+
+    let body_lines: Vec<Line<'static>> = if log_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "No log output available.",
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        log_lines[start..end]
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect()
+    };
+
+    let body = Paragraph::new(body_lines)
+        .block(normal_block("Output"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, chunks[1]);
+
+    let footer = Paragraph::new(Line::from(Span::styled(
+        "[j/k] Scroll  [PgDn/PgUp] Page  [G] End  [g] Start  [Esc] Back",
+        Style::default().fg(DIM),
+    )))
+    .block(normal_block("Controls"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, chunks[2]);
 }
 
 // -- Header -----------------------------------------------------------------

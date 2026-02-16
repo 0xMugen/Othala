@@ -50,6 +50,16 @@ pub struct PromptConfig {
 pub fn build_rich_prompt(config: &PromptConfig, template_dir: &Path) -> String {
     let mut sections: Vec<String> = Vec::new();
 
+    if let Some(repo_root) = &config.repo_root {
+        let system_prompt_path = repo_root.join(".othala/system-prompt.md");
+        if let Ok(system_prompt) = std::fs::read_to_string(system_prompt_path) {
+            let trimmed = system_prompt.trim();
+            if !trimmed.is_empty() {
+                sections.push(trimmed.to_string());
+            }
+        }
+    }
+
     // 1. Role template (from disk).
     let template_file = match config.role {
         PromptRole::Implement => "implementer.md",
@@ -90,6 +100,24 @@ pub fn build_rich_prompt(config: &PromptConfig, template_dir: &Path) -> String {
             }
         }
     }
+
+    let attempt = config.retry.as_ref().map(|r| r.attempt).unwrap_or(1);
+    let failed_models: Vec<&str> = config
+        .retry
+        .as_ref()
+        .map(|r| vec![r.previous_model.as_str()])
+        .unwrap_or_default();
+
+    let mut metadata = format!(
+        "# Task Metadata\n\n- Priority: normal\n- Attempt: {attempt}\n"
+    );
+    if !failed_models.is_empty() {
+        metadata.push_str(&format!(
+            "- Previously failed with: {}\n",
+            failed_models.join(", ")
+        ));
+    }
+    sections.push(metadata);
 
     // 4. Test specification (if available).
     if let Some(spec) = &config.test_spec {
@@ -335,6 +363,56 @@ mod tests {
         let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
         assert!(prompt.contains("Referenced Source Files"));
         assert!(prompt.contains("pub fn greet()"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prompt_builder_includes_task_metadata() {
+        let mut config = mk_config();
+        config.retry = Some(RetryContext {
+            attempt: 3,
+            max_retries: 5,
+            previous_failure: "previous failure".to_string(),
+            previous_model: ModelKind::Gemini,
+        });
+
+        let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
+        assert!(prompt.contains("Task Metadata"));
+        assert!(prompt.contains("Priority: normal"));
+        assert!(prompt.contains("Attempt: 3"));
+        assert!(prompt.contains("Previously failed with: gemini"));
+    }
+
+    #[test]
+    fn prompt_builder_includes_system_prompt() {
+        let tmp = std::env::temp_dir().join(format!("othala-system-prompt-{}", std::process::id()));
+        let othala = tmp.join(".othala");
+        fs::create_dir_all(&othala).unwrap();
+        fs::write(othala.join("system-prompt.md"), "# Repo Override\n\nUse strict conventions.\n")
+            .unwrap();
+
+        let mut config = mk_config();
+        config.repo_root = Some(tmp.clone());
+
+        let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
+        assert!(prompt.contains("Repo Override"));
+        assert!(prompt.contains("Use strict conventions."));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prompt_builder_skips_missing_system_prompt() {
+        let tmp = std::env::temp_dir().join(format!("othala-system-prompt-missing-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mut config = mk_config();
+        config.repo_root = Some(tmp.clone());
+
+        let prompt = build_rich_prompt(&config, Path::new("/nonexistent"));
+        assert!(!prompt.contains("Repo Override"));
+        assert!(prompt.contains("Task Assignment"));
 
         fs::remove_dir_all(&tmp).ok();
     }
