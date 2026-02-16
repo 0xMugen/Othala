@@ -185,6 +185,22 @@ impl TuiApp {
             return;
         }
 
+        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('S') {
+            self.state.sort_mode = self.state.sort_mode.next();
+            self.state.status_line = format!("sort: {}", self.state.sort_mode.label());
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Normal) && key.code == KeyCode::Char('R') {
+            self.state.sort_reversed = !self.state.sort_reversed;
+            self.state.status_line = if self.state.sort_reversed {
+                "sort direction: reversed".to_string()
+            } else {
+                "sort direction: normal".to_string()
+            };
+            return;
+        }
+
         if matches!(self.input_mode, InputMode::Normal)
             && self.state.focused_task
             && key.code == KeyCode::Char('l')
@@ -994,7 +1010,8 @@ mod tests {
     use orch_core::types::{ModelKind, TaskId};
 
     use crate::{
-        AgentPane, AgentPaneStatus, QueuedAction, TaskOverviewRow, TuiApp, TuiEvent, UiAction,
+        AgentPane, AgentPaneStatus, QueuedAction, SortMode, TaskOverviewRow, TuiApp, TuiEvent,
+        UiAction,
     };
 
     fn assert_dispatch_action(
@@ -1357,6 +1374,30 @@ mod tests {
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
         assert_eq!(app.state.filter_state, None);
+    }
+
+    #[test]
+    fn s_key_changes_sort_mode() {
+        let mut app = TuiApp::default();
+        assert_eq!(app.state.sort_mode, SortMode::ByState);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        assert_eq!(app.state.sort_mode, SortMode::ByPriority);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        assert_eq!(app.state.sort_mode, SortMode::ByLastActivity);
+    }
+
+    #[test]
+    fn r_key_reverses_sort() {
+        let mut app = TuiApp::default();
+        assert!(!app.state.sort_reversed);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(app.state.sort_reversed);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(!app.state.sort_reversed);
     }
 
     #[test]

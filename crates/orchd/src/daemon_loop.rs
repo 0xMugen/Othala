@@ -55,6 +55,7 @@ pub struct DaemonConfig {
     pub skip_context_regen: bool,
     pub dry_run: bool,
     pub agent_timeout_secs: u64,
+    pub drain_timeout_secs: u64,
 }
 
 /// Mutable state carried across daemon ticks.
@@ -70,6 +71,8 @@ pub struct DaemonState {
     pub restack_retries: HashMap<String, RestackRetryState>,
     pub notification_dispatcher: Option<NotificationDispatcher>,
     pub config_last_modified: Option<std::time::SystemTime>,
+    pub shutdown_requested: bool,
+    pub shutdown_deadline: Option<std::time::Instant>,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -126,7 +129,16 @@ impl DaemonState {
             restack_retries: HashMap::new(),
             notification_dispatcher: None,
             config_last_modified: None,
+            shutdown_requested: false,
+            shutdown_deadline: None,
         }
+    }
+
+    pub fn request_shutdown(&mut self, drain_timeout_secs: u64) {
+        self.shutdown_requested = true;
+        self.shutdown_deadline = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(drain_timeout_secs),
+        );
     }
 }
 
@@ -300,6 +312,7 @@ pub enum DaemonAction {
     Log {
         message: String,
     },
+    ShutdownComplete,
 }
 
 /// Run a single daemon tick — the core of the orchestration loop.
@@ -314,6 +327,63 @@ pub fn daemon_tick(
 ) -> Vec<DaemonAction> {
     let mut actions = Vec::new();
     let now = Utc::now();
+
+    if daemon_state.shutdown_requested {
+        let poll_result = supervisor.poll();
+
+        for chunk in &poll_result.output {
+            if let Err(err) =
+                agent_log::append_agent_output(&config.repo_root, &chunk.task_id, &chunk.lines)
+            {
+                eprintln!(
+                    "[daemon] Failed to persist agent output for {}: {err}",
+                    chunk.task_id.0
+                );
+            }
+
+            for line in &chunk.lines {
+                actions.push(DaemonAction::Log {
+                    message: format!("[{}] {}", chunk.task_id.0, line),
+                });
+            }
+        }
+
+        let notification_dispatcher = daemon_state.notification_dispatcher.take();
+        for outcome in &poll_result.completed {
+            let outcome_actions = handle_agent_completion(
+                service,
+                notification_dispatcher.as_ref(),
+                outcome,
+                config,
+                daemon_state,
+                now,
+            );
+            actions.extend(outcome_actions);
+        }
+        daemon_state.notification_dispatcher = notification_dispatcher;
+
+        let deadline_reached = daemon_state
+            .shutdown_deadline
+            .map(|deadline| std::time::Instant::now() >= deadline)
+            .unwrap_or(false);
+        let running_agents = supervisor.running_count();
+
+        if running_agents == 0 {
+            actions.push(DaemonAction::ShutdownComplete);
+            return actions;
+        }
+
+        if deadline_reached {
+            let unfinished = supervisor.drain_agents(std::time::Duration::from_millis(10));
+            if !unfinished.is_empty() {
+                supervisor.terminate_all_agents();
+            }
+            actions.push(DaemonAction::ShutdownComplete);
+            return actions;
+        }
+
+        return actions;
+    }
 
     // --- Phase 1: Spawn agents for Chatting tasks without sessions ---
     if let Ok(chatting) = service.list_tasks_by_state(TaskState::Chatting) {
@@ -947,8 +1017,9 @@ pub fn execute_actions(
     supervisor: &mut AgentSupervisor,
     daemon_state: &mut DaemonState,
     config: &DaemonConfig,
-) {
+) -> bool {
     let now = Utc::now();
+    let mut should_exit = false;
 
     for action in actions {
         match action {
@@ -1667,8 +1738,56 @@ pub fn execute_actions(
             DaemonAction::Log { message } => {
                 println!("{}", message);
             }
+            DaemonAction::ShutdownComplete => {
+                eprintln!("[daemon] Daemon shutdown complete");
+                if !config.dry_run {
+                    let interrupted_reason = "interrupted by daemon shutdown";
+                    if let Ok(open_runs) = service.store.list_open_runs() {
+                        for run in open_runs {
+                            let task_id = run.task_id.clone();
+                            if let Err(err) = service.store.finish_open_runs_for_task(
+                                &task_id,
+                                now,
+                                "interrupted",
+                                None,
+                                None,
+                            ) {
+                                eprintln!(
+                                    "[daemon] Failed to finish open run for {}: {}",
+                                    task_id.0, err
+                                );
+                            }
+
+                            if let Ok(Some(mut task)) = service.task(&task_id) {
+                                if matches!(
+                                    task.state,
+                                    TaskState::Chatting
+                                        | TaskState::Ready
+                                        | TaskState::Submitting
+                                        | TaskState::Restacking
+                                        | TaskState::AwaitingMerge
+                                ) {
+                                    task.state = TaskState::Stopped;
+                                    task.updated_at = now;
+                                    task.last_failure_reason =
+                                        Some(interrupted_reason.to_string());
+                                    if let Err(err) = service.store.upsert_task(&task) {
+                                        eprintln!(
+                                            "[daemon] Failed to persist interrupted task {}: {}",
+                                            task_id.0, err
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                should_exit = true;
+            }
         }
     }
+
+    should_exit
 }
 
 /// Convenience: run a single daemon tick and execute its actions.
@@ -1677,9 +1796,9 @@ pub fn run_tick(
     supervisor: &mut AgentSupervisor,
     daemon_state: &mut DaemonState,
     config: &DaemonConfig,
-) {
+) -> bool {
     let actions = daemon_tick(service, supervisor, daemon_state, config);
-    execute_actions(&actions, service, supervisor, daemon_state, config);
+    execute_actions(&actions, service, supervisor, daemon_state, config)
 }
 
 #[cfg(test)]
@@ -1688,12 +1807,14 @@ mod tests {
     use crate::event_log::JsonlEventLog;
     use crate::persistence::SqliteStore;
     use crate::scheduler::{Scheduler, SchedulerConfig};
+    use crate::supervisor::AgentSession;
     use chrono::Duration;
     use orch_core::events::{Event, EventKind};
     use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
     use std::fs;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration as StdDuration;
 
@@ -1735,6 +1856,7 @@ mod tests {
             skip_context_regen: false,
             dry_run: false,
             agent_timeout_secs: 1_800,
+            drain_timeout_secs: 30,
         }
     }
 
@@ -1755,6 +1877,28 @@ mod tests {
             at: Utc::now(),
             kind: EventKind::TaskCreated,
         }
+    }
+
+    fn insert_sleep_session(supervisor: &mut AgentSupervisor, task_id: &TaskId) {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep session");
+        let (_tx, rx) = mpsc::channel();
+        supervisor.insert_session_for_test(AgentSession {
+            child,
+            output_rx: rx,
+            input_tx: None,
+            task_id: task_id.clone(),
+            model: ModelKind::Claude,
+            started_at: Utc::now(),
+            timeout: StdDuration::from_secs(1_800),
+            patch_ready: false,
+            needs_human: false,
+            signal_at: None,
+        });
     }
 
     fn sample_org_config_toml(tick_interval_secs: u64, agent_timeout_secs: u64) -> String {
@@ -1954,6 +2098,85 @@ agent_timeout_secs = {agent_timeout_secs}
     }
 
     #[test]
+    fn request_shutdown_sets_deadline() {
+        let mut state = DaemonState::new();
+        state.request_shutdown(30);
+        assert!(state.shutdown_requested);
+        assert!(state.shutdown_deadline.is_some());
+    }
+
+    #[test]
+    fn daemon_tick_skips_spawn_during_shutdown() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let task = mk_task("T-SD-1");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        daemon_state.request_shutdown(30);
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::SpawnAgent { .. })));
+    }
+
+    #[test]
+    fn shutdown_complete_when_no_agents_running() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        daemon_state.request_shutdown(30);
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::ShutdownComplete)));
+    }
+
+    #[test]
+    fn shutdown_waits_for_running_agents() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+        let task_id = TaskId::new("T-SD-2");
+
+        insert_sleep_session(&mut supervisor, &task_id);
+        daemon_state.request_shutdown(30);
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::ShutdownComplete)));
+        assert!(supervisor.has_session(&task_id));
+        supervisor.stop_all();
+    }
+
+    #[test]
+    fn drain_timeout_forces_shutdown() {
+        let service = mk_service();
+        let config = mk_config();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        insert_sleep_session(&mut supervisor, &TaskId::new("T-SD-3"));
+        daemon_state.request_shutdown(0);
+        let actions = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DaemonAction::ShutdownComplete)));
+        assert_eq!(supervisor.running_count(), 0);
+    }
+
+    #[test]
     fn config_reload_detects_change() {
         let mut daemon_state = DaemonState::new();
         let config_dir = std::env::temp_dir().join(format!(
@@ -2136,6 +2359,7 @@ agent_timeout_secs = {agent_timeout_secs}
             skip_context_regen: false,
             dry_run: false,
             agent_timeout_secs: 1_800,
+            drain_timeout_secs: 30,
         };
         (config, tmp)
     }

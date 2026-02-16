@@ -34,6 +34,8 @@ pub struct AgentSession {
     pub signal_at: Option<Instant>,
 }
 
+pub type AgentProcess = AgentSession;
+
 /// Result returned when an agent session finishes.
 #[derive(Debug)]
 pub struct AgentOutcome {
@@ -92,7 +94,7 @@ fn rotate_task_log_if_needed(task_id: &TaskId) {
 
 /// Manages running agent sessions.
 pub struct AgentSupervisor {
-    sessions: HashMap<String, AgentSession>,
+    sessions: HashMap<TaskId, AgentSession>,
     default_model: ModelKind,
 }
 
@@ -105,7 +107,12 @@ impl AgentSupervisor {
     }
 
     pub fn has_session(&self, task_id: &TaskId) -> bool {
-        self.sessions.contains_key(&task_id.0)
+        self.sessions.contains_key(task_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_session_for_test(&mut self, session: AgentSession) {
+        self.sessions.insert(session.task_id.clone(), session);
     }
 
     /// Spawn an agent process for a task.
@@ -160,7 +167,7 @@ impl AgentSupervisor {
             signal_at: None,
         };
 
-        self.sessions.insert(task_id.0.clone(), session);
+        self.sessions.insert(task_id.clone(), session);
         Ok(())
     }
 
@@ -239,7 +246,7 @@ impl AgentSupervisor {
             signal_at: None,
         };
 
-        self.sessions.insert(task_id.0.clone(), session);
+        self.sessions.insert(task_id.clone(), session);
         Ok(())
     }
 
@@ -247,7 +254,7 @@ impl AgentSupervisor {
     pub fn send_input(&self, task_id: &TaskId, message: &str) -> anyhow::Result<()> {
         let session = self
             .sessions
-            .get(&task_id.0)
+            .get(task_id)
             .ok_or_else(|| anyhow::anyhow!("no session for task {}", task_id.0))?;
         let tx = session
             .input_tx
@@ -389,21 +396,91 @@ impl AgentSupervisor {
         PollResult { output, completed }
     }
 
+    pub fn running_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn running_task_ids(&self) -> Vec<TaskId> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    pub fn drain_agents(&mut self, timeout: Duration) -> Vec<TaskId> {
+        drain_agents(&mut self.sessions, timeout)
+    }
+
+    pub fn terminate_all_agents(&mut self) {
+        terminate_all_agents(&mut self.sessions);
+    }
+
     /// Kill all running agent processes.
     pub fn stop_all(&mut self) {
-        for (_key, mut session) in self.sessions.drain() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
+        terminate_all_agents(&mut self.sessions);
     }
 
     /// Stop the agent for a specific task.
     pub fn stop(&mut self, task_id: &TaskId) {
-        if let Some(mut session) = self.sessions.remove(&task_id.0) {
+        if let Some(mut session) = self.sessions.remove(task_id) {
             let _ = session.child.kill();
             let _ = session.child.wait();
         }
     }
+}
+
+fn send_sigterm(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+}
+
+pub fn terminate_all_agents(active_processes: &mut HashMap<TaskId, AgentProcess>) {
+    for (task_id, mut process) in active_processes.drain() {
+        eprintln!("[supervisor] Sending SIGTERM to agent for task {}", task_id.0);
+        send_sigterm(&mut process.child);
+
+        let grace_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < grace_deadline {
+            match process.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+
+        let still_running = matches!(process.child.try_wait(), Ok(None));
+        if still_running {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+        }
+    }
+}
+
+pub fn drain_agents(
+    active_processes: &mut HashMap<TaskId, AgentProcess>,
+    timeout: Duration,
+) -> Vec<TaskId> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let finished: Vec<TaskId> = active_processes
+            .iter_mut()
+            .filter_map(|(task_id, process)| match process.child.try_wait() {
+                Ok(Some(_)) | Err(_) => Some(task_id.clone()),
+                Ok(None) => None,
+            })
+            .collect();
+
+        for task_id in finished {
+            active_processes.remove(&task_id);
+        }
+
+        if active_processes.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    active_processes.keys().cloned().collect()
 }
 
 /// Build the prompt sent to the agent CLI.
@@ -586,7 +663,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
         assert!(sup.has_session(&task_id));
 
         // Wait for the process to finish.
@@ -629,7 +706,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -667,7 +744,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -704,7 +781,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -741,7 +818,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
         assert!(sup.has_session(&task_id));
 
         sup.stop(&task_id);
@@ -776,7 +853,7 @@ mod tests {
                 needs_human: false,
                 signal_at: None,
             };
-            sup.sessions.insert(task_id.0.clone(), session);
+            sup.sessions.insert(task_id.clone(), session);
         }
 
         assert!(sup.has_session(&TaskId::new("T-stopall-0")));
@@ -818,7 +895,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -855,7 +932,7 @@ mod tests {
             needs_human: false,
             signal_at: None,
         };
-        sup.sessions.insert(task_id.0.clone(), session);
+        sup.sessions.insert(task_id.clone(), session);
 
         let err = sup
             .send_input(&task_id, "hello")
@@ -892,7 +969,7 @@ mod tests {
         pipe_child_output(&mut slow_child, slow_tx);
 
         sup.sessions.insert(
-            fast_id.0.clone(),
+            fast_id.clone(),
             AgentSession {
                 child: fast_child,
                 output_rx: fast_rx,
@@ -907,7 +984,7 @@ mod tests {
             },
         );
         sup.sessions.insert(
-            slow_id.0.clone(),
+            slow_id.clone(),
             AgentSession {
                 child: slow_child,
                 output_rx: slow_rx,
@@ -951,7 +1028,7 @@ mod tests {
         pipe_child_output(&mut child, tx);
 
         sup.sessions.insert(
-            task_id.0.clone(),
+            task_id.clone(),
             AgentSession {
                 child,
                 output_rx: rx,
@@ -986,7 +1063,7 @@ mod tests {
         pipe_child_output(&mut child, tx);
 
         sup.sessions.insert(
-            task_id.0.clone(),
+            task_id.clone(),
             AgentSession {
                 child,
                 output_rx: rx,
@@ -1023,7 +1100,7 @@ mod tests {
         pipe_child_output(&mut child, tx);
 
         sup.sessions.insert(
-            task_id.0.clone(),
+            task_id.clone(),
             AgentSession {
                 child,
                 output_rx: rx,

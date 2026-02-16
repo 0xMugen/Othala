@@ -179,6 +179,8 @@ pub struct Task {
     pub priority: TaskPriority,
     pub depends_on: Vec<TaskId>,
     pub submit_mode: SubmitMode,
+    #[serde(default)]
+    pub labels: Vec<String>,
     pub branch_name: Option<String>,
     pub worktree_path: PathBuf,
     pub pr: Option<PullRequestRef>,
@@ -229,6 +231,7 @@ impl Task {
             priority: TaskPriority::default(),
             depends_on: Vec::new(),
             submit_mode: SubmitMode::Single,
+            labels: Vec::new(),
             branch_name: None,
             worktree_path,
             pr: None,
