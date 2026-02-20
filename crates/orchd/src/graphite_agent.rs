@@ -437,6 +437,13 @@ pub fn repair_tracking(
     Ok(())
 }
 
+fn is_benign_noop_restack(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("does not need to be restacked")
+        || lower.contains("already up to date")
+        || lower.contains("nothing to restack")
+}
+
 fn untrack_branch(repo_root: &Path, branch: &str) -> Result<(), GraphiteError> {
     let status = Command::new("git")
         .args([
@@ -600,11 +607,15 @@ impl GraphiteMasterAgent {
                 results.push(OperationResult::Success);
             }
             Ok(RestackOutcome::Conflict { stdout, stderr }) => {
-                // Abort the failed rebase
-                let _ = graphite.abort_rebase();
-                results.push(OperationResult::Conflict {
-                    details: format!("{stdout}\n{stderr}"),
-                });
+                let combined = format!("{stdout}\n{stderr}");
+                if is_benign_noop_restack(&combined) {
+                    // Treat Graphite's "no restack needed" output as success.
+                    results.push(OperationResult::Success);
+                } else {
+                    // Abort the failed rebase
+                    let _ = graphite.abort_rebase();
+                    results.push(OperationResult::Conflict { details: combined });
+                }
             }
             Err(e) => {
                 results.push(OperationResult::Retryable {
@@ -1116,5 +1127,14 @@ mod tests {
         assert!(info.is_diverged);
         assert!(info.needs_track);
         assert!(!info.needs_untrack);
+    }
+
+    #[test]
+    fn noop_restack_messages_are_treated_as_benign() {
+        assert!(is_benign_noop_restack(
+            "task/foo does not need to be restacked on main"
+        ));
+        assert!(is_benign_noop_restack("nothing to restack"));
+        assert!(!is_benign_noop_restack("merge conflict in src/lib.rs"));
     }
 }
