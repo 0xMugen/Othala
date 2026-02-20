@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use orch_core::config::OrgConfig;
 use orch_core::state::TaskState;
-use orch_core::types::{ModelKind, RepoId, TaskId, TaskPriority};
+use orch_core::types::{ModelKind, RepoId, SubmitMode, TaskId, TaskPriority};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +34,7 @@ pub struct QueuedTask {
     pub task_id: TaskId,
     pub repo_id: RepoId,
     pub depends_on: Vec<TaskId>,
+    pub submit_mode: SubmitMode,
     pub preferred_model: Option<ModelKind>,
     pub priority: TaskPriority,
     pub enqueued_at: DateTime<Utc>,
@@ -131,10 +132,11 @@ impl Scheduler {
         let mut blocked = Vec::new();
 
         for queued in input.queued {
-            let deps_resolved = queued
-                .depends_on
-                .iter()
-                .all(|dep| input.all_task_states.get(dep) == Some(&TaskState::Merged));
+            let deps_resolved = queued.depends_on.iter().all(|dep| {
+                matches!(input.all_task_states.get(dep), Some(TaskState::Merged))
+                    || (queued.submit_mode == SubmitMode::Stack
+                        && matches!(input.all_task_states.get(dep), Some(TaskState::AwaitingMerge)))
+            });
             if !deps_resolved {
                 blocked.push(BlockedTask {
                     task_id: queued.task_id,
@@ -259,6 +261,7 @@ mod tests {
             task_id: TaskId(id.to_string()),
             repo_id: RepoId(repo.to_string()),
             depends_on: Vec::new(),
+            submit_mode: SubmitMode::Single,
             preferred_model,
             priority,
             enqueued_at: Utc::now(),
@@ -459,6 +462,28 @@ mod tests {
 
         let mut all_task_states = HashMap::new();
         all_task_states.insert(TaskId("T1".to_string()), TaskState::Merged);
+
+        let plan = scheduler.plan(SchedulingInput {
+            queued: vec![queued],
+            running: Vec::new(),
+            all_task_states,
+            enabled_models: vec![ModelKind::Claude],
+            availability: Vec::new(),
+        });
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert!(plan.blocked.is_empty());
+    }
+
+    #[test]
+    fn stack_dependency_allows_awaiting_merge_parent() {
+        let scheduler = mk_scheduler(10, &[(ModelKind::Claude, 10)]);
+        let mut queued = mk_queued("T2", "repo", TaskPriority::Normal, None);
+        queued.submit_mode = SubmitMode::Stack;
+        queued.depends_on = vec![TaskId("T1".to_string())];
+
+        let mut all_task_states = HashMap::new();
+        all_task_states.insert(TaskId("T1".to_string()), TaskState::AwaitingMerge);
 
         let plan = scheduler.plan(SchedulingInput {
             queued: vec![queued],

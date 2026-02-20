@@ -372,6 +372,7 @@ impl OrchdService {
                 task_id: task.id.clone(),
                 repo_id: task.repo_id.clone(),
                 depends_on: task.depends_on.clone(),
+                submit_mode: task.submit_mode,
                 preferred_model: task.preferred_model,
                 priority: task.priority,
                 enqueued_at: task.created_at,

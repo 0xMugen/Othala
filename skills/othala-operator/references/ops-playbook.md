@@ -52,3 +52,11 @@ othala daemon --skip-context-gen --verify-command "echo verify skipped" --skip-q
 
 - Stack mode (prod/high-risk): preserve branch stacks and review flow.
 - Merge mode (non-prod/fast iteration): shorter cycle, merge quickly, keep stack shallow.
+
+## Boundary enforcement
+
+Use this split consistently:
+- Othala core owns state machine correctness, retries, merge/submit semantics, and deterministic failure handling.
+- Othala Operator skill owns multi-repo policy, vault task seeding, Telegram/SSH UX, and escalation cadence.
+
+If a problem appears in both layers, first fix correctness in core, then expose/automate through the skill.

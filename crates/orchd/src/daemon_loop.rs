@@ -31,6 +31,7 @@ use crate::test_spec::load_test_spec;
 use crate::OrchdService;
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -655,8 +656,21 @@ pub fn daemon_tick(
         .retain(|task_id, _| daemon_state.pipelines.contains_key(task_id));
 
     if let Ok(awaiting) = service.list_tasks_by_state(TaskState::AwaitingMerge) {
+        let auto_merge_mode = repo_mode_is_merge(&config.repo_root);
+
         for task in &awaiting {
             if let Some(pr) = &task.pr {
+                if auto_merge_mode {
+                    if let Some(branch) = task.branch_name.as_deref() {
+                        if auto_merge_branch_into_trunk(&config.repo_root, branch) {
+                            actions.push(DaemonAction::MarkMerged {
+                                task_id: task.id.clone(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 let merged_via_pr = check_pr_merged(pr.number, &config.repo_root);
                 let merged_via_graphite_stack = pr.number == 0
                     && pr.url.starts_with("graphite://")
@@ -1022,6 +1036,38 @@ fn is_branch_merged_into_trunk(repo_root: &Path, branch: &str) -> bool {
     }
 
     false
+}
+
+fn repo_mode_is_merge(repo_root: &Path) -> bool {
+    let mode_path = repo_root.join(".othala/repo-mode.toml");
+    let Ok(contents) = fs::read_to_string(mode_path) else {
+        return false;
+    };
+
+    contents
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "mode = \"merge\"" || line == "mode=\"merge\"")
+}
+
+fn auto_merge_branch_into_trunk(repo_root: &Path, branch: &str) -> bool {
+    if branch.trim().is_empty() {
+        return false;
+    }
+
+    if is_branch_merged_into_trunk(repo_root, branch) {
+        return true;
+    }
+
+    let status = Command::new("bash")
+        .arg("-lc")
+        .arg(format!(
+            "git fetch origin && git checkout -q main && git pull --ff-only origin main && git merge --ff-only {branch} && git push origin main"
+        ))
+        .current_dir(repo_root)
+        .status();
+
+    matches!(status, Ok(s) if s.success()) && is_branch_merged_into_trunk(repo_root, branch)
 }
 
 fn worktree_has_uncommitted_changes(path: &Path) -> bool {
