@@ -193,3 +193,15 @@ crates/
 - Runtime state is stored under `.orch/` (gitignored).
 - Graphite operations are intentionally wrapped through `orch-graphite`.
 - For controlled local validation, prefer temporary config + sqlite paths.
+
+## Operator skill (multi-repo)
+
+- Skill package path: `skills/othala-operator/`
+- SSH visual tree: `scripts/operator/status_tree.sh --watch`
+- SSH dashboard (tmux): `scripts/operator/dashboard_tmux.sh`
+- Blocked/stale report: `scripts/operator/blocked_report.sh`
+- Hourly escalation hook: `scripts/operator/hourly_check.sh`
+
+Per-repo mode is declared in `.othala/repo-mode.toml`:
+- `mode = "stack"` for stack-first repos.
+- `mode = "merge"` for merge-as-you-go repos.

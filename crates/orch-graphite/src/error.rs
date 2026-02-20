@@ -67,6 +67,15 @@ impl GraphiteError {
             _ => false,
         }
     }
+
+    pub fn is_trunk_outdated_failure(&self) -> bool {
+        match self {
+            GraphiteError::CommandFailed { stdout, stderr, .. } => {
+                looks_like_trunk_outdated_failure(stdout, stderr)
+            }
+            _ => false,
+        }
+    }
 }
 
 pub fn looks_like_restack_conflict(stdout: &str, stderr: &str) -> bool {
@@ -99,9 +108,25 @@ pub fn looks_like_auth_failure(stdout: &str, stderr: &str) -> bool {
     markers.iter().any(|marker| combined.contains(marker))
 }
 
+pub fn looks_like_trunk_outdated_failure(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{}\n{}", stdout, stderr).to_ascii_lowercase();
+
+    let markers = [
+        "trunk branch is out of date",
+        "could not be updated",
+        "could not be fast-forwarded",
+        "main could not be fast-forwarded",
+    ];
+
+    markers.iter().any(|marker| combined.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_auth_failure, looks_like_restack_conflict, GraphiteError};
+    use super::{
+        looks_like_auth_failure, looks_like_restack_conflict, looks_like_trunk_outdated_failure,
+        GraphiteError,
+    };
 
     #[test]
     fn detects_restack_conflict_from_common_markers() {
@@ -157,5 +182,25 @@ mod tests {
             stderr: "ERROR: No auth token set".to_string(),
         };
         assert!(err.is_auth_failure());
+    }
+
+    #[test]
+    fn detects_trunk_outdated_failures() {
+        assert!(looks_like_trunk_outdated_failure(
+            "",
+            "ERROR: Aborting submit because trunk branch is out of date and could not be updated."
+        ));
+        assert!(looks_like_trunk_outdated_failure(
+            "WARNING: main could not be fast-forwarded.",
+            ""
+        ));
+
+        let err = GraphiteError::CommandFailed {
+            command: "gt submit --no-edit --no-interactive".to_string(),
+            status: Some(1),
+            stdout: "WARNING: main could not be fast-forwarded.".to_string(),
+            stderr: "".to_string(),
+        };
+        assert!(err.is_trunk_outdated_failure());
     }
 }

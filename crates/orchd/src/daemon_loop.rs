@@ -1627,6 +1627,29 @@ pub fn execute_actions(
                                 continue;
                             }
 
+                            if error.is_trunk_outdated_failure() {
+                                let reason = format!(
+                                    "{err_msg}. Run gt sync (or git pull --rebase on trunk) and retry this task"
+                                );
+                                eprintln!(
+                                    "[daemon] Submit trunk-sync failed for {}; stopping without retries",
+                                    task_id.0
+                                );
+                                stop_task_with_failure_reason(
+                                    service,
+                                    daemon_state.notification_dispatcher.as_ref(),
+                                    task_id,
+                                    &reason,
+                                    now,
+                                );
+                                if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                    pipeline.fail(reason);
+                                }
+                                daemon_state.pipelines.remove(&task_id.0);
+                                daemon_state.restack_retries.remove(&task_id.0);
+                                continue;
+                            }
+
                             let retry_model = service
                                 .task(task_id)
                                 .ok()
