@@ -750,6 +750,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

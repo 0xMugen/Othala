@@ -1,11 +1,15 @@
 //! Othala daemon crate - MVP version.
+//!
+//! Next-gen orchestrator with multi-agent routing and smart context.
 
+pub mod agent_dispatch;
 pub mod agent_log;
 pub mod attribution;
 pub mod auto_compact;
 pub mod chat_workspace;
 pub mod ci_gen;
 pub mod code_search;
+pub mod context_manager;
 pub mod conversation;
 pub mod custom_commands;
 pub mod context_gen;
@@ -14,7 +18,10 @@ pub mod daemon_loop;
 pub mod daemon_status;
 pub mod delegation;
 pub mod dependency_graph;
+pub mod e2e_tester;
 pub mod graphite_agent;
+pub mod orchestration_metrics;
+pub mod problem_classifier;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod editor;
 pub mod env_inject;
