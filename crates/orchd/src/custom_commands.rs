@@ -178,8 +178,104 @@ pub fn validate_arguments(
     }
 }
 
+/// Rewrite legacy seeded placeholder syntax into canonical command-template syntax.
+/// Currently rewrites `${NAME}` and `${NAME:default}` into `$NAME` / `$NAME:default`.
+pub fn canonicalize_command_template(template: &str) -> String {
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(template.len());
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let mut end = i + 2;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b'}' {
+                if let Some(inner) = template.get(i + 2..end) {
+                    if is_valid_braced_placeholder(inner) {
+                        out.push('$');
+                        out.push_str(inner);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
+}
+
+/// Validate command-template syntax. Supported placeholders:
+/// - `$$` (escaped dollar)
+/// - `$UPPER_CASE`
+/// - `$UPPER_CASE:default`
+pub fn validate_command_template(template: &str) -> Result<(), CommandError> {
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= bytes.len() {
+            return Err(CommandError::InvalidTemplate("dangling '$' at end of template".to_string()));
+        }
+
+        if bytes[i + 1] == b'$' {
+            i += 2;
+            continue;
+        }
+
+        if !is_upper(bytes[i + 1]) {
+            let next = bytes[i + 1] as char;
+            return Err(CommandError::InvalidTemplate(format!(
+                "invalid placeholder start '${next}'"
+            )));
+        }
+
+        let mut end = i + 2;
+        while end < bytes.len() && is_arg_char(bytes[end]) {
+            end += 1;
+        }
+
+        if end < bytes.len() && bytes[end].is_ascii_lowercase() {
+            return Err(CommandError::InvalidTemplate(
+                "placeholder names must use only [A-Z0-9_]".to_string(),
+            ));
+        }
+
+        if end < bytes.len() && bytes[end] == b':' {
+            let default_start = end + 1;
+            let mut default_end = default_start;
+            while default_end < bytes.len() && !bytes[default_end].is_ascii_whitespace() {
+                default_end += 1;
+            }
+            if default_end == default_start {
+                return Err(CommandError::InvalidTemplate(
+                    "placeholder default value must not be empty".to_string(),
+                ));
+            }
+            end = default_end;
+        }
+
+        i = end;
+    }
+
+    Ok(())
+}
+
 pub fn render_template(template: &str, args: &HashMap<String, String>) -> Result<String, CommandError> {
-    let specs = parse_argument_specs(template);
+    let template = canonicalize_command_template(template);
+    validate_command_template(&template)?;
+
+    let specs = parse_argument_specs(&template);
     validate_arguments(&specs, args)?;
 
     let bytes = template.as_bytes();
@@ -404,6 +500,15 @@ fn visit_markdown(base_dir: &Path, current_dir: &Path, prefix: CommandPrefix, ou
         };
         let name = command_name_from_relative_path(relative);
         let (description_raw, template) = parse_command_description(&content);
+        let template = canonicalize_command_template(&template);
+        if validate_command_template(&template).is_err() {
+            continue;
+        }
+
+        if let Some(rewritten) = rewrite_command_file_content(&content, &template) {
+            let _ = fs::write(&path, rewritten);
+        }
+
         let description = if description_raw.is_empty() {
             name.clone()
         } else {
@@ -418,6 +523,22 @@ fn visit_markdown(base_dir: &Path, current_dir: &Path, prefix: CommandPrefix, ou
             template,
             source_path: path,
         });
+    }
+}
+
+fn rewrite_command_file_content(original_content: &str, canonical_template: &str) -> Option<String> {
+    let (description_raw, _) = parse_command_description(original_content);
+    let rewritten = if description_raw.is_empty() {
+        canonical_template.to_string()
+    } else {
+        let first_line = original_content.lines().next().unwrap_or_default();
+        format!("{first_line}\n{canonical_template}")
+    };
+
+    if rewritten == original_content {
+        None
+    } else {
+        Some(rewritten)
     }
 }
 
@@ -442,6 +563,37 @@ fn is_upper(b: u8) -> bool {
 
 fn is_arg_char(b: u8) -> bool {
     b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+}
+
+fn is_valid_braced_placeholder(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    if bytes.is_empty() || !is_upper(bytes[0]) {
+        return false;
+    }
+
+    let mut i = 1usize;
+    while i < bytes.len() && is_arg_char(bytes[i]) {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return true;
+    }
+
+    if bytes[i] != b':' {
+        return false;
+    }
+    i += 1;
+    if i == bytes.len() {
+        return false;
+    }
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b'}' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -584,5 +736,56 @@ mod tests {
     fn command_prefix_display() {
         assert_eq!(CommandPrefix::User.to_string(), "user");
         assert_eq!(CommandPrefix::Project.to_string(), "project");
+    }
+
+    #[test]
+    fn canonicalize_command_template_rewrites_braced_placeholders() {
+        let template = "Keep hot for ${MODEL} with ${SEED:123}";
+        let canonical = canonicalize_command_template(template);
+        assert_eq!(canonical, "Keep hot for $MODEL with $SEED:123");
+    }
+
+    #[test]
+    fn validate_command_template_accepts_valid_tokens() {
+        let template = "Run $TASK in $ENV:staging and $$literal";
+        assert!(validate_command_template(template).is_ok());
+    }
+
+    #[test]
+    fn validate_command_template_rejects_invalid_start() {
+        let err = validate_command_template("Run ${TASK}")
+            .expect_err("braced syntax should be invalid until canonicalized");
+        assert!(matches!(err, CommandError::InvalidTemplate(_)));
+    }
+
+    #[test]
+    fn validate_command_template_rejects_empty_default() {
+        let err = validate_command_template("Run $ENV: ")
+            .expect_err("empty default should be invalid");
+        assert!(matches!(err, CommandError::InvalidTemplate(_)));
+    }
+
+    #[test]
+    fn discover_commands_rewrites_legacy_template_syntax() {
+        let temp_dir = make_temp_dir();
+        let path = temp_dir.join("keep-hot.md");
+        fs::write(&path, "# Keep Hot\nWarm ${MODEL} with ${SEED:42}").expect("write command");
+
+        let commands = discover_commands_from_dir(&temp_dir, CommandPrefix::Project);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].template, "Warm $MODEL with $SEED:42");
+
+        let persisted = fs::read_to_string(&path).expect("read rewritten command");
+        assert_eq!(persisted, "# Keep Hot\nWarm $MODEL with $SEED:42");
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn discover_commands_skips_invalid_template_syntax() {
+        let temp_dir = make_temp_dir();
+        fs::write(temp_dir.join("bad.md"), "# Bad\nOops $name").expect("write invalid command");
+        let commands = discover_commands_from_dir(&temp_dir, CommandPrefix::Project);
+        assert!(commands.is_empty());
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
