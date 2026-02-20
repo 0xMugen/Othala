@@ -664,7 +664,8 @@ pub fn daemon_tick(
                         .branch_name
                         .as_deref()
                         .map(|b| is_branch_merged_into_trunk(&config.repo_root, b))
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                    && !worktree_has_uncommitted_changes(&task.worktree_path);
 
                 if merged_via_pr || merged_via_graphite_stack {
                     actions.push(DaemonAction::MarkMerged {
@@ -1021,6 +1022,18 @@ fn is_branch_merged_into_trunk(repo_root: &Path, branch: &str) -> bool {
     }
 
     false
+}
+
+fn worktree_has_uncommitted_changes(path: &Path) -> bool {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(path)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn get_worktree_head_sha(path: &Path) -> Option<String> {
@@ -1600,6 +1613,53 @@ pub fn execute_actions(
                         continue;
                     }
 
+                    let graphite = GraphiteClient::new(worktree_path.clone());
+
+                    // Ensure agent changes are committed before submit. This captures
+                    // untracked/modified files in the task branch so "merged" state
+                    // actually reflects landed content.
+                    if worktree_has_uncommitted_changes(worktree_path) {
+                        let message = format!("task {}: save pending changes", task_id.0);
+                        if let Err(error) = graphite.commit_pending(&message) {
+                            let err_msg = format!("graphite commit pending failed: {error}");
+                            let retry_model = service
+                                .task(task_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.preferred_model)
+                                .or_else(|| config.enabled_models.first().copied())
+                                .unwrap_or(ModelKind::Claude);
+                            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                pipeline.fail(err_msg.clone());
+                            }
+                            match apply_retry_transition(
+                                service,
+                                daemon_state.notification_dispatcher.as_ref(),
+                                task_id,
+                                retry_model,
+                                &err_msg,
+                                now,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!(
+                                        "[daemon] Commit pending failed for {}; retries exhausted",
+                                        task_id.0
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[daemon] Commit pending retry handling failed for {}: {}",
+                                        task_id.0, e
+                                    );
+                                }
+                            }
+                            daemon_state.pipelines.remove(&task_id.0);
+                            daemon_state.restack_retries.remove(&task_id.0);
+                            continue;
+                        }
+                    }
+
                     // Fetch latest trunk before submitting to avoid
                     // "trunk branch is out of date" errors from Graphite.
                     let _ = Command::new("git")
@@ -1609,7 +1669,6 @@ pub fn execute_actions(
                         .stderr(Stdio::null())
                         .status();
 
-                    let graphite = GraphiteClient::new(worktree_path.clone());
                     match graphite.submit(*mode) {
                         Ok(()) => {
                             if let Err(e) = service.complete_submit(
