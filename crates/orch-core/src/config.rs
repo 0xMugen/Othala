@@ -319,6 +319,20 @@ pub struct NixConfig {
     pub dev_shell: String,
 }
 
+impl NixConfig {
+    /// Wrap a command so it runs inside the nix dev shell.
+    ///
+    /// If `dev_shell` is empty, returns the command unchanged.
+    /// Otherwise wraps as `<dev_shell> -c <command>` (e.g. `nix develop -c bash -lc '<cmd>'`).
+    pub fn wrap_command(&self, command: &str) -> String {
+        let shell = self.dev_shell.trim();
+        if shell.is_empty() {
+            return command.to_string();
+        }
+        format!("{shell} -c {command}")
+    }
+}
+
 /// Verify configuration - simplified for MVP (just a command).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyConfig {
@@ -757,5 +771,32 @@ stdout = true
         let config = sample_org_with_profile(ConfigProfile::Staging);
         let serialized = toml::to_string(&config).expect("serialize org config");
         assert!(serialized.contains("profile = \"staging\""));
+    }
+
+    #[test]
+    fn nix_config_wrap_command_prepends_dev_shell() {
+        let nix = NixConfig {
+            dev_shell: "nix develop".to_string(),
+        };
+        assert_eq!(
+            nix.wrap_command("cargo test"),
+            "nix develop -c cargo test"
+        );
+    }
+
+    #[test]
+    fn nix_config_wrap_command_passthrough_when_empty() {
+        let nix = NixConfig {
+            dev_shell: String::new(),
+        };
+        assert_eq!(nix.wrap_command("cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn nix_config_wrap_command_trims_whitespace() {
+        let nix = NixConfig {
+            dev_shell: "  ".to_string(),
+        };
+        assert_eq!(nix.wrap_command("cargo test"), "cargo test");
     }
 }

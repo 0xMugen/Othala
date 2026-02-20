@@ -48,6 +48,10 @@ pub struct DaemonConfig {
     pub context_config: ContextLoadConfig,
     /// Default verify command.
     pub verify_command: Option<String>,
+    /// Nix dev shell command prefix (e.g. "nix develop").
+    /// When non-empty, verify commands are wrapped so they execute inside the
+    /// nix dev shell, ensuring cargo/rustc are available on PATH.
+    pub nix_shell: String,
     /// Context generation configuration.
     pub context_gen_config: ContextGenConfig,
     /// Skip all QA runs (baseline + validation). Prevents QA agent from
@@ -1201,13 +1205,20 @@ fn estimate_tokens_from_char_count(chars: u64) -> u64 {
     chars.div_ceil(4)
 }
 
-fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
+fn run_verify_command(cwd: &Path, command: &str, nix_shell: &str) -> Result<(), String> {
+    let nix = nix_shell.trim();
+    let effective = if nix.is_empty() {
+        command.to_string()
+    } else {
+        format!("{nix} -c {command}")
+    };
+
     let output = Command::new("bash")
         .arg("-lc")
-        .arg(command)
+        .arg(&effective)
         .current_dir(cwd)
         .output()
-        .map_err(|e| format!("failed to spawn verify command `{command}`: {e}"))?;
+        .map_err(|e| format!("failed to spawn verify command `{effective}`: {e}"))?;
 
     if output.status.success() {
         return Ok(());
@@ -1216,9 +1227,39 @@ fn run_verify_command(cwd: &Path, command: &str) -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(format!(
-        "verify command `{command}` failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        "verify command `{effective}` failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
         output.status.code()
     ))
+}
+
+/// Detect the nix dev shell command from repo config or flake.nix presence.
+///
+/// Tries `config/repos/*.toml` first for `nix.dev_shell`, then falls back to
+/// `"nix develop"` when a `flake.nix` exists at the repo root.
+pub fn detect_nix_shell(repo_root: &Path) -> String {
+    // Try repo config files first.
+    if let Ok(entries) = fs::read_dir(repo_root.join("config/repos")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "toml") {
+                if let Ok(contents) = fs::read_to_string(&path) {
+                    if let Ok(config) = orch_core::config::parse_repo_config(&contents) {
+                        let shell = config.nix.dev_shell.trim().to_string();
+                        if !shell.is_empty() {
+                            return shell;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if flake.nix exists, assume nix develop.
+    if repo_root.join("flake.nix").exists() {
+        return "nix develop".to_string();
+    }
+
+    String::new()
 }
 
 fn is_gh_pr_state_merged(stdout: &[u8]) -> bool {
@@ -1662,7 +1703,7 @@ pub fn execute_actions(
                     },
                     );
 
-                    match run_verify_command(worktree_path, verify_cmd) {
+                    match run_verify_command(worktree_path, verify_cmd, &config.nix_shell) {
                         Ok(()) => {
                             if let Some(sha) = current_sha {
                                 daemon_state.verify_cache.insert(task_id.0.clone(), sha);
@@ -2344,6 +2385,7 @@ mod tests {
             enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
+            nix_shell: String::new(),
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
             skip_context_regen: false,
@@ -3277,6 +3319,7 @@ monthly_token_limit = {monthly_token_limit}
             enabled_models: vec![ModelKind::Claude, ModelKind::Codex, ModelKind::Gemini],
             context_config: ContextLoadConfig::default(),
             verify_command: Some("cargo test --workspace".to_string()),
+            nix_shell: String::new(),
             context_gen_config: ContextGenConfig::default(),
             skip_qa: false,
             skip_context_regen: false,
@@ -3920,5 +3963,71 @@ monthly_token_limit = {monthly_token_limit}
         );
 
         assert!(!daemon_state.verify_cache.contains_key("T-VC-4"));
+    }
+
+    #[test]
+    fn run_verify_command_wraps_with_nix_shell_when_set() {
+        // With empty nix_shell, runs command directly.
+        let result = run_verify_command(Path::new("/tmp"), "true", "");
+        assert!(result.is_ok());
+
+        // With nix_shell set, command is wrapped as "<shell> -c <cmd>".
+        // Using "bash" as a stand-in since it understands "-c".
+        let result = run_verify_command(Path::new("/tmp"), "true", "bash");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn detect_nix_shell_returns_empty_for_missing_dir() {
+        let result = detect_nix_shell(Path::new("/tmp/nonexistent-othala-detect-nix-test"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn detect_nix_shell_finds_flake_nix() {
+        let dir = std::env::temp_dir().join(format!(
+            "othala-detect-nix-flake-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(dir.join("flake.nix"), "{ }").expect("write flake.nix");
+
+        let result = detect_nix_shell(&dir);
+        assert_eq!(result, "nix develop");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_nix_shell_reads_repo_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "othala-detect-nix-repo-config-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let repos_dir = dir.join("config/repos");
+        fs::create_dir_all(&repos_dir).expect("create repos dir");
+        fs::write(
+            repos_dir.join("test.toml"),
+            r#"
+repo_id = "test"
+repo_path = "/tmp/test"
+base_branch = "main"
+
+[nix]
+dev_shell = "nix develop --impure"
+
+[verify]
+command = "cargo test"
+
+[graphite]
+draft_on_start = false
+"#,
+        )
+        .expect("write repo config");
+
+        let result = detect_nix_shell(&dir);
+        assert_eq!(result, "nix develop --impure");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

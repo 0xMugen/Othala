@@ -2862,6 +2862,11 @@ fn main() -> anyhow::Result<()> {
             let mut daemon_state = orchd::daemon_loop::DaemonState::new();
             daemon_state.notification_dispatcher = notification_dispatcher;
 
+            let nix_shell = orchd::daemon_loop::detect_nix_shell(&repo_root);
+            if !nix_shell.is_empty() {
+                eprintln!("[daemon] Nix dev shell: {nix_shell}");
+            }
+
             let verify_cmd = verify_command
                 .unwrap_or_else(|| "cargo check && cargo test --workspace".to_string());
 
@@ -2871,6 +2876,7 @@ fn main() -> anyhow::Result<()> {
                 enabled_models,
                 context_config: orchd::context_graph::ContextLoadConfig::default(),
                 verify_command: Some(verify_cmd),
+                nix_shell,
                 context_gen_config,
                 skip_qa,
                 skip_context_regen: skip_context_gen,

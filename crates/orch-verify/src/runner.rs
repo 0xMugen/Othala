@@ -26,6 +26,9 @@ pub struct MultiVerifyResult {
 }
 
 /// Run the verification command for a repo.
+///
+/// When `repo_config.nix.dev_shell` is non-empty the command is wrapped so it
+/// executes inside the nix dev shell, ensuring cargo/rustc are on PATH.
 pub fn run_verify(
     repo_config: &RepoConfig,
     worktree_path: &Path,
@@ -43,10 +46,12 @@ pub fn run_verify(
         });
     }
 
+    let effective_command = repo_config.nix.wrap_command(command);
+
     let start = Instant::now();
     let output = Command::new("bash")
         .arg("-lc")
-        .arg(command)
+        .arg(&effective_command)
         .current_dir(worktree_path)
         .output()
         .map_err(|source| VerifyError::Io {
@@ -131,7 +136,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/test"),
             base_branch: "main".to_string(),
             nix: NixConfig {
-                dev_shell: "nix develop".to_string(),
+                dev_shell: String::new(),
             },
             verify: VerifyConfig {
                 command: verify_command.to_string(),
@@ -217,5 +222,30 @@ mod tests {
             super::run_multi_verify(&commands, Path::new("/tmp")).expect("run multi verify");
         assert!(result.overall_success);
         assert!(result.results.is_empty());
+    }
+
+    #[test]
+    fn run_verify_wraps_command_with_nix_dev_shell() {
+        // When dev_shell is set the effective command should be
+        // "<dev_shell> -c <original>".  We use bash as a stand-in since it
+        // understands "-c".
+        let config = RepoConfig {
+            repo_id: "test".to_string(),
+            repo_path: PathBuf::from("/tmp/test"),
+            base_branch: "main".to_string(),
+            nix: NixConfig {
+                dev_shell: "bash".to_string(),
+            },
+            verify: VerifyConfig {
+                command: "true".to_string(),
+            },
+            graphite: RepoGraphiteConfig {
+                draft_on_start: false,
+                submit_mode: Some(SubmitMode::Single),
+            },
+        };
+        // bash -c true → runs "true" inside a bash subshell, should succeed.
+        let result = run_verify(&config, Path::new("/tmp")).expect("run verify");
+        assert!(result.success);
     }
 }
