@@ -657,7 +657,16 @@ pub fn daemon_tick(
     if let Ok(awaiting) = service.list_tasks_by_state(TaskState::AwaitingMerge) {
         for task in &awaiting {
             if let Some(pr) = &task.pr {
-                if check_pr_merged(pr.number, &config.repo_root) {
+                let merged_via_pr = check_pr_merged(pr.number, &config.repo_root);
+                let merged_via_graphite_stack = pr.number == 0
+                    && pr.url.starts_with("graphite://")
+                    && task
+                        .branch_name
+                        .as_deref()
+                        .map(|b| is_branch_merged_into_trunk(&config.repo_root, b))
+                        .unwrap_or(false);
+
+                if merged_via_pr || merged_via_graphite_stack {
                     actions.push(DaemonAction::MarkMerged {
                         task_id: task.id.clone(),
                     });
@@ -993,6 +1002,25 @@ fn check_pr_merged(pr_number: u64, repo_root: &Path) -> bool {
         Ok(o) if o.status.success() => is_gh_pr_state_merged(&o.stdout),
         _ => false,
     }
+}
+
+fn is_branch_merged_into_trunk(repo_root: &Path, branch: &str) -> bool {
+    if branch.trim().is_empty() {
+        return false;
+    }
+
+    // Prefer remote trunk if available, otherwise fallback to local main.
+    for trunk in ["origin/main", "main"] {
+        let status = Command::new("git")
+            .args(["merge-base", "--is-ancestor", branch, trunk])
+            .current_dir(repo_root)
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn get_worktree_head_sha(path: &Path) -> Option<String> {
