@@ -98,6 +98,16 @@ pub enum EventKind {
         failures: Vec<String>,
     },
     BudgetExceeded,
+    /// Task was automatically respawned after recoverable failure.
+    TaskRespawned {
+        previous_reason: String,
+    },
+    /// Graphite sync cycle started.
+    GraphiteSyncStarted,
+    /// Graphite sync cycle completed.
+    GraphiteSyncCompleted {
+        success: bool,
+    },
 }
 
 /// An event in the orchestrator.
@@ -219,6 +229,11 @@ mod tests {
                 failures: vec!["test_a failed".to_string(), "test_b failed".to_string()],
             },
             EventKind::BudgetExceeded,
+            EventKind::TaskRespawned {
+                previous_reason: "restack conflict".to_string(),
+            },
+            EventKind::GraphiteSyncStarted,
+            EventKind::GraphiteSyncCompleted { success: true },
         ];
 
         for kind in kinds {

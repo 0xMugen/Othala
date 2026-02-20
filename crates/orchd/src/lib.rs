@@ -14,6 +14,7 @@ pub mod daemon_loop;
 pub mod daemon_status;
 pub mod delegation;
 pub mod dependency_graph;
+pub mod graphite_agent;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod editor;
 pub mod env_inject;

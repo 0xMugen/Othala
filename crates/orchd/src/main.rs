@@ -4369,6 +4369,13 @@ fn format_event(event: &Event) -> String {
         ),
         EventKind::QAFailed { failures } => ("QAFailed", format!("failures={}", failures.join(";"))),
         EventKind::BudgetExceeded => ("BudgetExceeded", "budget exceeded".to_string()),
+        EventKind::TaskRespawned { previous_reason } => {
+            ("TaskRespawned", format!("previous_reason={previous_reason}"))
+        }
+        EventKind::GraphiteSyncStarted => ("GraphiteSyncStarted", "sync started".to_string()),
+        EventKind::GraphiteSyncCompleted { success } => {
+            ("GraphiteSyncCompleted", format!("success={success}"))
+        }
     };
 
     let timestamp = event.at.format("%Y-%m-%d %H:%M:%S");
@@ -4460,6 +4467,17 @@ fn format_event_kind(kind: &EventKind) -> String {
             format!("\x1b[31mqa_failed\x1b[0m: {}", failures.join("; "))
         }
         EventKind::BudgetExceeded => "\x1b[31mbudget_exceeded\x1b[0m".to_string(),
+        EventKind::TaskRespawned { previous_reason } => {
+            format!("\x1b[33mtask_respawned\x1b[0m: {previous_reason}")
+        }
+        EventKind::GraphiteSyncStarted => "graphite_sync_started".to_string(),
+        EventKind::GraphiteSyncCompleted { success } => {
+            if *success {
+                "\x1b[32mgraphite_sync_completed\x1b[0m".to_string()
+            } else {
+                "\x1b[31mgraphite_sync_failed\x1b[0m".to_string()
+            }
+        }
     }
 }
 

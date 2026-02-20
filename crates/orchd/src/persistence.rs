@@ -1065,6 +1065,9 @@ fn event_kind_tag(kind: &EventKind) -> &'static str {
         EventKind::QACompleted { .. } => "qa_completed",
         EventKind::QAFailed { .. } => "qa_failed",
         EventKind::BudgetExceeded => "budget_exceeded",
+        EventKind::TaskRespawned { .. } => "task_respawned",
+        EventKind::GraphiteSyncStarted => "graphite_sync_started",
+        EventKind::GraphiteSyncCompleted { .. } => "graphite_sync_completed",
     }
 }
 

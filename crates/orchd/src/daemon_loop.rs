@@ -86,6 +86,8 @@ pub struct DaemonState {
     pub budget_output_chars_by_task: HashMap<String, u64>,
     pub token_trackers: HashMap<String, crate::auto_compact::TokenTracker>,
     pub auto_compact_config: crate::auto_compact::AutoCompactConfig,
+    /// Graphite Master Agent — single authority for stack queue operations.
+    pub graphite_agent: crate::graphite_agent::GraphiteMasterAgent,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -158,6 +160,7 @@ impl DaemonState {
             budget_output_chars_by_task: HashMap::new(),
             token_trackers: HashMap::new(),
             auto_compact_config: crate::auto_compact::AutoCompactConfig::default(),
+            graphite_agent: crate::graphite_agent::GraphiteMasterAgent::default(),
         }
     }
 
@@ -599,6 +602,14 @@ pub enum DaemonAction {
         kind: EventKind,
     },
     ShutdownComplete,
+    /// Respawn a stopped task (auto-recovery from recoverable failure).
+    RespawnTask {
+        task_id: TaskId,
+    },
+    /// Execute Graphite sync cycle.
+    GraphiteSyncCycle {
+        repo_root: PathBuf,
+    },
 }
 
 /// Run a single daemon tick — the core of the orchestration loop.
@@ -953,6 +964,71 @@ pub fn daemon_tick(
         && should_regenerate(&daemon_state.context_gen, &config.context_gen_config, now)
     {
         actions.push(DaemonAction::TriggerContextRegen);
+    }
+
+    // --- Phase 5: Graphite Master Agent — STOPPED task respawn & sync cycles ---
+    //
+    // The Graphite Master Agent handles:
+    // - Auto-respawn of STOPPED tasks with recoverable failure classes
+    // - Periodic sync cycles (gt sync + restack) for stack repos
+    // - Queue serialization for stack operations
+    if let Ok(stopped_tasks) = service.list_tasks_by_state(TaskState::Stopped) {
+        let stopped_entries: Vec<(TaskId, String)> = stopped_tasks
+            .iter()
+            .filter_map(|t| {
+                t.last_failure_reason
+                    .as_ref()
+                    .map(|r| (t.id.clone(), r.clone()))
+            })
+            .collect();
+
+        // Generate respawn actions for eligible stopped tasks
+        let graphite_actions = crate::graphite_agent::graphite_agent_tick(
+            &mut daemon_state.graphite_agent,
+            &[(
+                orch_core::types::RepoId(
+                    config
+                        .repo_root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                ),
+                config.repo_root.clone(),
+            )],
+            &stopped_entries,
+            now,
+        );
+
+        for ga_action in graphite_actions {
+            match ga_action {
+                crate::graphite_agent::GraphiteAgentAction::RespawnTask { task_id } => {
+                    actions.push(DaemonAction::RespawnTask { task_id });
+                }
+                crate::graphite_agent::GraphiteAgentAction::ExecuteSyncCycle { repo_root, .. } => {
+                    actions.push(DaemonAction::GraphiteSyncCycle { repo_root });
+                }
+                crate::graphite_agent::GraphiteAgentAction::Log { level, message } => {
+                    let prefix = match level {
+                        crate::graphite_agent::LogLevel::Debug => "[graphite:debug]",
+                        crate::graphite_agent::LogLevel::Info => "[graphite]",
+                        crate::graphite_agent::LogLevel::Warn => "[graphite:warn]",
+                        crate::graphite_agent::LogLevel::Error => "[graphite:error]",
+                    };
+                    actions.push(DaemonAction::Log {
+                        message: format!("{prefix} {message}"),
+                    });
+                }
+                crate::graphite_agent::GraphiteAgentAction::RepairTracking { .. } => {
+                    // Tracking repair is handled within the sync cycle
+                }
+                crate::graphite_agent::GraphiteAgentAction::EmitEvent { task_id, event_type } => {
+                    actions.push(DaemonAction::Log {
+                        message: format!("[graphite:event] {event_type} for {:?}", task_id),
+                    });
+                }
+            }
+        }
     }
 
     actions
@@ -2270,6 +2346,111 @@ pub fn execute_actions(
                 ) {
                     eprintln!("[daemon] Failed to record emitted event: {}", e);
                 }
+            }
+            DaemonAction::RespawnTask { task_id } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would respawn stopped task {}", task_id.0);
+                    continue;
+                }
+                // Respawn: transition from STOPPED to CHATTING
+                if let Ok(Some(mut task)) = service.task(task_id) {
+                    if task.state == TaskState::Stopped {
+                        // Reset retry count for fresh attempt
+                        task.retry_count = 0;
+                        task.failed_models.clear();
+                        task.state = TaskState::Chatting;
+                        task.updated_at = now;
+
+                        if let Err(e) = service.store.upsert_task(&task) {
+                            eprintln!(
+                                "[daemon] Failed to respawn task {}: {}",
+                                task_id.0, e
+                            );
+                        } else {
+                            let event = Event {
+                                id: EventId(format!(
+                                    "E-RESPAWN-{}-{}",
+                                    task_id.0,
+                                    now.timestamp_nanos_opt().unwrap_or_default()
+                                )),
+                                task_id: Some(task_id.clone()),
+                                repo_id: Some(task.repo_id.clone()),
+                                at: now,
+                                kind: EventKind::TaskRespawned {
+                                    previous_reason: task.last_failure_reason.clone().unwrap_or_default(),
+                                },
+                            };
+                            let _ = record_event_with_notification(
+                                service,
+                                daemon_state.notification_dispatcher.as_ref(),
+                                &event,
+                            );
+                            eprintln!(
+                                "[daemon] Respawned stopped task {} (auto-recovery)",
+                                task_id.0
+                            );
+                            // Remove from respawn candidates
+                            daemon_state.graphite_agent.remove_respawn_candidate(task_id);
+                        }
+                    }
+                }
+            }
+            DaemonAction::GraphiteSyncCycle { repo_root } => {
+                if config.dry_run {
+                    eprintln!("[dry-run] Would execute graphite sync cycle for {:?}", repo_root);
+                    continue;
+                }
+
+                // Execute sync cycle with queue lock
+                if !daemon_state.graphite_agent.try_lock() {
+                    eprintln!("[daemon] Graphite sync cycle skipped (queue locked)");
+                    continue;
+                }
+
+                eprintln!("[daemon] Starting graphite sync cycle for {:?}", repo_root);
+
+                let repo_id = orch_core::types::RepoId(
+                    repo_root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
+
+                let results = daemon_state.graphite_agent.execute_sync_cycle(
+                    repo_root,
+                    &repo_id,
+                    now,
+                );
+
+                for result in results {
+                    match result {
+                        crate::graphite_agent::OperationResult::Success => {
+                            eprintln!("[daemon] Graphite sync/restack succeeded");
+                        }
+                        crate::graphite_agent::OperationResult::Conflict { details } => {
+                            eprintln!("[daemon] Graphite restack conflict (will retry): {}", 
+                                details.chars().take(200).collect::<String>());
+                        }
+                        crate::graphite_agent::OperationResult::AuthFailure { details } => {
+                            eprintln!("[daemon] Graphite auth failure: {}", details);
+                        }
+                        crate::graphite_agent::OperationResult::TrunkOutdated { details } => {
+                            eprintln!("[daemon] Graphite trunk outdated: {}", details);
+                        }
+                        crate::graphite_agent::OperationResult::TrackingDivergence { branches } => {
+                            eprintln!("[daemon] Graphite tracking divergence: {:?}", branches);
+                        }
+                        crate::graphite_agent::OperationResult::Retryable { reason } => {
+                            eprintln!("[daemon] Graphite operation retryable: {}", reason);
+                        }
+                        crate::graphite_agent::OperationResult::Fatal { reason } => {
+                            eprintln!("[daemon] Graphite operation fatal: {}", reason);
+                        }
+                    }
+                }
+
+                daemon_state.graphite_agent.unlock();
             }
             DaemonAction::ShutdownComplete => {
                 eprintln!("[daemon] Daemon shutdown complete");
