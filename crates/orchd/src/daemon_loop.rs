@@ -12,7 +12,7 @@ use orch_git::{discover_repo, has_uncommitted_changes, GitCli};
 use orch_graphite::GraphiteClient;
 use orch_notify::{notification_for_event, NotificationDispatcher};
 
-use crate::agent_dispatch::{AgentDispatcher, AgentRole, DispatchDecision, RepoContext as DispatchRepoContext};
+use crate::agent_dispatch::{AgentDispatcher, AgentRole, RepoContext as DispatchRepoContext};
 use crate::agent_log;
 use crate::context_gen::{
     build_context_gen_prompt, context_is_current, poll_context_gen, should_regenerate,
@@ -995,9 +995,135 @@ pub fn daemon_tick(
         actions.push(DaemonAction::TriggerContextRegen);
     }
 
-    // --- Phase 5: Graphite Master Agent — STOPPED task respawn & sync cycles ---
+    // --- Phase 5: Next-Gen Sisyphus Recovery for STOPPED tasks ---
     //
-    // The Graphite Master Agent handles:
+    // When next-gen is enabled, use Sisyphus recovery loop instead of basic respawn:
+    // - Classifies errors and decides recovery strategy
+    // - Spawns Sisyphus with full context for deep analysis
+    // - Escalates to human after 2 failed Sisyphus rounds
+    if daemon_state.use_next_gen {
+        if let Ok(stopped_tasks) = service.list_tasks_by_state(TaskState::Stopped) {
+            let all_tasks: Vec<Task> = service
+                .list_tasks_by_state(TaskState::Chatting)
+                .unwrap_or_default()
+                .into_iter()
+                .chain(service.list_tasks_by_state(TaskState::Ready).unwrap_or_default())
+                .chain(stopped_tasks.clone())
+                .collect();
+
+            for task in &stopped_tasks {
+                if let Some(reason) = &task.last_failure_reason {
+                    let repo_context = DispatchRepoContext::load(&config.repo_root);
+
+                    let decision = daemon_state.sisyphus_recovery.evaluate(
+                        task,
+                        &all_tasks,
+                        reason,
+                        &repo_context,
+                    );
+
+                    match decision {
+                        RecoveryDecision::RetryWithSisyphus { context, prompt_additions } => {
+                            // Spawn Sisyphus for deep error recovery
+                            eprintln!(
+                                "[sisyphus] Spawning recovery for {} (attempt {})",
+                                task.id.0,
+                                daemon_state.sisyphus_recovery.get_state(&task.id.0)
+                                    .map(|s| s.sisyphus_attempts)
+                                    .unwrap_or(1)
+                            );
+
+                            // Build recovery prompt with context
+                            let context_markdown = daemon_state.sisyphus_recovery.context_manager.render_context(&context);
+                            let recovery_prompt = format!(
+                                "{}\n\n{}\n\n{}",
+                                prompt_additions.join("\n\n"),
+                                context_markdown,
+                                task.title
+                            );
+
+                            actions.push(DaemonAction::SpawnAgent {
+                                task_id: task.id.clone(),
+                                model: ModelKind::Claude, // Sisyphus uses Claude Opus
+                                prompt: recovery_prompt,
+                                worktree_path: task.worktree_path.clone(),
+                            });
+
+                            // Transition task back to Chatting for retry
+                            let _ = service.transition_task_state(
+                                &task.id,
+                                TaskState::Chatting,
+                                EventId(format!(
+                                    "E-SISYPHUS-RETRY-{}-{}",
+                                    task.id.0,
+                                    now.timestamp_nanos_opt().unwrap_or_default()
+                                )),
+                                now,
+                            );
+                        }
+                        RecoveryDecision::WaitAndRetry { wait_secs, reason } => {
+                            actions.push(DaemonAction::Log {
+                                message: format!(
+                                    "[sisyphus] Waiting {}s before retry for {}: {}",
+                                    wait_secs, task.id.0, reason
+                                ),
+                            });
+                        }
+                        RecoveryDecision::EscalateHuman { reason, summary } => {
+                            actions.push(DaemonAction::RecordNeedsHuman {
+                                task_id: task.id.clone(),
+                                reason: format!("{}\n\n{}", reason, summary),
+                            });
+                            daemon_state.sisyphus_recovery.cleanup(&task.id.0);
+                        }
+                        RecoveryDecision::Stop { reason } => {
+                            actions.push(DaemonAction::TaskFailed {
+                                task_id: task.id.clone(),
+                                reason,
+                            });
+                            daemon_state.sisyphus_recovery.cleanup(&task.id.0);
+                        }
+                        RecoveryDecision::Success => {
+                            daemon_state.sisyphus_recovery.mark_success(&task.id.0, vec![]);
+                            daemon_state.sisyphus_recovery.cleanup(&task.id.0);
+                        }
+                        RecoveryDecision::RetryWithAgent { role, context } => {
+                            // Use a different agent for retry
+                            let context_markdown = daemon_state.sisyphus_recovery.context_manager.render_context(&context);
+                            let retry_prompt = format!(
+                                "{}\n\n{}\n\n{}",
+                                role.persona(),
+                                context_markdown,
+                                task.title
+                            );
+
+                            actions.push(DaemonAction::SpawnAgent {
+                                task_id: task.id.clone(),
+                                model: role.model(),
+                                prompt: retry_prompt,
+                                worktree_path: task.worktree_path.clone(),
+                            });
+
+                            let _ = service.transition_task_state(
+                                &task.id,
+                                TaskState::Chatting,
+                                EventId(format!(
+                                    "E-RETRY-{}-{}",
+                                    task.id.0,
+                                    now.timestamp_nanos_opt().unwrap_or_default()
+                                )),
+                                now,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Phase 5b: Graphite Master Agent — STOPPED task respawn & sync cycles ---
+    //
+    // The Graphite Master Agent handles (legacy, used when next-gen is disabled):
     // - Auto-respawn of STOPPED tasks with recoverable failure classes
     // - Periodic sync cycles (gt sync + restack) for stack repos
     // - Queue serialization for stack operations
