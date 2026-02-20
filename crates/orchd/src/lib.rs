@@ -22,6 +22,7 @@ pub mod e2e_tester;
 pub mod graphite_agent;
 pub mod orchestration_metrics;
 pub mod problem_classifier;
+pub mod sisyphus_recovery;
 // prompt_builder intentionally not glob-reexported to avoid name collisions.
 pub mod editor;
 pub mod env_inject;
