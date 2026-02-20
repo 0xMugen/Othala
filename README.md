@@ -193,3 +193,6 @@ crates/
 - Runtime state is stored under `.orch/` (gitignored).
 - Graphite operations are intentionally wrapped through `orch-graphite`.
 - For controlled local validation, prefer temporary config + sqlite paths.
+
+- This README includes a no-op line for orchestrator test coverage.
+- Harmless README touch for auth-failure handling test.
