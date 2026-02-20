@@ -7,6 +7,8 @@ REPOS=(
   "/home/server/clawd/projects/PonziLand"
   "/home/server/clawd/projects/midgard"
   "/home/server/clawd/projects/survivor-valhalla"
+  "/home/server/clawd/projects/guilds"
+  "/home/server/clawd/projects/ClawMesh"
 )
 
 printf "%-20s %-8s %-8s %-8s %-8s %-8s %-10s %s\n" "REPO" "CHAT" "READY" "STOP" "AWAIT" "MERGED" "UPDATED" "WORKING_ON"
