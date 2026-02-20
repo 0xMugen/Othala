@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use orch_core::config::{load_org_config, BudgetConfig, OrgConfig};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
-use orch_core::types::{EventId, ModelKind, Task, TaskId};
+use orch_core::types::{EventId, ModelKind, SubmitMode, Task, TaskId};
 use orch_git::{discover_repo, has_uncommitted_changes, GitCli};
 use orch_graphite::GraphiteClient;
 use orch_notify::{notification_for_event, NotificationDispatcher};
@@ -272,6 +272,20 @@ fn load_budget_config_for_tick(repo_root: &Path) -> BudgetConfig {
     load_org_config(config_path)
         .map(|org| org.budget)
         .unwrap_or_default()
+}
+
+fn load_submit_mode_for_tick(repo_root: &Path) -> SubmitMode {
+    let config_path = repo_root.join(".othala/config.toml");
+    load_org_config(config_path)
+        .map(|org| org.graphite.submit_mode_default)
+        .unwrap_or(SubmitMode::Single)
+}
+
+fn resolve_submit_mode_for_task(task: &Task, default_mode: SubmitMode) -> SubmitMode {
+    match task.submit_mode {
+        SubmitMode::Stack => SubmitMode::Stack,
+        SubmitMode::Single => default_mode,
+    }
 }
 
 fn check_budget(state: &DaemonState, config: &BudgetConfig) -> bool {
@@ -612,6 +626,7 @@ pub fn daemon_tick(
         .retain(|_, s| s.status != QAStatus::Completed && s.status != QAStatus::Failed);
 
     // --- Phase 3: Drive pipelines for Ready tasks ---
+    let submit_mode_default = load_submit_mode_for_tick(&config.repo_root);
     if let Ok(ready_tasks) = service.list_tasks_by_state(TaskState::Ready) {
         for task in &ready_tasks {
             if !daemon_state.pipelines.contains_key(&task.id.0) {
@@ -623,7 +638,7 @@ pub fn daemon_tick(
                         .clone()
                         .unwrap_or_else(|| format!("task/{}", task.id.0)),
                     task.worktree_path.clone(),
-                    task.submit_mode,
+                    resolve_submit_mode_for_task(task, submit_mode_default),
                     parent_branch,
                 );
                 daemon_state.pipelines.insert(task.id.0.clone(), pipeline);
@@ -2220,7 +2235,11 @@ mod tests {
         });
     }
 
-    fn sample_org_config_toml(tick_interval_secs: u64, agent_timeout_secs: u64) -> String {
+    fn sample_org_config_toml(
+        tick_interval_secs: u64,
+        agent_timeout_secs: u64,
+        submit_mode_default: &str,
+    ) -> String {
         format!(
             r#"
 [models]
@@ -2234,7 +2253,7 @@ gemini = 10
 
 [graphite]
 auto_submit = true
-submit_mode_default = "single"
+submit_mode_default = "{submit_mode_default}"
 allow_move = "manual"
 
 [ui]
@@ -2376,6 +2395,61 @@ monthly_token_limit = {monthly_token_limit}
             .filter(|a| matches!(a, DaemonAction::ExecutePipeline { .. }))
             .count();
         assert!(pipeline_count > 0);
+    }
+
+    #[test]
+    fn load_submit_mode_for_tick_reads_org_config() {
+        let repo_root = std::env::temp_dir().join(format!(
+            "othala-submit-mode-read-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let othala_dir = repo_root.join(".othala");
+        fs::create_dir_all(&othala_dir).expect("create .othala dir");
+        fs::write(
+            othala_dir.join("config.toml"),
+            sample_org_config_toml(2, 1_800, "stack"),
+        )
+        .expect("write org config");
+
+        assert_eq!(load_submit_mode_for_tick(&repo_root), SubmitMode::Stack);
+        fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn daemon_tick_uses_submit_mode_default_from_config_for_pipeline() {
+        let service = mk_service();
+        let repo_root = std::env::temp_dir().join(format!(
+            "othala-submit-policy-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let othala_dir = repo_root.join(".othala");
+        fs::create_dir_all(&othala_dir).expect("create .othala dir");
+        fs::write(
+            othala_dir.join("config.toml"),
+            sample_org_config_toml(2, 1_800, "stack"),
+        )
+        .expect("write org config");
+
+        let mut config = mk_config();
+        config.repo_root = repo_root.clone();
+        let mut supervisor = AgentSupervisor::new(ModelKind::Claude);
+        let mut daemon_state = DaemonState::new();
+
+        let mut task = mk_task("T-POLICY-1");
+        task.state = TaskState::Ready;
+        task.branch_name = Some("task/T-POLICY-1".to_string());
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create");
+
+        let _ = daemon_tick(&service, &mut supervisor, &mut daemon_state, &config);
+        let pipeline = daemon_state
+            .pipelines
+            .get(&task.id.0)
+            .expect("pipeline should be created");
+        assert_eq!(pipeline.submit_mode, SubmitMode::Stack);
+
+        fs::remove_dir_all(&repo_root).ok();
     }
 
     #[test]
@@ -2686,12 +2760,14 @@ monthly_token_limit = {monthly_token_limit}
         fs::create_dir_all(&config_dir).expect("create config dir");
         let config_path = config_dir.join("config.toml");
 
-        fs::write(&config_path, sample_org_config_toml(2, 1800)).expect("write initial config");
+        fs::write(&config_path, sample_org_config_toml(2, 1800, "single"))
+            .expect("write initial config");
         let first = check_config_reload(&config_path, &mut daemon_state);
         assert!(first.is_some(), "initial load should reload config");
 
         thread::sleep(StdDuration::from_millis(1100));
-        fs::write(&config_path, sample_org_config_toml(7, 90)).expect("write updated config");
+        fs::write(&config_path, sample_org_config_toml(7, 90, "single"))
+            .expect("write updated config");
         let second = check_config_reload(&config_path, &mut daemon_state).expect("config reload");
         assert_eq!(second.daemon.tick_interval_secs, 7);
         assert_eq!(second.daemon.agent_timeout_secs, 90);
@@ -2709,7 +2785,8 @@ monthly_token_limit = {monthly_token_limit}
         fs::create_dir_all(&config_dir).expect("create config dir");
         let config_path = config_dir.join("config.toml");
 
-        fs::write(&config_path, sample_org_config_toml(2, 1800)).expect("write initial config");
+        fs::write(&config_path, sample_org_config_toml(2, 1800, "single"))
+            .expect("write initial config");
         let first = check_config_reload(&config_path, &mut daemon_state);
         assert!(first.is_some(), "first read should load config");
 

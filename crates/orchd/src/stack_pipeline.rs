@@ -82,10 +82,10 @@ impl PipelineState {
     pub fn advance(&mut self) {
         self.stage = match self.stage {
             PipelineStage::VerifyBranch => {
-                if self.parent_branch.is_some() {
+                if self.parent_branch.is_some() && self.submit_mode == SubmitMode::Stack {
                     PipelineStage::StackOnParent
                 } else {
-                    // No parent to stack on — skip straight to submit.
+                    // Merge/single mode or no parent to stack on — skip straight to submit.
                     PipelineStage::Submit
                 }
             }
@@ -174,25 +174,25 @@ pub fn next_action(state: &PipelineState) -> PipelineAction {
 mod tests {
     use super::*;
 
-    fn mk_pipeline(parent: Option<&str>) -> PipelineState {
+    fn mk_pipeline(parent: Option<&str>, submit_mode: SubmitMode) -> PipelineState {
         PipelineState::new(
             TaskId::new("T-1"),
             "task/T-1".to_string(),
             PathBuf::from(".orch/wt/T-1"),
-            SubmitMode::Single,
+            submit_mode,
             parent.map(|s| s.to_string()),
         )
     }
 
     #[test]
     fn pipeline_starts_at_verify_branch() {
-        let p = mk_pipeline(Some("task/T-0"));
+        let p = mk_pipeline(Some("task/T-0"), SubmitMode::Single);
         assert_eq!(p.stage, PipelineStage::VerifyBranch);
     }
 
     #[test]
-    fn full_pipeline_with_parent() {
-        let mut p = mk_pipeline(Some("task/T-0"));
+    fn full_pipeline_with_parent_in_stack_mode() {
+        let mut p = mk_pipeline(Some("task/T-0"), SubmitMode::Stack);
 
         // VerifyBranch -> StackOnParent
         assert!(matches!(next_action(&p), PipelineAction::RunVerify { .. }));
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn pipeline_without_parent_skips_stack() {
-        let mut p = mk_pipeline(None);
+        let mut p = mk_pipeline(None, SubmitMode::Stack);
 
         // VerifyBranch -> Submit (skip StackOnParent)
         p.advance();
@@ -233,8 +233,17 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_with_parent_in_single_mode_skips_stack() {
+        let mut p = mk_pipeline(Some("task/T-0"), SubmitMode::Single);
+
+        // VerifyBranch -> Submit (skip StackOnParent in single mode)
+        p.advance();
+        assert_eq!(p.stage, PipelineStage::Submit);
+    }
+
+    #[test]
     fn pipeline_failure() {
-        let mut p = mk_pipeline(Some("task/T-0"));
+        let mut p = mk_pipeline(Some("task/T-0"), SubmitMode::Single);
         p.fail("verification failed: cargo test had 3 failures".to_string());
 
         assert_eq!(p.stage, PipelineStage::Failed);
@@ -255,7 +264,7 @@ mod tests {
 
     #[test]
     fn done_and_failed_are_terminal() {
-        let mut p = mk_pipeline(None);
+        let mut p = mk_pipeline(None, SubmitMode::Single);
         assert!(!p.is_terminal());
 
         p.stage = PipelineStage::Done;
@@ -267,7 +276,7 @@ mod tests {
 
     #[test]
     fn advance_from_terminal_is_idempotent() {
-        let mut p = mk_pipeline(None);
+        let mut p = mk_pipeline(None, SubmitMode::Single);
         p.stage = PipelineStage::Done;
         p.advance();
         assert_eq!(p.stage, PipelineStage::Done);
