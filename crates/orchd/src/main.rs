@@ -436,6 +436,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Read reliability snapshots from JSONL and compute KPI summary
+        #[arg(long)]
+        snapshots: Option<PathBuf>,
     },
     /// Generate CI workflow files
     CiGen {
@@ -3915,14 +3918,30 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", orchd::ignore::display_ignore_rules(&rules));
             }
         }
-        Commands::Metrics { json } => {
-            let collector = orchd::metrics::MetricsCollector::new(
-                orchd::metrics::MetricsConfig::default(),
-            );
-            if json {
-                println!("{}", serde_json::to_string_pretty(&collector.summary()).unwrap_or_default());
+        Commands::Metrics { json, snapshots } => {
+            if let Some(path) = snapshots {
+                let summary = orchd::metrics::summarize_reliability_jsonl(&path)
+                    .map_err(anyhow::Error::msg)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&summary).unwrap_or_default()
+                    );
+                } else {
+                    println!("{}", orchd::metrics::display_reliability_summary(&summary));
+                }
             } else {
-                println!("{}", collector.display_summary());
+                let collector = orchd::metrics::MetricsCollector::new(
+                    orchd::metrics::MetricsConfig::default(),
+                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&collector.summary()).unwrap_or_default()
+                    );
+                } else {
+                    println!("{}", collector.display_summary());
+                }
             }
         }
         Commands::CiGen { output, workflow, dry_run } => {
@@ -4650,6 +4669,29 @@ mod tests {
                 _ => panic!("expected session fork"),
             },
             _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn metrics_command_parses_snapshots_flag() {
+        let cli = Cli::try_parse_from([
+            "othala",
+            "metrics",
+            "--snapshots",
+            ".othala/obs/snapshots.jsonl",
+            "--json",
+        ])
+        .expect("parse metrics");
+
+        match cli.command {
+            Commands::Metrics { json, snapshots } => {
+                assert!(json);
+                assert_eq!(
+                    snapshots,
+                    Some(PathBuf::from(".othala/obs/snapshots.jsonl"))
+                );
+            }
+            _ => panic!("expected metrics command"),
         }
     }
 

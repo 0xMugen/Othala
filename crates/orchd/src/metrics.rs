@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +66,17 @@ pub struct MetricsSummary {
     pub total_agent_invocations: u64,
     pub models_used: HashMap<String, u64>,
     pub avg_task_duration_secs: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReliabilityKpiSummary {
+    pub snapshot_count: usize,
+    pub recovery_rate: Option<f64>,
+    pub mean_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub stuck_sla_compliance_rate: Option<f64>,
+    pub false_alert_rate: Option<f64>,
+    pub idea_quality_mean: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +253,209 @@ impl MetricsCollector {
     }
 }
 
+pub fn summarize_reliability_jsonl(path: &Path) -> Result<ReliabilityKpiSummary, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read reliability snapshots file: {err}"))?;
+    summarize_reliability_jsonl_str(&content)
+}
+
+pub fn summarize_reliability_jsonl_str(content: &str) -> Result<ReliabilityKpiSummary, String> {
+    let mut snapshot_count = 0usize;
+
+    let mut recovery_successes = 0.0f64;
+    let mut recovery_attempts = 0.0f64;
+
+    let mut latencies: Vec<f64> = Vec::new();
+
+    let mut sla_met = 0.0f64;
+    let mut sla_total = 0.0f64;
+
+    let mut false_alerts = 0.0f64;
+    let mut total_alerts = 0.0f64;
+
+    let mut idea_quality_sum = 0.0f64;
+    let mut idea_quality_count = 0.0f64;
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: Value = serde_json::from_str(line)
+            .map_err(|err| format!("invalid JSONL at line {}: {err}", idx + 1))?;
+        let Some(obj) = value.as_object() else {
+            return Err(format!("invalid JSONL at line {}: expected object", idx + 1));
+        };
+        snapshot_count += 1;
+
+        // Accept either normalized counters or boolean flags for one-event snapshots.
+        if let (Some(successes), Some(attempts)) = (
+            get_number(obj, &["recovery_successes", "recoveries", "recovered_count"]),
+            get_number(obj, &["recovery_attempts", "recovery_total", "incident_count"]),
+        ) {
+            recovery_successes += successes.max(0.0);
+            recovery_attempts += attempts.max(0.0);
+        } else if let Some(rate) = get_number(obj, &["recovery_rate"]) {
+            recovery_successes += rate.clamp(0.0, 1.0);
+            recovery_attempts += 1.0;
+        } else if let Some(ok) =
+            get_bool(obj, &["recovery_success", "recovery_succeeded", "recovered"])
+        {
+            recovery_successes += if ok { 1.0 } else { 0.0 };
+            recovery_attempts += 1.0;
+        }
+
+        if let Some(latency) = get_number(
+            obj,
+            &[
+                "latency_ms",
+                "recovery_latency_ms",
+                "detection_latency_ms",
+                "latency",
+            ],
+        ) {
+            if latency >= 0.0 {
+                latencies.push(latency);
+            }
+        }
+
+        if let (Some(met), Some(total)) = (
+            get_number(obj, &["stuck_sla_met", "stuck_within_sla"]),
+            get_number(obj, &["stuck_sla_total", "stuck_incidents", "stuck_total"]),
+        ) {
+            sla_met += met.max(0.0);
+            sla_total += total.max(0.0);
+        } else if let Some(met) = get_bool(obj, &["stuck_sla_met", "stuck_within_sla"]) {
+            sla_met += if met { 1.0 } else { 0.0 };
+            sla_total += 1.0;
+        } else if let Some(breached) = get_bool(obj, &["stuck_sla_breached"]) {
+            sla_met += if breached { 0.0 } else { 1.0 };
+            sla_total += 1.0;
+        }
+
+        if let (Some(false_count), Some(total)) = (
+            get_number(obj, &["false_alerts", "false_positives"]),
+            get_number(obj, &["total_alerts", "alerts_total", "alerts"]),
+        ) {
+            false_alerts += false_count.max(0.0);
+            total_alerts += total.max(0.0);
+        } else if let Some(rate) = get_number(obj, &["false_alert_rate"]) {
+            false_alerts += rate.clamp(0.0, 1.0);
+            total_alerts += 1.0;
+        } else if let Some(is_false) = get_bool(obj, &["false_alert", "false_positive"]) {
+            false_alerts += if is_false { 1.0 } else { 0.0 };
+            total_alerts += 1.0;
+        }
+
+        if let Some(score) = get_number(obj, &["idea_quality", "idea_quality_score", "idea_score"])
+        {
+            idea_quality_sum += score;
+            idea_quality_count += 1.0;
+        }
+    }
+
+    let mean_latency_ms = mean(&latencies);
+    let p95_latency_ms = percentile_95(&mut latencies);
+
+    Ok(ReliabilityKpiSummary {
+        snapshot_count,
+        recovery_rate: ratio(recovery_successes, recovery_attempts),
+        mean_latency_ms,
+        p95_latency_ms,
+        stuck_sla_compliance_rate: ratio(sla_met, sla_total),
+        false_alert_rate: ratio(false_alerts, total_alerts),
+        idea_quality_mean: ratio(idea_quality_sum, idea_quality_count),
+    })
+}
+
+pub fn display_reliability_summary(summary: &ReliabilityKpiSummary) -> String {
+    let mut lines = vec![format!("Snapshots: {}", summary.snapshot_count)];
+    lines.push(format_rate_line("Recovery rate", summary.recovery_rate));
+    lines.push(format_number_line("Mean latency", summary.mean_latency_ms, "ms"));
+    lines.push(format_number_line("P95 latency", summary.p95_latency_ms, "ms"));
+    lines.push(format_rate_line(
+        "Stuck SLA compliance",
+        summary.stuck_sla_compliance_rate,
+    ));
+    lines.push(format_rate_line("False alert rate", summary.false_alert_rate));
+    lines.push(format_number_line(
+        "Idea quality mean",
+        summary.idea_quality_mean,
+        "",
+    ));
+    lines.join("\n")
+}
+
+fn get_number(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        if let Some(n) = value.as_f64() {
+            return Some(n);
+        }
+        if let Some(s) = value.as_str() {
+            if let Ok(parsed) = s.parse::<f64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn get_bool(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        if let Some(b) = value.as_bool() {
+            return Some(b);
+        }
+        if let Some(s) = value.as_str() {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => return Some(true),
+                "false" | "0" | "no" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    (denominator > 0.0).then_some(numerator / denominator)
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then_some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn percentile_95(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((values.len() as f64) * 0.95).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(values.len() - 1);
+    Some(values[idx])
+}
+
+fn format_rate_line(label: &str, rate: Option<f64>) -> String {
+    match rate {
+        Some(value) => format!("{label}: {:.2}%", value * 100.0),
+        None => format!("{label}: n/a"),
+    }
+}
+
+fn format_number_line(label: &str, value: Option<f64>, unit: &str) -> String {
+    match (value, unit.is_empty()) {
+        (Some(v), true) => format!("{label}: {:.2}", v),
+        (Some(v), false) => format!("{label}: {:.2}{unit}", v),
+        (None, _) => format!("{label}: n/a"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MetricEventType, MetricsCollector, MetricsConfig};
@@ -403,5 +618,65 @@ mod tests {
         assert_eq!(loaded.get_counter("verify_runs"), 1);
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn summarize_reliability_jsonl_computes_expected_kpis() {
+        let input = r#"{"recovery_success": true, "latency_ms": 120, "stuck_sla_met": true, "false_alert": false, "idea_quality": 0.8}
+{"recovery_success": false, "latency_ms": 300, "stuck_sla_breached": true, "false_alert": true, "idea_quality": 0.4}
+{"recovery_rate": 1.0, "latency_ms": 80, "stuck_sla_met": true, "false_alert": false, "idea_quality_score": 1.0}"#;
+
+        let summary = super::summarize_reliability_jsonl_str(input).expect("summary");
+
+        assert_eq!(summary.snapshot_count, 3);
+        assert_eq!(summary.recovery_rate, Some(2.0 / 3.0));
+        assert_eq!(summary.mean_latency_ms, Some((120.0 + 300.0 + 80.0) / 3.0));
+        assert_eq!(summary.p95_latency_ms, Some(300.0));
+        assert_eq!(summary.stuck_sla_compliance_rate, Some(2.0 / 3.0));
+        assert_eq!(summary.false_alert_rate, Some(1.0 / 3.0));
+        assert_eq!(summary.idea_quality_mean, Some((0.8 + 0.4 + 1.0) / 3.0));
+    }
+
+    #[test]
+    fn summarize_reliability_jsonl_supports_aggregate_counters() {
+        let input = r#"{"recovery_successes": 7, "recovery_attempts": 10, "latency_ms": 50, "stuck_sla_met": 8, "stuck_sla_total": 10, "false_alerts": 2, "total_alerts": 10, "idea_score": 3}
+{"recovery_successes": 3, "recovery_attempts": 5, "latency_ms": 150, "stuck_sla_met": 4, "stuck_sla_total": 5, "false_alerts": 1, "total_alerts": 5, "idea_score": 5}"#;
+
+        let summary = super::summarize_reliability_jsonl_str(input).expect("summary");
+
+        assert_eq!(summary.snapshot_count, 2);
+        assert_eq!(summary.recovery_rate, Some(10.0 / 15.0));
+        assert_eq!(summary.mean_latency_ms, Some(100.0));
+        assert_eq!(summary.p95_latency_ms, Some(150.0));
+        assert_eq!(summary.stuck_sla_compliance_rate, Some(12.0 / 15.0));
+        assert_eq!(summary.false_alert_rate, Some(3.0 / 15.0));
+        assert_eq!(summary.idea_quality_mean, Some(4.0));
+    }
+
+    #[test]
+    fn summarize_reliability_jsonl_rejects_invalid_line() {
+        let err = super::summarize_reliability_jsonl_str("{not-json}\n").expect_err("invalid json");
+        assert!(err.contains("invalid JSONL at line 1"));
+    }
+
+    #[test]
+    fn display_reliability_summary_renders_rates_and_na() {
+        let rendered = super::display_reliability_summary(&super::ReliabilityKpiSummary {
+            snapshot_count: 2,
+            recovery_rate: Some(0.5),
+            mean_latency_ms: Some(42.0),
+            p95_latency_ms: None,
+            stuck_sla_compliance_rate: Some(1.0),
+            false_alert_rate: Some(0.0),
+            idea_quality_mean: Some(0.8),
+        });
+
+        assert!(rendered.contains("Snapshots: 2"));
+        assert!(rendered.contains("Recovery rate: 50.00%"));
+        assert!(rendered.contains("Mean latency: 42.00ms"));
+        assert!(rendered.contains("P95 latency: n/a"));
+        assert!(rendered.contains("Stuck SLA compliance: 100.00%"));
+        assert!(rendered.contains("False alert rate: 0.00%"));
+        assert!(rendered.contains("Idea quality mean: 0.80"));
     }
 }
