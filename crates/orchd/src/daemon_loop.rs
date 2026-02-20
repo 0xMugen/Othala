@@ -12,6 +12,7 @@ use orch_git::{discover_repo, has_uncommitted_changes, GitCli};
 use orch_graphite::GraphiteClient;
 use orch_notify::{notification_for_event, NotificationDispatcher};
 
+use crate::agent_dispatch::{AgentDispatcher, AgentRole, DispatchDecision, RepoContext as DispatchRepoContext};
 use crate::agent_log;
 use crate::context_gen::{
     build_context_gen_prompt, context_is_current, poll_context_gen, should_regenerate,
@@ -27,6 +28,9 @@ use crate::qa_agent::{
 use crate::retry::{evaluate_retry, pick_next_model_with_health, ModelHealthTracker};
 use crate::stack_pipeline::{next_action, PipelineAction, PipelineStage, PipelineState};
 use crate::supervisor::{AgentOutcome, AgentSupervisor};
+use crate::orchestration_metrics::OrchestrationMetricsStore;
+use crate::problem_classifier::ProblemClassifier;
+use crate::sisyphus_recovery::{SisyphusRecoveryLoop, RecoveryDecision};
 use crate::test_spec::load_test_spec;
 use crate::OrchdService;
 
@@ -88,6 +92,19 @@ pub struct DaemonState {
     pub auto_compact_config: crate::auto_compact::AutoCompactConfig,
     /// Graphite Master Agent — single authority for stack queue operations.
     pub graphite_agent: crate::graphite_agent::GraphiteMasterAgent,
+    // ─────────────────────────────────────────────────────────────────────────
+    // Next-Gen Orchestration (multi-agent, sisyphus recovery, metrics)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Agent dispatcher for routing tasks to optimal agent.
+    pub agent_dispatcher: AgentDispatcher,
+    /// Problem classifier for error analysis.
+    pub problem_classifier: ProblemClassifier,
+    /// Sisyphus recovery loop for error recovery.
+    pub sisyphus_recovery: SisyphusRecoveryLoop,
+    /// Orchestration metrics for tracking effectiveness.
+    pub orchestration_metrics: OrchestrationMetricsStore,
+    /// Whether to use next-gen orchestration (multi-agent routing).
+    pub use_next_gen: bool,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -161,6 +178,12 @@ impl DaemonState {
             token_trackers: HashMap::new(),
             auto_compact_config: crate::auto_compact::AutoCompactConfig::default(),
             graphite_agent: crate::graphite_agent::GraphiteMasterAgent::default(),
+            // Next-gen orchestration
+            agent_dispatcher: AgentDispatcher::default(),
+            problem_classifier: ProblemClassifier::default(),
+            sisyphus_recovery: SisyphusRecoveryLoop::default(),
+            orchestration_metrics: OrchestrationMetricsStore::default(),
+            use_next_gen: true, // Enable by default
         }
     }
 
@@ -702,7 +725,13 @@ pub fn daemon_tick(
                     });
                     continue;
                 }
-                if let Some(action) = build_spawn_action(task, config) {
+                // Use next-gen multi-agent dispatch if enabled
+                let action = if daemon_state.use_next_gen {
+                    build_spawn_action_next_gen(task, config, daemon_state)
+                } else {
+                    build_spawn_action(task, config)
+                };
+                if let Some(action) = action {
                     actions.push(action);
                 }
             }
@@ -1035,6 +1064,109 @@ pub fn daemon_tick(
 }
 
 /// Build the spawn action for a chatting task.
+/// Build spawn action using next-gen multi-agent dispatch.
+fn build_spawn_action_next_gen(
+    task: &Task,
+    config: &DaemonConfig,
+    daemon_state: &mut DaemonState,
+) -> Option<DaemonAction> {
+    // Load repo context for dispatch decisions
+    let repo_context = DispatchRepoContext::load(&config.repo_root);
+
+    // Determine if this is a retry
+    let is_retry = task.retry_count > 0;
+    let failure_reason = task.last_failure_reason.as_deref();
+
+    // Use the agent dispatcher to decide which agent to use
+    let decision = daemon_state.agent_dispatcher.dispatch(
+        task,
+        &repo_context,
+        is_retry,
+        failure_reason,
+    );
+
+    // Record the dispatch decision in metrics
+    daemon_state.orchestration_metrics.record_dispatch(decision.role);
+
+    // Get the model from the dispatch decision
+    let model = decision.role.model();
+
+    // Log the dispatch decision
+    eprintln!(
+        "[next-gen] Task {} → {} ({:.0}% confidence): {}",
+        task.id.0,
+        decision.role.name(),
+        decision.confidence * 100.0,
+        decision.reasoning
+    );
+
+    let context = load_context_graph(&config.repo_root, &config.context_config);
+
+    let test_spec_content = task
+        .test_spec_path
+        .as_ref()
+        .and_then(|_| load_test_spec(&config.repo_root, &task.id))
+        .map(|spec| spec.raw);
+
+    let retry = if task.retry_count > 0 {
+        task.last_failure_reason
+            .as_ref()
+            .map(|reason| RetryContext {
+                attempt: task.retry_count + 1,
+                max_retries: task.max_retries,
+                previous_failure: reason.clone(),
+                previous_model: *task.failed_models.last().unwrap_or(&model),
+            })
+    } else {
+        None
+    };
+
+    let role = match task.task_type {
+        orch_core::types::TaskType::Implement => PromptRole::Implement,
+        orch_core::types::TaskType::TestSpecWrite => PromptRole::TestSpecWrite,
+        orch_core::types::TaskType::TestValidate => PromptRole::Review,
+        orch_core::types::TaskType::Orchestrate => PromptRole::Implement,
+    };
+
+    let qa_failure_context = task
+        .last_failure_reason
+        .as_ref()
+        .filter(|r| r.starts_with("## QA Failures"))
+        .cloned();
+
+    // Build prompt with agent persona and context additions
+    let mut prompt_additions = Vec::new();
+    prompt_additions.push(decision.role.persona().to_string());
+    prompt_additions.extend(decision.context_additions);
+
+    let prompt_config = PromptConfig {
+        task_id: task.id.clone(),
+        task_title: task.title.clone(),
+        role,
+        context,
+        test_spec: test_spec_content,
+        retry,
+        verify_command: config.verify_command.clone(),
+        qa_failure_context,
+        repo_root: Some(config.repo_root.clone()),
+    };
+
+    let mut prompt = build_rich_prompt(&prompt_config, &config.template_dir);
+
+    // Prepend agent persona and context additions
+    if !prompt_additions.is_empty() {
+        let additions = prompt_additions.join("\n\n");
+        prompt = format!("{}\n\n{}", additions, prompt);
+    }
+
+    Some(DaemonAction::SpawnAgent {
+        task_id: task.id.clone(),
+        model,
+        prompt,
+        worktree_path: task.worktree_path.clone(),
+    })
+}
+
 fn build_spawn_action(task: &Task, config: &DaemonConfig) -> Option<DaemonAction> {
     let model = task.preferred_model.unwrap_or(ModelKind::Claude);
 
