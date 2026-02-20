@@ -10,10 +10,11 @@ Run Othala as an operations system across multiple repos.
 ## Core loop
 
 1. Keep one daemon per repo running.
-2. Convert vault notes into explicit Othala tasks.
-3. Track blocked/stopped tasks and stale test coverage.
-4. Escalate to Telegram when human input is needed.
-5. Keep Othala itself as one continuously improving repo.
+2. Keep at least one `CHATTING` task per active repo (auto-seed keep-hot tasks when a repo drops to 0).
+3. Convert vault notes into explicit Othala tasks.
+4. Track blocked/stopped tasks and stale test coverage.
+5. Escalate to Telegram when human input is needed.
+6. Keep Othala itself as one continuously improving repo.
 
 ## Repo policy modes
 
@@ -51,6 +52,15 @@ If vault context is insufficient for a blocked decision:
    - `othala tail <task-id> -f`
    - `othala logs <task-id>`
 3. Continue by creating a follow-up task with clarified instruction.
+
+## Idea-exhaustion behavior (must be in skill policy)
+
+If the active backlog has no credible next PR ideas (after scanning repo TODOs + vault notes):
+
+1. Send a short Telegram prompt asking Mugen for fresh priorities.
+2. Include 3 concrete suggestion starters (not generic "what next?").
+3. Propose a notes update pass (project page + objectives + implementation checklist) so autonomous seeding quality improves.
+4. Resume auto-seeding immediately once new guidance is available.
 
 ## Hourly cadence
 

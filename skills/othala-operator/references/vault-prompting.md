@@ -30,3 +30,11 @@ If missing data for safe implementation:
 1. mark blocked with exact missing input,
 2. send Telegram ask-to-SSH message,
 3. include one-line command list for inspection.
+
+## Backlog exhaustion rule
+
+If no strong next tasks can be derived from vault + repo state:
+1. ask Mugen for direction in one concise Telegram message,
+2. include 3 concrete candidate PR ideas,
+3. request/perform notes enrichment (`.othala/OBJECTIVES.md`, implementation checklist, vault project page),
+4. then regenerate keep-hot tasks from the updated notes.
