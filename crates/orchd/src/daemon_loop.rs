@@ -1603,6 +1603,30 @@ pub fn execute_actions(
                         }
                         Err(error) => {
                             let err_msg = format!("graphite submit failed: {error}");
+
+                            if error.is_auth_failure() {
+                                let reason = format!(
+                                    "{err_msg}. Fix once globally with: gt auth --token <token>"
+                                );
+                                eprintln!(
+                                    "[daemon] Submit auth failed for {}; stopping without retries",
+                                    task_id.0
+                                );
+                                stop_task_with_failure_reason(
+                                    service,
+                                    daemon_state.notification_dispatcher.as_ref(),
+                                    task_id,
+                                    &reason,
+                                    now,
+                                );
+                                if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                                    pipeline.fail(reason);
+                                }
+                                daemon_state.pipelines.remove(&task_id.0);
+                                daemon_state.restack_retries.remove(&task_id.0);
+                                continue;
+                            }
+
                             let retry_model = service
                                 .task(task_id)
                                 .ok()

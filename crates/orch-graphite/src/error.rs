@@ -58,6 +58,15 @@ impl GraphiteError {
             _ => false,
         }
     }
+
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            GraphiteError::CommandFailed { stdout, stderr, .. } => {
+                looks_like_auth_failure(stdout, stderr)
+            }
+            _ => false,
+        }
+    }
 }
 
 pub fn looks_like_restack_conflict(stdout: &str, stderr: &str) -> bool {
@@ -75,9 +84,24 @@ pub fn looks_like_restack_conflict(stdout: &str, stderr: &str) -> bool {
     markers.iter().any(|marker| combined.contains(marker))
 }
 
+pub fn looks_like_auth_failure(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{}\n{}", stdout, stderr).to_ascii_lowercase();
+
+    let markers = [
+        "please authenticate your graphite cli",
+        "no auth token set",
+        "graphite auth --token",
+        "graphite.com/activate",
+        "authentication failed",
+        "not authenticated",
+    ];
+
+    markers.iter().any(|marker| combined.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_restack_conflict, GraphiteError};
+    use super::{looks_like_auth_failure, looks_like_restack_conflict, GraphiteError};
 
     #[test]
     fn detects_restack_conflict_from_common_markers() {
@@ -113,5 +137,25 @@ mod tests {
             message: "bad args".to_string(),
         };
         assert!(!other.is_restack_conflict());
+    }
+
+    #[test]
+    fn detects_graphite_auth_failures() {
+        assert!(looks_like_auth_failure(
+            "",
+            "ERROR: Please authenticate your Graphite CLI by visiting https://app.graphite.com/activate"
+        ));
+        assert!(looks_like_auth_failure(
+            "",
+            "ERROR: No auth token set. Please run `graphite auth --token <token>`."
+        ));
+
+        let err = GraphiteError::CommandFailed {
+            command: "gt submit --no-edit --no-interactive".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "ERROR: No auth token set".to_string(),
+        };
+        assert!(err.is_auth_failure());
     }
 }
