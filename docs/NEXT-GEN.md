@@ -81,3 +81,25 @@
 1. ✅ Proof: Task routed to correct agent based on intent
 2. ⏳ Proof: Error → Sisyphus spawned → fixed → merged
 3. ⏳ Dashboard: Before/after metrics comparison
+
+---
+
+## Sprint Progress
+
+### 30 Minute Mark (15:48 UTC)
+
+**Commits:** 4
+**New Code:** ~4500 LOC
+**Tests:** 39 new (all passing)
+
+**Integrated:**
+- ✅ Agent dispatch in daemon_tick
+- ✅ Sisyphus recovery for STOPPED tasks
+- ✅ Logging for dispatch decisions
+
+**Log Examples:**
+```
+[next-gen] Task T-123 → hephaestus (90% confidence): Code implementation → Hephaestus
+[sisyphus] Spawning recovery for T-124 (attempt 1)
+[sisyphus] Waiting 30s before retry for T-125: Transient error (network)
+```
