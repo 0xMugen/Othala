@@ -193,3 +193,4 @@ crates/
 - Runtime state is stored under `.orch/` (gitignored).
 - Graphite operations are intentionally wrapped through `orch-graphite`.
 - For controlled local validation, prefer temporary config + sqlite paths.
+- Post-auth submit tests need authenticated GitHub access and an up-to-date trunk (`gt sync`) before non-interactive `gt submit`.
