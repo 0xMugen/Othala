@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BASE="/home/server/clawd/projects/Othala"
+"$BASE/scripts/operator/reliability_snapshot.sh" >/dev/null 2>&1 || true
 report="$($BASE/scripts/operator/blocked_report.sh || true)"
 echo "$report"
 
