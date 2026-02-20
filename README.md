@@ -10,6 +10,11 @@ Org-wide AI coding orchestrator (MVP-2 track), built in Rust with:
 ## Current Status
 
 This repository is **mid-MVP-2**.
+Orchestrator validation checks are run as part of cross-project test workflows.
+This line exists solely to validate cross-project orchestrator patching.
+Cross-project orchestrator validation notes may appear here as harmless metadata.
+Additional orchestrator validation markers may be added during automated test assignments.
+This README includes a harmless note confirming orchestrator validation coverage.
 
 - Workspace and crate layout are in place.
 - Core orchestrator state model and persistence are implemented.
