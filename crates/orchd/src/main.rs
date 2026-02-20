@@ -18,7 +18,6 @@ use orch_core::types::{
     load_task_specs_from_dir, parse_yaml_task_spec, yaml_spec_to_task, EventId, ModelKind, RepoId,
     Session, Task, TaskId, TaskPriority,
 };
-#[cfg(test)]
 use orch_core::types::SubmitMode;
 use orch_notify::{NotificationDispatcher, NotificationSink, StdoutSink, WebhookSink};
 use orchd::supervisor::AgentSupervisor;
@@ -1456,6 +1455,7 @@ fn create_task_command(
     );
     task.branch_name = Some(workspace.branch_name.clone());
     task.priority = priority;
+    task.submit_mode = submit_mode_from_repo_mode(&start_path);
     if let Some((parent_task_id, _)) = parent.as_ref() {
         task.parent_task_id = Some(parent_task_id.clone());
         if !task.depends_on.contains(parent_task_id) {
@@ -1497,6 +1497,23 @@ fn create_task_command(
         );
     }
     Ok(())
+}
+
+fn submit_mode_from_repo_mode(repo_root: &Path) -> SubmitMode {
+    let mode_path = repo_root.join(".othala/repo-mode.toml");
+    let Ok(contents) = std::fs::read_to_string(mode_path) else {
+        return SubmitMode::Single;
+    };
+
+    if contents
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "mode = \"stack\"" || line == "mode=\"stack\"")
+    {
+        SubmitMode::Stack
+    } else {
+        SubmitMode::Single
+    }
 }
 
 fn model_name(model: ModelKind) -> &'static str {
