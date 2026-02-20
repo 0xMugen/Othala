@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use orch_core::events::{Event, EventKind};
 use orch_core::state::TaskState;
 use orch_core::types::{EventId, SubmitMode, Task, TaskId};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -414,6 +415,124 @@ impl OrchdService {
             blocked: plan.blocked,
         })
     }
+
+    // --- Reconciliation Diagnostics ---
+
+    /// Detect tasks in stuck or inconsistent states related to merge/restack.
+    ///
+    /// Returns a report of:
+    /// - Merged parents whose children haven't been restacked yet
+    /// - Tasks stuck in Restacking state
+    /// - Tasks in AwaitingMerge for a long time (configurable threshold)
+    pub fn reconciliation_diagnostics(
+        &self,
+        now: DateTime<Utc>,
+        stale_threshold_secs: i64,
+    ) -> Result<ReconciliationReport, ServiceError> {
+        let all_tasks = self.store.list_tasks()?;
+        let graph = build_dependency_graph(&all_tasks);
+        let tasks_by_id: HashMap<&TaskId, &Task> =
+            all_tasks.iter().map(|t| (&t.id, t)).collect();
+
+        let mut unreconciled_children = Vec::new();
+        let mut stuck_restacking = Vec::new();
+        let mut stale_awaiting_merge = Vec::new();
+
+        let threshold = chrono::Duration::seconds(stale_threshold_secs);
+
+        for task in &all_tasks {
+            match task.state {
+                TaskState::Merged => {
+                    // Check if any direct children are not yet restacked/merged.
+                    if let Some(children) = graph.children_by_parent.get(&task.id) {
+                        for child_id in children {
+                            if let Some(child) = tasks_by_id.get(child_id) {
+                                // A child that still depends on a merged parent and is not
+                                // itself Merged/Stopped/Restacking needs reconciliation.
+                                if matches!(
+                                    child.state,
+                                    TaskState::Ready
+                                        | TaskState::Submitting
+                                        | TaskState::AwaitingMerge
+                                        | TaskState::Chatting
+                                ) {
+                                    unreconciled_children.push(UnreconciledChild {
+                                        parent_id: task.id.0.clone(),
+                                        child_id: child_id.0.clone(),
+                                        child_state: format!("{}", child.state),
+                                        parent_merged_at: task.updated_at,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                TaskState::Restacking => {
+                    let elapsed = now - task.updated_at;
+                    stuck_restacking.push(StuckTask {
+                        task_id: task.id.0.clone(),
+                        state: format!("{}", task.state),
+                        since: task.updated_at,
+                        elapsed_secs: elapsed.num_seconds(),
+                    });
+                }
+                TaskState::AwaitingMerge => {
+                    let elapsed = now - task.updated_at;
+                    if elapsed > threshold {
+                        stale_awaiting_merge.push(StuckTask {
+                            task_id: task.id.0.clone(),
+                            state: format!("{}", task.state),
+                            since: task.updated_at,
+                            elapsed_secs: elapsed.num_seconds(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let has_issues = !unreconciled_children.is_empty()
+            || !stuck_restacking.is_empty()
+            || !stale_awaiting_merge.is_empty();
+
+        Ok(ReconciliationReport {
+            unreconciled_children,
+            stuck_restacking,
+            stale_awaiting_merge,
+            has_issues,
+        })
+    }
+}
+
+/// Report of tasks in stuck or inconsistent merge/restack states.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReconciliationReport {
+    /// Children of merged parents that haven't been restacked.
+    pub unreconciled_children: Vec<UnreconciledChild>,
+    /// Tasks stuck in the Restacking state.
+    pub stuck_restacking: Vec<StuckTask>,
+    /// Tasks in AwaitingMerge longer than the threshold.
+    pub stale_awaiting_merge: Vec<StuckTask>,
+    /// True if any issues were found.
+    pub has_issues: bool,
+}
+
+/// A child task that hasn't been restacked after its parent merged.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UnreconciledChild {
+    pub parent_id: String,
+    pub child_id: String,
+    pub child_state: String,
+    pub parent_merged_at: DateTime<Utc>,
+}
+
+/// A task that appears stuck in a non-terminal state.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StuckTask {
+    pub task_id: String,
+    pub state: String,
+    pub since: DateTime<Utc>,
+    pub elapsed_secs: i64,
 }
 
 #[cfg(test)]
@@ -566,5 +685,111 @@ mod tests {
 
         assert!(svc.delete_task(&task.id).expect("delete"));
         assert!(svc.task(&task.id).expect("load").is_none());
+    }
+
+    #[test]
+    fn reconciliation_no_issues_when_clean() {
+        let svc = mk_service();
+        let task = mk_task("T1", TaskState::Chatting);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let report = svc
+            .reconciliation_diagnostics(Utc::now(), 3600)
+            .expect("diagnostics");
+        assert!(!report.has_issues);
+        assert!(report.unreconciled_children.is_empty());
+        assert!(report.stuck_restacking.is_empty());
+        assert!(report.stale_awaiting_merge.is_empty());
+    }
+
+    #[test]
+    fn reconciliation_detects_unreconciled_children() {
+        let svc = mk_service();
+
+        // Parent: merged
+        let mut parent = mk_task("P1", TaskState::Merged);
+        svc.create_task(&parent, &mk_created_event(&parent))
+            .expect("create parent");
+
+        // Child: depends on parent, still in Ready (not restacked)
+        let mut child = mk_task("C1", TaskState::Ready);
+        child.depends_on = vec![TaskId("P1".to_string())];
+        svc.create_task(&child, &mk_created_event(&child))
+            .expect("create child");
+
+        let report = svc
+            .reconciliation_diagnostics(Utc::now(), 3600)
+            .expect("diagnostics");
+        assert!(report.has_issues);
+        assert_eq!(report.unreconciled_children.len(), 1);
+        assert_eq!(report.unreconciled_children[0].parent_id, "P1");
+        assert_eq!(report.unreconciled_children[0].child_id, "C1");
+        assert_eq!(report.unreconciled_children[0].child_state, "READY");
+    }
+
+    #[test]
+    fn reconciliation_detects_stuck_restacking() {
+        let svc = mk_service();
+        let task = mk_task("T1", TaskState::Restacking);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        let report = svc
+            .reconciliation_diagnostics(Utc::now(), 3600)
+            .expect("diagnostics");
+        assert!(report.has_issues);
+        assert_eq!(report.stuck_restacking.len(), 1);
+        assert_eq!(report.stuck_restacking[0].task_id, "T1");
+    }
+
+    #[test]
+    fn reconciliation_detects_stale_awaiting_merge() {
+        let svc = mk_service();
+        let mut task = mk_task("T1", TaskState::AwaitingMerge);
+        // Set updated_at to 2 hours ago
+        task.updated_at = Utc::now() - chrono::Duration::seconds(7200);
+        svc.create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+
+        // Threshold is 1 hour
+        let report = svc
+            .reconciliation_diagnostics(Utc::now(), 3600)
+            .expect("diagnostics");
+        assert!(report.has_issues);
+        assert_eq!(report.stale_awaiting_merge.len(), 1);
+        assert_eq!(report.stale_awaiting_merge[0].task_id, "T1");
+    }
+
+    #[test]
+    fn reconciliation_ignores_merged_children() {
+        let svc = mk_service();
+
+        let parent = mk_task("P1", TaskState::Merged);
+        svc.create_task(&parent, &mk_created_event(&parent))
+            .expect("create parent");
+
+        // Child: also merged — no issue
+        let mut child = mk_task("C1", TaskState::Merged);
+        child.depends_on = vec![TaskId("P1".to_string())];
+        svc.create_task(&child, &mk_created_event(&child))
+            .expect("create child");
+
+        let report = svc
+            .reconciliation_diagnostics(Utc::now(), 3600)
+            .expect("diagnostics");
+        assert!(!report.has_issues);
+    }
+
+    #[test]
+    fn reconciliation_report_serializes_to_json() {
+        let report = ReconciliationReport {
+            unreconciled_children: vec![],
+            stuck_restacking: vec![],
+            stale_awaiting_merge: vec![],
+            has_issues: false,
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains("\"has_issues\":false"));
     }
 }

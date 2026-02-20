@@ -500,6 +500,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show merged/awaiting reconciliation diagnostics
+    Reconcile {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Threshold in seconds before AwaitingMerge tasks are considered stale (default: 3600)
+        #[arg(long, default_value = "3600")]
+        stale_secs: i64,
+    },
     /// Show environment variable injection config
     Env {
         /// Task ID to show env for
@@ -4034,6 +4043,55 @@ fn main() -> anyhow::Result<()> {
                 println!("  Grace:    {}s", config.grace_period_secs);
                 println!("  Interval: {}s", config.check_interval_secs);
                 println!("  Tracked:  {}", tracker.active_count());
+            }
+        }
+        Commands::Reconcile { json, stale_secs } => {
+            let now = Utc::now();
+            let report = service.reconciliation_diagnostics(now, stale_secs)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                if report.unreconciled_children.is_empty()
+                    && report.stuck_restacking.is_empty()
+                    && report.stale_awaiting_merge.is_empty()
+                {
+                    println!("No reconciliation issues found.");
+                } else {
+                    if !report.unreconciled_children.is_empty() {
+                        println!("Unreconciled Children (parent merged, child not restacked):");
+                        for item in &report.unreconciled_children {
+                            println!(
+                                "  {} -> {} (state: {}, parent merged at: {})",
+                                item.parent_id, item.child_id, item.child_state, item.parent_merged_at
+                            );
+                        }
+                        println!();
+                    }
+                    if !report.stuck_restacking.is_empty() {
+                        println!("Stuck in Restacking:");
+                        for item in &report.stuck_restacking {
+                            println!(
+                                "  {} (since: {}, elapsed: {}s)",
+                                item.task_id, item.since, item.elapsed_secs
+                            );
+                        }
+                        println!();
+                    }
+                    if !report.stale_awaiting_merge.is_empty() {
+                        println!("Stale AwaitingMerge (>{stale_secs}s):");
+                        for item in &report.stale_awaiting_merge {
+                            println!(
+                                "  {} (since: {}, elapsed: {}s)",
+                                item.task_id, item.since, item.elapsed_secs
+                            );
+                        }
+                        println!();
+                    }
+                }
+                if report.has_issues {
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Env { task_id, model, redacted, json } => {
