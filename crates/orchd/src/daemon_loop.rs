@@ -87,6 +87,13 @@ pub struct DaemonState {
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
 const RESTACK_RETRY_INITIAL_BACKOFF_SECS: u64 = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphiteRecoveryPlaybook {
+    Auth,
+    Trunk,
+    Restack,
+}
+
 #[derive(Debug, Clone)]
 pub struct RestackRetryState {
     pub attempts: u32,
@@ -199,6 +206,209 @@ fn schedule_restack_retry(
             None
         }
     }
+}
+
+fn graphite_error_text(error: &orch_graphite::GraphiteError) -> String {
+    match error {
+        orch_graphite::GraphiteError::CommandFailed { stdout, stderr, .. } => {
+            format!("{stdout}\n{stderr}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn select_graphite_recovery_playbook(
+    error: &orch_graphite::GraphiteError,
+) -> Option<GraphiteRecoveryPlaybook> {
+    if error.is_restack_conflict() {
+        return Some(GraphiteRecoveryPlaybook::Restack);
+    }
+
+    let text = graphite_error_text(error).to_ascii_lowercase();
+
+    const AUTH_MARKERS: &[&str] = &[
+        "authentication failed",
+        "not authenticated",
+        "token expired",
+        "invalid token",
+        "run gt auth",
+        "run `gt auth`",
+        "please authenticate",
+    ];
+
+    if AUTH_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(GraphiteRecoveryPlaybook::Auth);
+    }
+
+    const TRUNK_MARKERS: &[&str] = &[
+        "trunk branch is out of date",
+        "trunk is out of date",
+        "out of date with trunk",
+        "no trunk",
+        "set trunk",
+        "run gt sync",
+        "run `gt sync`",
+    ];
+
+    if TRUNK_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(GraphiteRecoveryPlaybook::Trunk);
+    }
+
+    const RESTACK_MARKERS: &[&str] = &[
+        "rebase in progress",
+        "restack in progress",
+        "run gt abort",
+        "run `gt abort`",
+        "run gt continue",
+        "run `gt continue`",
+    ];
+
+    if RESTACK_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(GraphiteRecoveryPlaybook::Restack);
+    }
+
+    None
+}
+
+fn schedule_restack_playbook_retry_or_stop(
+    service: &OrchdService,
+    daemon_state: &mut DaemonState,
+    task_id: &TaskId,
+    now: DateTime<Utc>,
+    event_seed: i64,
+    retry_reason: &str,
+    exhausted_reason: &str,
+) {
+    if let Some(retry_state) = schedule_restack_retry(daemon_state, task_id, now) {
+        let _ = service.transition_task_state(
+            task_id,
+            TaskState::Ready,
+            EventId(format!("E-RESTACK-RETRY-WAIT-{}-{event_seed}", task_id.0)),
+            now,
+        );
+        eprintln!(
+            "[daemon] {} for {}; retry {}/{} in {}s",
+            retry_reason,
+            task_id.0,
+            retry_state.attempts,
+            retry_state.max_retries,
+            retry_state.backoff_secs
+        );
+    } else {
+        if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+            pipeline.fail(exhausted_reason.to_string());
+        }
+        daemon_state.restack_retries.remove(&task_id.0);
+        daemon_state.pipelines.remove(&task_id.0);
+        stop_task_with_failure_reason(
+            service,
+            daemon_state.notification_dispatcher.as_ref(),
+            task_id,
+            exhausted_reason,
+            now,
+        );
+        eprintln!("[daemon] {}", exhausted_reason);
+    }
+}
+
+fn handle_restack_graphite_playbook(
+    service: &OrchdService,
+    daemon_state: &mut DaemonState,
+    task_id: &TaskId,
+    parent_branch: &str,
+    error: &orch_graphite::GraphiteError,
+    graphite: &GraphiteClient,
+    now: DateTime<Utc>,
+    event_seed: i64,
+) -> bool {
+    let Some(playbook) = select_graphite_recovery_playbook(error) else {
+        return false;
+    };
+
+    match playbook {
+        GraphiteRecoveryPlaybook::Auth => {
+            let final_msg = format!(
+                "graphite auth required while restacking onto `{parent_branch}`; run `gt auth login` and retry task {}",
+                task_id.0
+            );
+            if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                pipeline.fail(final_msg.clone());
+            }
+            daemon_state.restack_retries.remove(&task_id.0);
+            daemon_state.pipelines.remove(&task_id.0);
+            stop_task_with_failure_reason(
+                service,
+                daemon_state.notification_dispatcher.as_ref(),
+                task_id,
+                &final_msg,
+                now,
+            );
+        }
+        GraphiteRecoveryPlaybook::Trunk => {
+            if let Err(sync_error) = graphite.sync_trunk() {
+                let final_msg = format!(
+                    "graphite trunk recovery failed for {} while restacking onto `{parent_branch}`: {sync_error}",
+                    task_id.0
+                );
+                if let Some(pipeline) = daemon_state.pipelines.get_mut(&task_id.0) {
+                    pipeline.fail(final_msg.clone());
+                }
+                daemon_state.restack_retries.remove(&task_id.0);
+                daemon_state.pipelines.remove(&task_id.0);
+                stop_task_with_failure_reason(
+                    service,
+                    daemon_state.notification_dispatcher.as_ref(),
+                    task_id,
+                    &final_msg,
+                    now,
+                );
+            } else {
+                let exhausted_msg = format!(
+                    "graphite trunk recovery retries exhausted for {} while restacking onto `{parent_branch}` (max retries: {})",
+                    task_id.0, RESTACK_RETRY_MAX_RETRIES
+                );
+                schedule_restack_playbook_retry_or_stop(
+                    service,
+                    daemon_state,
+                    task_id,
+                    now,
+                    event_seed,
+                    "Trunk recovery",
+                    &exhausted_msg,
+                );
+            }
+        }
+        GraphiteRecoveryPlaybook::Restack => {
+            let _ = record_event_with_notification(
+                service,
+                daemon_state.notification_dispatcher.as_ref(),
+                &Event {
+                    id: EventId(format!("E-RESTACK-CONFLICT-{}-{}", task_id.0, event_seed)),
+                    task_id: Some(task_id.clone()),
+                    repo_id: service.task(task_id).ok().flatten().map(|t| t.repo_id),
+                    at: now,
+                    kind: EventKind::RestackConflict,
+                },
+            );
+
+            let _ = graphite.abort_rebase();
+            let exhausted_msg = format!(
+                "restack recovery retries exhausted for {} while restacking onto `{parent_branch}` (max retries: {})",
+                task_id.0, RESTACK_RETRY_MAX_RETRIES
+            );
+            schedule_restack_playbook_retry_or_stop(
+                service,
+                daemon_state,
+                task_id,
+                now,
+                event_seed,
+                "Restack recovery",
+                &exhausted_msg,
+            );
+        }
+    }
+
+    true
 }
 
 fn stop_task_with_failure_reason(
@@ -1558,68 +1768,16 @@ pub fn execute_actions(
                         }
                         Err(error) => {
                             let err_msg = format!("restack onto `{parent_branch}` failed: {error}");
-
-                            if error.is_restack_conflict() {
-                                let _ = record_event_with_notification(
-                                    service,
-                                    daemon_state.notification_dispatcher.as_ref(),
-                                    &Event {
-                                    id: EventId(format!(
-                                        "E-RESTACK-CONFLICT-{}-{}",
-                                        task_id.0, event_seed
-                                    )),
-                                    task_id: Some(task_id.clone()),
-                                    repo_id: service
-                                        .task(task_id)
-                                        .ok()
-                                        .flatten()
-                                        .map(|t| t.repo_id),
-                                    at: now,
-                                    kind: EventKind::RestackConflict,
-                                    },
-                                );
-
-                                if let Some(retry_state) =
-                                    schedule_restack_retry(daemon_state, task_id, now)
-                                {
-                                    let _ = service.transition_task_state(
-                                        task_id,
-                                        TaskState::Ready,
-                                        EventId(format!(
-                                            "E-RESTACK-RETRY-WAIT-{}-{}",
-                                            task_id.0, event_seed
-                                        )),
-                                        now,
-                                    );
-                                    eprintln!(
-                                        "[daemon] Restack conflict for {}; retry {}/{} in {}s",
-                                        task_id.0,
-                                        retry_state.attempts,
-                                        retry_state.max_retries,
-                                        retry_state.backoff_secs
-                                    );
-                                } else {
-                                    let final_msg = format!(
-                                        "restack conflict retries exhausted for {} (max retries: {})",
-                                        task_id.0, RESTACK_RETRY_MAX_RETRIES
-                                    );
-                                    if let Some(pipeline) =
-                                        daemon_state.pipelines.get_mut(&task_id.0)
-                                    {
-                                        pipeline.fail(final_msg.clone());
-                                    }
-                                    daemon_state.restack_retries.remove(&task_id.0);
-                                    daemon_state.pipelines.remove(&task_id.0);
-                                    stop_task_with_failure_reason(
-                                        service,
-                                        daemon_state.notification_dispatcher.as_ref(),
-                                        task_id,
-                                        &final_msg,
-                                        now,
-                                    );
-                                    eprintln!("[daemon] {}", final_msg);
-                                }
-                            } else {
+                            if !handle_restack_graphite_playbook(
+                                service,
+                                daemon_state,
+                                task_id,
+                                parent_branch,
+                                &error,
+                                &graphite,
+                                now,
+                                event_seed,
+                            ) {
                                 let retry_model = service
                                     .task(task_id)
                                     .ok()
@@ -2145,6 +2303,7 @@ mod tests {
     use chrono::Duration;
     use orch_core::events::{Event, EventKind};
     use orch_core::types::{EventId, ModelKind, RepoId, SubmitMode, Task, TaskId};
+    use orch_graphite::{GraphiteCli, GraphiteClient, GraphiteError};
     use std::fs;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -2909,6 +3068,193 @@ monthly_token_limit = {monthly_token_limit}
                 } if id.0 == task_id.0
             )
         }));
+    }
+
+    #[test]
+    fn select_graphite_recovery_playbook_detects_auth_errors() {
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "authentication failed: token expired".to_string(),
+        };
+        assert_eq!(
+            select_graphite_recovery_playbook(&error),
+            Some(GraphiteRecoveryPlaybook::Auth)
+        );
+    }
+
+    #[test]
+    fn select_graphite_recovery_playbook_detects_trunk_errors() {
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "trunk branch is out of date; run gt sync".to_string(),
+        };
+        assert_eq!(
+            select_graphite_recovery_playbook(&error),
+            Some(GraphiteRecoveryPlaybook::Trunk)
+        );
+    }
+
+    #[test]
+    fn select_graphite_recovery_playbook_detects_restack_errors() {
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "rebase in progress, run gt abort first".to_string(),
+        };
+        assert_eq!(
+            select_graphite_recovery_playbook(&error),
+            Some(GraphiteRecoveryPlaybook::Restack)
+        );
+    }
+
+    #[test]
+    fn restack_auth_playbook_stops_without_incrementing_retry_count() {
+        let service = mk_service();
+        let mut daemon_state = DaemonState::new();
+        let task = mk_task("T-RS-AUTH");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+        daemon_state.pipelines.insert(
+            task.id.0.clone(),
+            PipelineState::new(
+                task.id.clone(),
+                "task/T-RS-AUTH".to_string(),
+                task.worktree_path.clone(),
+                SubmitMode::Single,
+                Some("task/T-parent".to_string()),
+            ),
+        );
+
+        let graphite = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "authentication failed: token expired".to_string(),
+        };
+        let now = Utc::now();
+        let handled = handle_restack_graphite_playbook(
+            &service,
+            &mut daemon_state,
+            &task.id,
+            "task/T-parent",
+            &error,
+            &graphite,
+            now,
+            now.timestamp_nanos_opt().unwrap_or_default(),
+        );
+
+        assert!(handled);
+        let updated = service.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(updated.retry_count, 0);
+        assert_eq!(updated.state, TaskState::Stopped);
+        assert!(!daemon_state.pipelines.contains_key(&task.id.0));
+    }
+
+    #[test]
+    fn restack_trunk_playbook_stops_without_incrementing_retry_count_on_sync_failure() {
+        let service = mk_service();
+        let mut daemon_state = DaemonState::new();
+        let task = mk_task("T-RS-TRUNK");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+        daemon_state.pipelines.insert(
+            task.id.0.clone(),
+            PipelineState::new(
+                task.id.clone(),
+                "task/T-RS-TRUNK".to_string(),
+                task.worktree_path.clone(),
+                SubmitMode::Single,
+                Some("task/T-parent".to_string()),
+            ),
+        );
+
+        let graphite = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "trunk branch is out of date; run gt sync".to_string(),
+        };
+        let now = Utc::now();
+        let handled = handle_restack_graphite_playbook(
+            &service,
+            &mut daemon_state,
+            &task.id,
+            "task/T-parent",
+            &error,
+            &graphite,
+            now,
+            now.timestamp_nanos_opt().unwrap_or_default(),
+        );
+
+        assert!(handled);
+        let updated = service.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(updated.retry_count, 0);
+        assert_eq!(updated.state, TaskState::Stopped);
+        assert!(!daemon_state.pipelines.contains_key(&task.id.0));
+    }
+
+    #[test]
+    fn restack_recovery_playbook_uses_backoff_without_incrementing_retry_count() {
+        let service = mk_service();
+        let mut daemon_state = DaemonState::new();
+        let task = mk_task("T-RS-RECOVER");
+        service
+            .create_task(&task, &mk_created_event(&task))
+            .expect("create task");
+        daemon_state.pipelines.insert(
+            task.id.0.clone(),
+            PipelineState::new(
+                task.id.clone(),
+                "task/T-RS-RECOVER".to_string(),
+                task.worktree_path.clone(),
+                SubmitMode::Single,
+                Some("task/T-parent".to_string()),
+            ),
+        );
+
+        let graphite = GraphiteClient::with_cli(
+            PathBuf::from("."),
+            GraphiteCli::new("/definitely/missing/gt"),
+        );
+        let error = GraphiteError::CommandFailed {
+            command: "gt move --onto task/T-parent".to_string(),
+            status: Some(1),
+            stdout: "".to_string(),
+            stderr: "rebase in progress, run gt abort".to_string(),
+        };
+        let now = Utc::now();
+        let handled = handle_restack_graphite_playbook(
+            &service,
+            &mut daemon_state,
+            &task.id,
+            "task/T-parent",
+            &error,
+            &graphite,
+            now,
+            now.timestamp_nanos_opt().unwrap_or_default(),
+        );
+
+        assert!(handled);
+        let updated = service.task(&task.id).expect("load task").expect("task exists");
+        assert_eq!(updated.retry_count, 0);
+        assert_eq!(updated.state, TaskState::Ready);
+        assert!(daemon_state.restack_retries.contains_key(&task.id.0));
+        assert!(daemon_state.pipelines.contains_key(&task.id.0));
     }
 
     /// Helper: create a DaemonConfig whose repo_root has a `.othala/qa/baseline.md`.
