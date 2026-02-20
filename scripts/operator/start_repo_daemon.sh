@@ -19,10 +19,30 @@ choose_verify_command() {
     return 0
   fi
 
+  # Dojo/Starknet monorepo contract tests
+  if [[ -f "$root/contract/Scarb.toml" ]]; then
+    echo "cd contract && (sozo test || scarb test)"
+    return 0
+  fi
+
   # Rust
   if [[ -f "$root/Cargo.toml" ]]; then
     echo "cargo test --all-targets --all-features"
     return 0
+  fi
+
+  # Node/TS monorepo client
+  if [[ -f "$root/client/package.json" ]]; then
+    if jq -e '.scripts.test' "$root/client/package.json" >/dev/null 2>&1; then
+      if [[ -f "$root/client/pnpm-lock.yaml" ]]; then
+        echo "cd client && pnpm test"
+      elif [[ -f "$root/client/yarn.lock" ]]; then
+        echo "cd client && yarn test"
+      else
+        echo "cd client && npm test"
+      fi
+      return 0
+    fi
   fi
 
   # Node/TS
