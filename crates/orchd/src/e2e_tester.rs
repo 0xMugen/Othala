@@ -334,6 +334,52 @@ impl E2ETester {
         Self { config }
     }
 
+    /// **GRACEFUL FALLBACK:** Run E2E with automatic skip if spec is missing.
+    /// Never blocks on missing `.othala/e2e-spec.toml`.
+    pub fn run_with_fallback(
+        &self,
+        repo_root: &Path,
+        task_id: &str,
+        branch: &str,
+    ) -> E2EResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+
+        // If spec doesn't exist, return "skipped" (not failure)
+        let spec = match E2ESpec::load(repo_root) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "[e2e] INFO: E2E spec not found for {}. Skipping E2E tests (non-blocking).",
+                    task_id
+                );
+                let duration_secs = start_instant.elapsed().as_secs_f64();
+                return E2EResult {
+                    task_id: task_id.to_string(),
+                    branch: branch.to_string(),
+                    passed: true, // Treat missing spec as "pass" (don't block merge)
+                    stages: vec![StageResult {
+                        name: "skipped (no spec)".to_string(),
+                        passed: true,
+                        skipped: true,
+                        exit_code: None,
+                        duration_secs,
+                        stdout: "E2E spec not found; skipping E2E validation".to_string(),
+                        stderr: String::new(),
+                        error: None,
+                    }],
+                    started_at,
+                    ended_at: Utc::now(),
+                    duration_secs,
+                    error: None,
+                };
+            }
+        };
+
+        // Run E2E normally
+        self.run(&spec, repo_root, task_id, branch)
+    }
+
     /// Run E2E tests for a task.
     pub fn run(
         &self,

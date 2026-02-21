@@ -335,6 +335,38 @@ impl AgentDispatcher {
         Self { config }
     }
 
+    /// **GRACEFUL FALLBACK:** Always succeeds with safe defaults.
+    /// If dispatch routing fails for any reason, returns a sensible fallback.
+    pub fn dispatch_with_fallback(
+        &self,
+        task: &Task,
+        repo_context: &RepoContext,
+        is_retry: bool,
+        failure_reason: Option<&str>,
+    ) -> DispatchDecision {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.dispatch(task, repo_context, is_retry, failure_reason)
+        })) {
+            Ok(decision) => decision,
+            Err(_) => {
+                // If dispatch crashes, degrade gracefully to Claude
+                eprintln!(
+                    "[dispatch] WARNING: dispatch router panicked for task {}. Using fallback agent.",
+                    task.id
+                );
+                DispatchDecision {
+                    role: AgentRole::Sisyphus,
+                    confidence: 0.5,
+                    reasoning: "Dispatch router failed; using safe fallback (Sisyphus/Claude)".to_string(),
+                    fallback: Some(AgentRole::Explorer),
+                    context_additions: vec![
+                        "NOTE: Agent dispatch router encountered an error. Using fallback routing.".to_string(),
+                    ],
+                }
+            }
+        }
+    }
+
     /// Dispatch a task to the optimal agent.
     pub fn dispatch(
         &self,

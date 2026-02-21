@@ -1015,7 +1015,8 @@ pub fn daemon_tick(
                 if let Some(reason) = &task.last_failure_reason {
                     let repo_context = DispatchRepoContext::load(&config.repo_root);
 
-                    let decision = daemon_state.sisyphus_recovery.evaluate(
+                    // Use graceful fallback: if recovery loop breaks, escalate instead of hang
+                    let decision = daemon_state.sisyphus_recovery.evaluate_with_fallback(
                         task,
                         &all_tasks,
                         reason,
@@ -1204,7 +1205,8 @@ fn build_spawn_action_next_gen(
     let failure_reason = task.last_failure_reason.as_deref();
 
     // Use the agent dispatcher to decide which agent to use
-    let decision = daemon_state.agent_dispatcher.dispatch(
+    // With graceful fallback: if dispatch router fails, use safe default (Claude)
+    let decision = daemon_state.agent_dispatcher.dispatch_with_fallback(
         task,
         &repo_context,
         is_retry,

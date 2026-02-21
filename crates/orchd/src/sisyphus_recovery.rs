@@ -179,6 +179,43 @@ impl SisyphusRecoveryLoop {
         }
     }
 
+    /// **GRACEFUL FALLBACK:** Evaluate recovery with automatic escalation on failure.
+    /// Never panics; always returns a safe decision (escalate to human if recovery loop breaks).
+    pub fn evaluate_with_fallback(
+        &mut self,
+        task: &Task,
+        tasks: &[Task],
+        failure_reason: &str,
+        repo_context: &RepoContext,
+    ) -> RecoveryDecision {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.evaluate(task, tasks, failure_reason, repo_context)
+        })) {
+            Ok(decision) => decision,
+            Err(_) => {
+                eprintln!(
+                    "[sisyphus] WARNING: Recovery loop panicked for task {}. Escalating to human.",
+                    task.id
+                );
+                // Mark as complete and escalate
+                if !self.recoveries.contains_key(&task.id.0) {
+                    self.recoveries
+                        .insert(task.id.0.clone(), RecoveryState::new(&task.id.0));
+                }
+                if let Some(recovery) = self.recoveries.get_mut(&task.id.0) {
+                    recovery.complete = true;
+                }
+                RecoveryDecision::EscalateHuman {
+                    reason: "Recovery loop encountered internal error; escalating for manual triage".to_string(),
+                    summary: format!(
+                        "Task {} hit a recovery system error. Please investigate manually.",
+                        task.id
+                    ),
+                }
+            }
+        }
+    }
+
     /// Evaluate a stopped task and decide on recovery action.
     pub fn evaluate(
         &mut self,
