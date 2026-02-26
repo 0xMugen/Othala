@@ -42,6 +42,7 @@ pub mod prompt_mode;
 pub mod provider_registry;
 pub mod qa_agent;
 pub mod qa_spec_gen;
+pub mod qa_self_heal;
 pub mod rate_limiter;
 pub mod retry;
 pub mod scheduler;
