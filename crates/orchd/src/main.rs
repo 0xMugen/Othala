@@ -189,6 +189,15 @@ enum Commands {
         /// Per-model concurrency to set in org config
         #[arg(long)]
         per_model_concurrency: Option<usize>,
+        /// Run in CI mode (non-interactive, exit code based on readiness)
+        #[arg(long)]
+        ci: bool,
+        /// Output readiness report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Only run readiness checks, skip setup
+        #[arg(long)]
+        check_only: bool,
     },
     /// Validate Othala installation and environment
     SelfTest {
@@ -1840,6 +1849,16 @@ fn run_doctor(json: bool) -> anyhow::Result<bool> {
         );
     }
 
+    // Append readiness score from wizard module
+    if !json {
+        let readiness = orchd::wizard::run_readiness_checks(&repo_root);
+        println!();
+        println!(
+            "Readiness score: {}/100  ({}/{} checks)",
+            readiness.score, readiness.passed_checks, readiness.total_checks,
+        );
+    }
+
     Ok(report.all_ok)
 }
 
@@ -2014,6 +2033,18 @@ fn run_self_test(json: bool) -> bool {
             println!("\n\x1b[32mAll critical checks passed\x1b[0m");
         } else {
             println!("\n\x1b[31mOne or more critical checks failed\x1b[0m");
+        }
+    }
+
+    // Append readiness score from wizard module
+    if !json {
+        if let Ok(repo_root) = std::env::current_dir() {
+            let readiness = orchd::wizard::run_readiness_checks(&repo_root);
+            println!();
+            println!(
+                "Readiness score: {}/100  ({}/{} checks)",
+                readiness.score, readiness.passed_checks, readiness.total_checks,
+            );
         }
     }
 
@@ -3064,9 +3095,33 @@ fn main() -> anyhow::Result<()> {
         Commands::Wizard {
             enable,
             per_model_concurrency,
+            ci,
+            json,
+            check_only,
         } => {
+            let repo_root = std::env::current_dir()?;
+            let readiness = orchd::wizard::run_readiness_checks(&repo_root);
+
+            // CI mode: print report, exit based on score
+            if ci {
+                orchd::wizard::print_readiness_report(&readiness, json);
+                let exit_code = if orchd::wizard::is_ci_ready(&readiness) { 0 } else { 1 };
+                std::process::exit(exit_code);
+            }
+
+            // Check-only mode: print report, exit 0
+            if check_only {
+                orchd::wizard::print_readiness_report(&readiness, json);
+                std::process::exit(0);
+            }
+
+            // Interactive / scripted wizard flow
             print_banner();
             eprintln!("\x1b[35mWelcome to Othala first-time setup\x1b[0m");
+            eprintln!();
+
+            // Show pre-setup readiness
+            orchd::wizard::print_readiness_report(&readiness, false);
             eprintln!();
 
             eprintln!("\x1b[33mProbing model availability...\x1b[0m");
@@ -3144,7 +3199,6 @@ fn main() -> anyhow::Result<()> {
             let context_generated = if context_main_path.exists() {
                 false
             } else {
-                let repo_root = std::env::current_dir()?;
                 let template_dir = PathBuf::from("templates/prompts");
                 run_context_gen_with_status(
                     &repo_root,
@@ -3180,6 +3234,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("  - Model health: \x1b[33msome selected models have warnings\x1b[0m");
             }
+
+            // Post-setup readiness re-check
+            eprintln!();
+            let post_readiness = orchd::wizard::run_readiness_checks(&repo_root);
+            orchd::wizard::print_readiness_report(&post_readiness, false);
         }
         Commands::Logs { id, limit, json } => {
             let events = if let Some(ref task_id_str) = id {

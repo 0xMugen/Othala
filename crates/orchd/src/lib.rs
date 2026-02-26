@@ -56,6 +56,7 @@ pub mod task_templates;
 pub mod test_spec;
 pub mod types;
 pub mod upgrade;
+pub mod wizard;
 
 pub use chat_workspace::*;
 pub use context_graph::*;
