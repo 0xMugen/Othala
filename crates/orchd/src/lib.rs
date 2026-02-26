@@ -21,6 +21,7 @@ pub mod delta_report;
 pub mod delegation;
 pub mod dependency_graph;
 pub mod e2e_tester;
+pub mod e2e_scenarios;
 pub mod graphite_agent;
 pub mod orchestration_metrics;
 pub mod problem_classifier;

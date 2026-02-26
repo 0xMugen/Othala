@@ -230,6 +230,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run E2E orchestration scenario suite (built-in or soak test)
+    E2EScenarios {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Run soak test instead of built-in scenarios
+        #[arg(long)]
+        soak: bool,
+        /// Number of ticks for soak test (default: 1000)
+        #[arg(long, default_value = "1000")]
+        soak_ticks: u64,
+        /// Enable chaos injection during soak test
+        #[arg(long)]
+        chaos: bool,
+    },
     /// Show event log for a task (or all tasks)
     Logs {
         /// Task/chat ID (omit for global events)
@@ -3197,6 +3212,49 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 eprint!("{}", orchd::mission_vault::render_mission_report(&report));
+            }
+        }
+        Commands::E2EScenarios {
+            json,
+            soak,
+            soak_ticks,
+            chaos,
+        } => {
+            use orchd::e2e_scenarios::{ScenarioRunner, SoakConfig, builtin_scenarios};
+            let mut runner = ScenarioRunner::new();
+            if soak {
+                let config = SoakConfig {
+                    total_ticks: soak_ticks,
+                    enable_chaos: chaos,
+                    ..Default::default()
+                };
+                let tasks = vec![
+                    ("soak-1".to_string(), "Soak task 1".to_string()),
+                    ("soak-2".to_string(), "Soak task 2".to_string()),
+                    ("soak-3".to_string(), "Soak task 3".to_string()),
+                    ("soak-4".to_string(), "Soak task 4".to_string()),
+                    ("soak-5".to_string(), "Soak task 5".to_string()),
+                ];
+                let result = runner.run_soak(&config, tasks);
+                if json {
+                    println!("{}", result.to_json());
+                } else {
+                    eprint!("{}", result.summary());
+                }
+                if !result.passed {
+                    std::process::exit(1);
+                }
+            } else {
+                let scenarios = builtin_scenarios();
+                let suite = runner.run_suite(&scenarios);
+                if json {
+                    println!("{}", suite.to_json());
+                } else {
+                    eprint!("{}", suite.summary());
+                }
+                if suite.failed > 0 {
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Wizard {
