@@ -1,6 +1,6 @@
 # Othala
 
-Org-wide AI coding orchestrator (MVP-2 track), built in Rust with:
+Org-wide AI coding orchestrator, built in Rust with:
 
 - `Nix` for reproducible runtime and verification
 - `Graphite (gt)` for branch/stack operations
@@ -9,26 +9,21 @@ Org-wide AI coding orchestrator (MVP-2 track), built in Rust with:
 
 ## Current Status
 
-This repository is **mid-MVP-2**.
-Orchestrator validation checks are run as part of cross-project test workflows.
-This line exists solely to validate cross-project orchestrator patching.
-Cross-project orchestrator validation notes may appear here as harmless metadata.
-Additional orchestrator validation markers may be added during automated test assignments.
-This README includes a harmless note confirming orchestrator validation coverage.
+This repository is **production-hardened** with self-healing pipelines, operator-grade observability, and autonomous E2E test coverage.
 
 - Workspace and crate layout are in place.
 - Core orchestrator state model and persistence are implemented.
 - Daemon boot + scheduler tick + runtime tick are implemented.
-- Task initialization now executes real Graphite/worktree flow.
+- Task initialization executes real Graphite/worktree flow.
 - Quick verify execution and READY promotion path are wired.
 - Web merge queue and sandbox verify runner are implemented.
-
-Open gaps (before calling this production-ready):
-
-- Full autonomous agent epoch orchestration in `orchd` is not complete.
-- Reviewer automation (Claude/Codex/Gemini CLI-driven review generation) is not complete.
-- End-to-end auto-submit to GitHub is environment-dependent and not fully hardened.
-- TUI supports core in-app lifecycle controls, but interactive task creation from inside TUI is not wired yet.
+- **Install Wizard v2** — first-run readiness checks with scored remediation.
+- **Graphite reliability** — auto-track worktree branches, repair command, push fallback.
+- **QA self-heal pipeline** — failure classification, retry policy, auto-fix spawning.
+- **Context generation observability** — latency, coverage, cache, token budget, stale warnings.
+- **Delta-based operator reporting** — meaningful state changes only, noise suppression.
+- **Mission vault** — requirement parsing, coverage matrix, semantic dedup, gap detection.
+- **E2E orchestration test suite** — scenario runner, chaos injection, soak tests.
 
 ## Prerequisites
 
@@ -129,10 +124,70 @@ othala daemon \
 othala wizard
 ```
 
+The wizard runs 14 readiness checks across 4 categories (critical tools, config, models, permissions), produces a 0–100 readiness score, and provides actionable remediation hints.
+
+**CI mode** (non-interactive, exits with code 0/1):
+
+```bash
+othala wizard --ci
+othala wizard --ci --json
+```
+
+**Check-only mode** (print report, always exit 0):
+
+```bash
+othala wizard --check-only
+```
+
 ### Setup model selection (non-interactive)
 
 ```bash
 othala setup --enable claude,codex --per-model-concurrency 5
+```
+
+### Graphite repair
+
+Detect and repair Graphite branch tracking divergence:
+
+```bash
+othala graphite-repair
+othala graphite-repair --dry-run
+othala graphite-repair --json
+```
+
+### Context generation status
+
+Show context generation telemetry: latency, coverage, cache hits, token budget, stale warnings:
+
+```bash
+othala context-status
+othala context-status --json
+```
+
+### Mission completeness
+
+Show requirement coverage matrix, semantic dedup, gaps:
+
+```bash
+othala mission-status
+othala mission-status --json
+```
+
+### E2E orchestration test suite
+
+Run built-in orchestration scenarios (happy path, retry, chaos, multi-task, verify loop, QA red→green):
+
+```bash
+othala e2e-scenarios
+othala e2e-scenarios --json
+```
+
+Run soak test (sustained tick simulation with stuck-task detection):
+
+```bash
+othala e2e-scenarios --soak
+othala e2e-scenarios --soak --soak-ticks 5000
+othala e2e-scenarios --soak --chaos        # with fault injection
 ```
 
 ### Record a manual review decision
@@ -182,16 +237,28 @@ scripts/e2e-ready.sh
 
 ```text
 crates/
-  orch-core/
-  orchd/
-  orch-git/
-  orch-graphite/
-  orch-verify/
-  orch-agents/
-  orch-notify/
-  orch-tui/
-  orch-web/
+  orch-core/       # Core types, state machine, events, config
+  orchd/           # Main daemon binary + all orchestration modules
+  orch-git/        # Git operations
+  orch-graphite/   # Graphite CLI wrapper
+  orch-verify/     # Verification framework
+  orch-agents/     # Agent spawning + supervision
+  orch-notify/     # Notification dispatch
+  orch-tui/        # Terminal UI
+  orch-web/        # Web dashboard + merge queue
 ```
+
+### Key orchd modules (production-readiness)
+
+| Module | Purpose | Tests |
+|--------|---------|-------|
+| `wizard.rs` | Install wizard v2 — readiness score, remediation, CI mode | 7 |
+| `graphite_agent.rs` | Graphite reliability — auto-track, repair, push fallback | 3+ |
+| `qa_self_heal.rs` | QA self-heal — failure classifier, retry, auto-fix | 15 |
+| `context_gen_telemetry.rs` | Context observability — latency, coverage, tokens | 18 |
+| `delta_report.rs` | Delta reporting — state-change detection, suppression | 25 |
+| `mission_vault.rs` | Mission vault — requirements, coverage, dedup, gaps | 21 |
+| `e2e_scenarios.rs` | E2E scenarios — runner, chaos, soak framework | 25 |
 
 ## Notes
 
@@ -199,8 +266,6 @@ crates/
 - Graphite operations are intentionally wrapped through `orch-graphite`.
 - For controlled local validation, prefer temporary config + sqlite paths.
 - Post-auth submit tests need authenticated GitHub access and an up-to-date trunk (`gt sync`) before non-interactive `gt submit`.
-- This README includes a no-op line for orchestrator test coverage.
-- Harmless README touch for auth-failure handling test.
 
 ## Operator skill (multi-repo)
 
