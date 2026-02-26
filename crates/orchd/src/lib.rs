@@ -17,6 +17,7 @@ pub mod context_gen_telemetry;
 pub mod context_graph;
 pub mod daemon_loop;
 pub mod daemon_status;
+pub mod delta_report;
 pub mod delegation;
 pub mod dependency_graph;
 pub mod e2e_tester;
