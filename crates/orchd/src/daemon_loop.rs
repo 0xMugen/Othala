@@ -19,6 +19,7 @@ use crate::context_gen::{
     spawn_context_gen, ContextGenConfig, ContextGenState, ContextGenStatus,
 };
 use crate::context_gen_telemetry::{ContextGenMetrics, estimate_tokens};
+use crate::delta_report::DeltaReporter;
 use crate::context_graph::{load_context_graph, ContextLoadConfig};
 use crate::prompt_builder::{build_rich_prompt, PromptConfig, PromptRole, RetryContext};
 use crate::qa_agent::{
@@ -108,6 +109,8 @@ pub struct DaemonState {
     pub use_next_gen: bool,
     /// Context generation telemetry metrics.
     pub context_gen_metrics: ContextGenMetrics,
+    /// Delta-based operator reporter.
+    pub delta_reporter: DeltaReporter,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -188,6 +191,7 @@ impl DaemonState {
             orchestration_metrics: OrchestrationMetricsStore::default(),
             use_next_gen: true, // Enable by default
             context_gen_metrics: ContextGenMetrics::new(),
+            delta_reporter: DeltaReporter::default(),
         }
     }
 
