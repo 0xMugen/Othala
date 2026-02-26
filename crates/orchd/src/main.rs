@@ -209,6 +209,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Detect and repair Graphite branch tracking divergence
+    GraphiteRepair {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Dry-run: show divergences without repairing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show event log for a task (or all tasks)
     Logs {
         /// Task/chat ID (omit for global events)
@@ -3091,6 +3100,64 @@ fn main() -> anyhow::Result<()> {
         Commands::Doctor { json } => {
             let healthy = run_doctor(json)?;
             std::process::exit(if healthy { 0 } else { 1 });
+        }
+        Commands::GraphiteRepair { json, dry_run } => {
+            let repo_root = std::env::current_dir()?;
+            let tasks = service.store.list_tasks()?;
+            let mut expected: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+            for task in &tasks {
+                if let Some(ref branch) = task.branch_name {
+                    expected.insert(branch.clone(), Some("main".to_string()));
+                }
+            }
+
+            let divergences = orchd::graphite_agent::detect_tracking_divergence(&repo_root, &expected);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&divergences)?);
+            } else if divergences.is_empty() {
+                println!("\x1b[32mNo tracking divergences detected\x1b[0m");
+            } else {
+                println!("Found {} tracking divergence(s):\n", divergences.len());
+                for info in &divergences {
+                    let expected_str = info.expected_parent.as_deref().unwrap_or("none");
+                    let actual_str = info.actual_parent.as_deref().unwrap_or("none");
+                    let action = if info.needs_track {
+                        "needs track"
+                    } else if info.needs_untrack {
+                        "needs untrack"
+                    } else {
+                        "needs re-track"
+                    };
+                    println!(
+                        "  \x1b[33m{}\x1b[0m: expected_parent={}, actual_parent={} ({})",
+                        info.branch, expected_str, actual_str, action
+                    );
+                }
+
+                if !dry_run {
+                    println!();
+                    let graphite = orch_graphite::GraphiteClient::new(&repo_root);
+                    let mut repaired = 0;
+                    let mut failed = 0;
+                    for info in &divergences {
+                        match orchd::graphite_agent::repair_tracking(&graphite, info) {
+                            Ok(()) => {
+                                println!("  \x1b[32m\u{2713}\x1b[0m repaired: {}", info.branch);
+                                repaired += 1;
+                            }
+                            Err(e) => {
+                                println!("  \x1b[31m\u{2717}\x1b[0m failed: {} — {}", info.branch, e);
+                                failed += 1;
+                            }
+                        }
+                    }
+                    println!();
+                    println!("Repaired: {repaired}, Failed: {failed}");
+                } else {
+                    println!("\n(dry-run mode — no changes made)");
+                }
+            }
         }
         Commands::Wizard {
             enable,
