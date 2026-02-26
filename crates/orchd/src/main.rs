@@ -224,6 +224,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show mission completeness: requirement coverage, duplicates, gaps
+    MissionStatus {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show event log for a task (or all tasks)
     Logs {
         /// Task/chat ID (omit for global events)
@@ -3172,6 +3178,25 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 eprint!("{}", orchd::context_gen_telemetry::render_report(&report));
+            }
+        }
+        Commands::MissionStatus { json } => {
+            let repo_root = std::env::current_dir()?;
+            let requirements = orchd::mission_vault::load_all_requirements(&repo_root);
+            let tasks_raw = service.store.list_tasks()?;
+            let tasks: Vec<orchd::mission_vault::TaskInfo> = tasks_raw
+                .iter()
+                .map(|t| orchd::mission_vault::TaskInfo {
+                    id: t.id.0.clone(),
+                    title: t.title.clone(),
+                    state: orchd::state_machine::task_state_tag(t.state).to_string(),
+                })
+                .collect();
+            let report = orchd::mission_vault::build_mission_report(&requirements, &tasks, 0.5);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                eprint!("{}", orchd::mission_vault::render_mission_report(&report));
             }
         }
         Commands::Wizard {

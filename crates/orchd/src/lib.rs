@@ -36,6 +36,7 @@ pub mod mcp;
 pub mod mcp_resources;
 pub mod mcp_transport;
 pub mod metrics;
+pub mod mission_vault;
 pub mod model_options;
 pub mod persistence;
 pub mod permissions;
