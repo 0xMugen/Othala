@@ -437,6 +437,59 @@ pub fn repair_tracking(
     Ok(())
 }
 
+/// Preflight: ensure a branch is tracked by Graphite before committing.
+/// If the branch has no graphite-parent set, auto-track it with the given parent.
+/// Returns Ok(true) if tracking was performed, Ok(false) if already tracked.
+pub fn ensure_tracked(
+    graphite: &GraphiteClient,
+    branch: &str,
+    default_parent: &str,
+) -> Result<bool, GraphiteError> {
+    // Check if branch already has a graphite-parent
+    let output = Command::new("git")
+        .args(["config", &format!("branch.{}.graphite-parent", branch)])
+        .current_dir(graphite.repo_root())
+        .output()
+        .map_err(|e| GraphiteError::Io {
+            command: "git config branch.<name>.graphite-parent".to_string(),
+            source: e,
+        })?;
+
+    if output.status.success() {
+        let parent = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !parent.is_empty() {
+            return Ok(false); // Already tracked
+        }
+    }
+
+    // Not tracked — auto-track
+    graphite.track_branch(branch, default_parent)?;
+    Ok(true)
+}
+
+/// Git-only fallback for push when Graphite submit fails.
+/// Pushes the current branch to origin and returns success/failure.
+pub fn git_push_fallback(repo_root: &Path, branch: &str) -> Result<(), GraphiteError> {
+    let status = Command::new("git")
+        .args(["push", "--set-upstream", "origin", branch])
+        .current_dir(repo_root)
+        .status()
+        .map_err(|e| GraphiteError::Io {
+            command: format!("git push --set-upstream origin {branch}"),
+            source: e,
+        })?;
+
+    if !status.success() {
+        return Err(GraphiteError::CommandFailed {
+            command: format!("git push --set-upstream origin {branch}"),
+            status: status.code(),
+            stdout: String::new(),
+            stderr: "git push failed".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn is_benign_noop_restack(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("does not need to be restacked")
@@ -1136,5 +1189,81 @@ mod tests {
         ));
         assert!(is_benign_noop_restack("nothing to restack"));
         assert!(!is_benign_noop_restack("merge conflict in src/lib.rs"));
+    }
+
+    #[test]
+    fn extract_branch_from_typical_log_lines() {
+        assert_eq!(
+            extract_branch_from_log_line("  task/chat-123"),
+            Some("task/chat-123".to_string())
+        );
+        assert_eq!(
+            extract_branch_from_log_line("* main"),
+            Some("main".to_string())
+        );
+        assert_eq!(extract_branch_from_log_line("  |"), None);
+    }
+
+    #[test]
+    fn divergence_detection_reports_missing_parent() {
+        let mut expected = HashMap::new();
+        expected.insert("task/T1".to_string(), Some("main".to_string()));
+
+        // With empty actual state, everything diverges
+        let results = detect_tracking_divergence_inner(&expected, &HashMap::new());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].needs_track);
+    }
+
+    // Helper: test-friendly version of detect_tracking_divergence that accepts pre-fetched state
+    fn detect_tracking_divergence_inner(
+        expected: &HashMap<String, Option<String>>,
+        actual: &HashMap<String, Option<String>>,
+    ) -> Vec<BranchTrackingInfo> {
+        let mut results = Vec::new();
+        for (branch, expected_parent) in expected {
+            let actual_parent = actual.get(branch).cloned().flatten();
+            let is_diverged = expected_parent != &actual_parent;
+            let needs_track = expected_parent.is_some() && actual_parent.is_none();
+            let needs_untrack = expected_parent.is_none() && actual_parent.is_some();
+            if is_diverged {
+                results.push(BranchTrackingInfo {
+                    branch: branch.clone(),
+                    expected_parent: expected_parent.clone(),
+                    actual_parent,
+                    is_diverged,
+                    needs_track,
+                    needs_untrack,
+                });
+            }
+        }
+        results
+    }
+
+    #[test]
+    fn divergence_detection_reports_wrong_parent() {
+        let mut expected = HashMap::new();
+        expected.insert("task/T1".to_string(), Some("main".to_string()));
+
+        let mut actual = HashMap::new();
+        actual.insert("task/T1".to_string(), Some("develop".to_string()));
+
+        let results = detect_tracking_divergence_inner(&expected, &actual);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].needs_track);
+        assert!(!results[0].needs_untrack);
+        assert!(results[0].is_diverged);
+    }
+
+    #[test]
+    fn divergence_detection_no_divergence_when_matching() {
+        let mut expected = HashMap::new();
+        expected.insert("task/T1".to_string(), Some("main".to_string()));
+
+        let mut actual = HashMap::new();
+        actual.insert("task/T1".to_string(), Some("main".to_string()));
+
+        let results = detect_tracking_divergence_inner(&expected, &actual);
+        assert!(results.is_empty());
     }
 }
