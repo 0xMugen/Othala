@@ -18,6 +18,7 @@ use crate::context_gen::{
     build_context_gen_prompt, context_is_current, poll_context_gen, should_regenerate,
     spawn_context_gen, ContextGenConfig, ContextGenState, ContextGenStatus,
 };
+use crate::context_gen_telemetry::{ContextGenMetrics, estimate_tokens};
 use crate::context_graph::{load_context_graph, ContextLoadConfig};
 use crate::prompt_builder::{build_rich_prompt, PromptConfig, PromptRole, RetryContext};
 use crate::qa_agent::{
@@ -105,6 +106,8 @@ pub struct DaemonState {
     pub orchestration_metrics: OrchestrationMetricsStore,
     /// Whether to use next-gen orchestration (multi-agent routing).
     pub use_next_gen: bool,
+    /// Context generation telemetry metrics.
+    pub context_gen_metrics: ContextGenMetrics,
 }
 
 const RESTACK_RETRY_MAX_RETRIES: u32 = 3;
@@ -184,6 +187,7 @@ impl DaemonState {
             sisyphus_recovery: SisyphusRecoveryLoop::default(),
             orchestration_metrics: OrchestrationMetricsStore::default(),
             use_next_gen: true, // Enable by default
+            context_gen_metrics: ContextGenMetrics::new(),
         }
     }
 
@@ -959,22 +963,29 @@ pub fn daemon_tick(
         }
     }
 
-    // Poll any running context gen process.
+    // Poll any running context gen process and record telemetry.
     let was_context_regen_running = daemon_state.context_gen.status == ContextGenStatus::Running;
     if let Some(paths) = poll_context_gen(&config.repo_root, &mut daemon_state.context_gen) {
         actions.push(DaemonAction::Log {
             message: format!("[context-gen] Updated {} context files", paths.len()),
         });
         actions.push(DaemonAction::ContextRegenCompleted { success: true });
+        // Record success metric — wall-time approximated from generation_start.
+        // Precise timing would require a start timestamp; use 0.0 as placeholder
+        // since poll_context_gen doesn't expose duration.
+        daemon_state.context_gen_metrics.record_success(0.0);
     } else if was_context_regen_running
         && daemon_state.context_gen.status == ContextGenStatus::Failed
     {
         actions.push(DaemonAction::ContextRegenCompleted { success: false });
+        daemon_state.context_gen_metrics.record_failure(0.0);
     }
 
+    // Record cache check (stale vs current) for observability.
+    let is_stale = !context_is_current(&config.repo_root);
+    daemon_state.context_gen_metrics.record_cache_check(!is_stale);
+
     // Check if we should trigger a regen based on transitions or stale hash.
-    // Triggers: MarkReady actions (task completed), pipeline Complete actions (merged),
-    // or git hash mismatch (cheap check — file read + git rev-parse).
     let has_trigger = actions.iter().any(|a| {
         matches!(a, DaemonAction::MarkReady { .. })
             || matches!(a, DaemonAction::MarkMerged { .. })
@@ -985,8 +996,6 @@ pub fn daemon_tick(
                 }
             )
     });
-
-    let is_stale = !context_is_current(&config.repo_root);
 
     if !config.skip_context_regen
         && (has_trigger || is_stale)
@@ -2392,6 +2401,8 @@ pub fn execute_actions(
                     Utc::now(),
                 ) {
                     let prompt = build_context_gen_prompt(&config.repo_root, &config.template_dir);
+                    daemon_state.context_gen_metrics.record_start();
+                    daemon_state.context_gen_metrics.record_prompt_tokens(estimate_tokens(&prompt));
                     if let Err(e) = spawn_context_gen(
                         &config.repo_root,
                         &prompt,

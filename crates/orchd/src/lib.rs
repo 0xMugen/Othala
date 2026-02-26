@@ -13,6 +13,7 @@ pub mod context_manager;
 pub mod conversation;
 pub mod custom_commands;
 pub mod context_gen;
+pub mod context_gen_telemetry;
 pub mod context_graph;
 pub mod daemon_loop;
 pub mod daemon_status;

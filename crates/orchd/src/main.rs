@@ -218,6 +218,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show context generation status: staleness, coverage, metrics, token budget
+    ContextStatus {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show event log for a task (or all tasks)
     Logs {
         /// Task/chat ID (omit for global events)
@@ -3157,6 +3163,15 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     println!("\n(dry-run mode — no changes made)");
                 }
+            }
+        }
+        Commands::ContextStatus { json } => {
+            let repo_root = std::env::current_dir()?;
+            let report = orchd::context_gen_telemetry::build_report(&repo_root, None);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                eprint!("{}", orchd::context_gen_telemetry::render_report(&report));
             }
         }
         Commands::Wizard {
