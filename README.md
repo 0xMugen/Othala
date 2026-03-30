@@ -278,3 +278,7 @@ crates/
 Per-repo mode is declared in `.othala/repo-mode.toml`:
 - `mode = "stack"` for stack-first repos.
 - `mode = "merge"` for merge-as-you-go repos.
+
+
+todos:
+test it with openclaw
